@@ -5,10 +5,54 @@ import 'cw.dart';
 import 'cdata.dart';
 import 'cstate.dart';
 import 'symptom_field.dart';
+import '../api/masters_store.dart';
 import '../api/sync_service.dart';
 import '../doctor/voice.dart';
 import '../state/app_state.dart';
 import '../widgets/attachments_field.dart';
+
+/// yyyy-mm-dd (SQL date). Backend PatientIn / AppointmentIn expects this
+/// format for `dob`, `lmp_date`, `edd_date`, `appointment_date`.
+String _isoDate(DateTime d) =>
+    '${d.year.toString().padLeft(4, '0')}-'
+    '${d.month.toString().padLeft(2, '0')}-'
+    '${d.day.toString().padLeft(2, '0')}';
+
+/// Best-effort id lookup for a value in a `masters` sublist. Handles the
+/// two common shapes the bootstrap payload returns rows in — either
+/// `{symptom_id, symptom_name}` (per-domain keys) or `{id, name}` — and
+/// matches case-insensitively so "Fever" and "fever" both resolve.
+int? _lookupIdByName(List<Map<String, dynamic>> rows, String? name,
+    {String idKey = 'id', String nameKey = 'name'}) {
+  if (name == null || name.trim().isEmpty) return null;
+  final n = name.trim().toLowerCase();
+  for (final r in rows) {
+    final rn = (r[nameKey] ?? r['name'] ?? r['symptom_name'] ?? r['category_name'])
+        ?.toString().trim().toLowerCase();
+    if (rn == n) {
+      final id = r[idKey] ?? r['id'] ?? r['symptom_id'] ?? r['category_id'];
+      if (id is num) return id.toInt();
+      if (id is String) return int.tryParse(id);
+    }
+  }
+  return null;
+}
+
+/// Convert a numeric-in-a-controller to a nullable double. Empty or
+/// unparseable → null (so the backend stores NULL instead of `0`, which
+/// would look like a real reading).
+double? _asDouble(TextEditingController c) {
+  final s = c.text.trim();
+  if (s.isEmpty) return null;
+  return double.tryParse(s);
+}
+
+/// Same for ints. Backend vitals like systolic_bp / blood_sugar are int.
+int? _asInt(TextEditingController c) {
+  final s = c.text.trim();
+  if (s.isEmpty) return null;
+  return int.tryParse(s);
+}
 
 /// Allows up to [intDigits] integer digits and 1 optional decimal place
 /// (e.g. 100.1 with intDigits=3, or 14.5 with intDigits=2).
@@ -239,18 +283,102 @@ class _CounRegisterState extends State<CounRegister> {
     // Enqueue the mutation for /mobile/sync/push (v2 §4). The action is
     // idempotent by client_action_id so a replay is safe; the local
     // insert above still gives the counsellor an instant Home tile.
+    //
+    // Payload carries the FULL patient + appointment shape so nothing the
+    // counsellor typed is dropped on the way through the sync path. The
+    // backend's `_register` handler in mobile.py maps these into the same
+    // INSERT statements that `POST /patients` + `POST /appointments` use,
+    // so an offline registration ends up equivalent to an online one.
+    final masters = context.read<MastersStore>();
+    final appState = context.read<AppState>();
+
+    // Resolve symptom name → id via the masters cache. Names that don't
+    // match any master (custom / free-text entries) are silently dropped
+    // for now — the appointment_symptom link table only accepts real ids.
+    // TODO: when the backend adds a `symptom_names` accept path, send raw
+    // names too so custom symptoms round-trip.
+    final symptomRows = masters.masterRows('symptoms');
+    final symptomIds = <int>[
+      for (final s in symptoms)
+        if (_lookupIdByName(symptomRows, s,
+                idKey: 'symptom_id', nameKey: 'symptom_name') is int)
+          _lookupIdByName(symptomRows, s,
+              idKey: 'symptom_id', nameKey: 'symptom_name')!,
+    ];
+
+    // Resolve category label → id via masters.categories. Null if the
+    // user didn't pick a category or the name isn't in the master.
+    final categoryId = _lookupIdByName(
+      masters.masterRows('categories'), category,
+      idKey: 'category_id', nameKey: 'category_name');
+
+    // Age/DOB: form enforces one-or-the-other, so send whichever is set.
+    // DOB is preferred when the user picked the calendar option.
+    final ageValue = knowAge
+        ? (int.tryParse(_age.text.trim()))
+        : (_dob != null ? _ageFromDob(_dob!) : null);
+    final dobValue = (!knowAge && _dob != null) ? _isoDate(_dob!) : null;
+
+    // Pregnancy dates — only meaningful when `pregnant` is true.
+    final lmpIso = (pregnant && _lmp != null) ? _isoDate(_lmp!) : null;
+    final eddIso = (pregnant && _lmp != null)
+        ? _isoDate(_lmp!.add(const Duration(days: 280)))
+        : null;
+
+    // Aadhaar / pin: send only when they look valid so the backend
+    // regex CHECK doesn't 422 on partial numbers.
+    final aadharDigits = _aadhar.text.trim();
+    final aadharValue = RegExp(r'^\d{12}$').hasMatch(aadharDigits)
+        ? aadharDigits : null;
+    final pinDigits = _pin.text.trim();
+    final pinValue = RegExp(r'^[1-9]\d{5}$').hasMatch(pinDigits)
+        ? pinDigits : null;
+
     context.read<SyncService>().enqueue(kind: 'patient.register', payload: {
+      // Basic identity
       'patient_name':      p.name,
       'gender':            p.gender,
-      'age':               p.age,
+      if (ageValue != null) 'age': ageValue,
+      if (dobValue != null) 'dob': dobValue,
       'contact_number':    p.contact,
-      'state_name':        context.read<AppState>().backendStateName ?? context.read<AppState>().currentMmuState,
-      'district_name':     context.read<AppState>().backendDistrictName ?? context.read<AppState>().currentMmuDistrict,
+      // Address / geography — names carry the resolve chain the backend
+      // uses to look up the ids inside _resolve_geography.
+      'state_name':        appState.backendStateName ?? appState.currentMmuState,
+      'district_name':     appState.backendDistrictName ?? appState.currentMmuDistrict,
       'block_name':        p.block,
       'village_name':      p.village,
+      if (pinValue != null)   'pin_code': pinValue,
+      if (_address.text.trim().isNotEmpty) 'address': _address.text.trim(),
+      // Identity extras
+      if (aadharValue != null)     'aadhar_number': aadharValue,
+      if (bloodGroup != null)      'blood_group': bloodGroup,
+      if (categoryId != null)      'category_id': categoryId,
+      'disability':                pwd == 'Yes',
+      if (p.pastHistory.trim().isNotEmpty) 'past_history': p.pastHistory,
+      // Appointment leg
       'appointment_date':  p.regDate,
       'payment_type':      payment,
-      'paid_amount':       payment == 'Paid' ? (num.tryParse(_amount.text.trim()) ?? 0) : 0,
+      'paid_amount':       payment == 'Paid'
+          ? (num.tryParse(_amount.text.trim()) ?? 0) : 0,
+      'pregnant':          pregnant,
+      if (lmpIso != null) 'lmp_date': lmpIso,
+      if (eddIso != null) 'edd_date': eddIso,
+      'taken_prescribed_medicine': onMed,
+      if (_remarks.text.trim().isNotEmpty)
+        'counsellor_remarks': _remarks.text.trim(),
+      // Vitals — send only fields the counsellor actually typed so a
+      // NULL doesn't get stored as a real reading.
+      if (_asInt(_sys)      != null) 'systolic_bp':  _asInt(_sys),
+      if (_asInt(_dia)      != null) 'diastolic_bp': _asInt(_dia),
+      if (_asInt(_sugar)    != null) 'blood_sugar':  _asInt(_sugar),
+      if (_asDouble(_temp)  != null) 'body_temp':    _asDouble(_temp),
+      if (_asDouble(_spo2)  != null) 'oxygen':       _asDouble(_spo2),
+      if (_asInt(_hr)       != null) 'heart_rate':   _asInt(_hr),
+      if (_asDouble(_hb)    != null) 'hemoglobin':   _asDouble(_hb),
+      if (_asDouble(_height) != null) 'height':      _asDouble(_height),
+      if (_asDouble(_weight) != null) 'weight':      _asDouble(_weight),
+      // Clinical arrays
+      if (symptomIds.isNotEmpty) 'symptom_ids': symptomIds,
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),
