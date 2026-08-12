@@ -1,0 +1,61 @@
+name: jubicare_mmu
+description: JubiCare MMU mobile prototype — Counselor, Doctor, Pharmacist workflow with modernized UI, simulated voice capture and AI clinical decision support.
+publish_to: 'none'
+version: 0.21.6+42
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.2
+  cupertino_icons: ^1.0.6
+  image_picker: ^1.2.2
+  speech_to_text: ^7.4.0
+  pdf: ^3.12.0
+  printing: ^5.14.3
+  # ─── MMU location tracking ───
+  # geolocator: GPS sampling on Android/iOS.
+  # connectivity_plus: fires when internet returns so we can drain the offline
+  #   buffer without polling.
+  # shared_preferences: local buffer for offline GPS points.
+  # firebase_core + cloud_firestore: bridge that pushes points to the
+  #   JubiCare Dashboard's Firestore collection.
+  geolocator: ^12.0.0
+  connectivity_plus: ^6.0.5
+  shared_preferences: ^2.3.2
+  firebase_core: ^3.6.0
+  cloud_firestore: ^5.4.4
+  # HTTP client for the JubiCare backend API (revamp-back.indevconsultancy.in).
+  # See docs/api_requirements.md + backend team's v2 API doc.
+  http: ^1.2.2
+dev_dependencies:
+  flutter_lints: ^3.0.0
+  # Generates the Android launcher icon from a single source PNG. Run after
+  # every icon change:  flutter pub run flutter_launcher_icons
+  flutter_launcher_icons: ^0.14.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  # 2026-08-05: the raw jubicare_logo.png is 240x118 — squishing it into a
+  # square launcher icon (and then Android's adaptive mask) produced a
+  # cropped / tiny result. launcher_icon.png + launcher_icon_fg.png are
+  # generated 1024x1024 versions with the logo centered inside the safe
+  # zone (~66% of the canvas) so nothing gets clipped by the mask.
+  image_path: "assets/launcher_icon.png"
+  # White fill behind the transparent logo so the icon isn't rendered on a
+  # dark launcher background where the JubiCare mark would be invisible.
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/launcher_icon_fg.png"
+  remove_alpha_ios: true
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter.ttf

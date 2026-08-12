@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jubicare_mmu",
+      "runtimeExecutable": "flutter",
+      "runtimeArgs": ["run", "-d", "chrome", "--web-port=8000"],
+      "port": 8000
+    }
+  ]
+}

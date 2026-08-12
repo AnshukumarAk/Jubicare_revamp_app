@@ -1,0 +1,1604 @@
+[
+{
+"category": "Respiratory Infections",
+"sub": "Common cold",
+"term": "Acute nasopharyngitis",
+"icd": "CA00",
+"title": "Acute nasopharyngitis",
+"synonyms": [
+"common cold",
+"coryza",
+"head cold",
+"acute rhinitis",
+"runny nose",
+"blocked nose",
+"sardi",
+"zukam",
+"sardi-zukam",
+"nazla",
+"naak behna"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Sinusitis",
+"term": "Acute sinusitis",
+"icd": "CA01",
+"title": "Acute sinusitis",
+"synonyms": [
+"sinus infection",
+"rhinosinusitis",
+"sinusitis",
+"naak band",
+"sinus ki samasya",
+"sinus"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Pharyngitis (sore throat)",
+"term": "Acute pharyngitis",
+"icd": "CA02",
+"title": "Acute pharyngitis",
+"synonyms": [
+"sore throat",
+"throat infection",
+"pharyngitis",
+"gale me kharaash",
+"gala kharab",
+"gale me dard"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Tonsillitis",
+"term": "Acute tonsillitis",
+"icd": "CA03",
+"title": "Acute tonsillitis",
+"synonyms": [
+"tonsil infection",
+"tonsillitis",
+"tonsils",
+"gale ki granthi soojan",
+"tonsil badhna",
+"throat infection",
+"gala kharab"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Laryngitis / tracheitis",
+"term": "Acute laryngitis or tracheitis",
+"icd": "CA05",
+"title": "Acute laryngitis or tracheitis",
+"synonyms": [
+"laryngitis",
+"tracheitis",
+"hoarseness",
+"voice loss",
+"awaaz baithna",
+"gala baithna"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Acute bronchitis",
+"term": "Acute bronchitis",
+"icd": "CA20",
+"title": "Acute bronchitis",
+"synonyms": [
+"chest cold",
+"chest infection",
+"bronchitis",
+"seene me sankraman",
+"balgam wali khaansi"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Pneumonia",
+"term": "Pneumonia",
+"icd": "CA40",
+"title": "Pneumonia",
+"synonyms": [
+"lung infection",
+"chest infection",
+"pneumonia",
+"nimoniya",
+"phephdon ka sankraman"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Influenza",
+"term": "Influenza",
+"icd": "1E32",
+"title": "Influenza, virus not identified",
+"synonyms": [
+"flu",
+"influenza",
+"viral fever",
+"viral",
+"mausami bukhar",
+"flu bukhar"
+]
+},
+{
+"category": "Respiratory Infections",
+"sub": "Unspecified URI",
+"term": "Acute URI",
+"icd": "CA07",
+"title": "Acute upper respiratory infections of multiple and unspecified sites",
+"synonyms": [
+"URI",
+"URTI",
+"RTI",
+"upper respiratory infection",
+"saans naali ka sankraman"
+]
+},
+{
+"category": "Intestinal Infections",
+"sub": "",
+"term": "Infectious gastroenteritis/colitis",
+"icd": "1A40",
+"title": "Gastroenteritis or colitis without specification of infectious agent",
+"synonyms": [
+"gastroenteritis",
+"GE",
+"AGE",
+"loose motions",
+"diarrhoea",
+"dysentery",
+"food poisoning",
+"stomach infection",
+"stomach flu",
+"enteritis",
+"vomiting",
+"dast",
+"pet kharab",
+"pechish",
+"ulti-dast"
+]
+},
+{
+"category": "Wounds",
+"sub": "Head",
+"term": "Open wound of the head",
+"icd": "NA0Z",
+"title": "Injury of head, unspecified",
+"synonyms": [
+"head wound",
+"scalp cut",
+"head injury",
+"laceration of head",
+"sir par chot",
+"sir ka ghaav",
+"sir kat-na"
+]
+},
+{
+"category": "Wounds",
+"sub": "Neck",
+"term": "Open wound of the neck",
+"icd": "NA8Z",
+"title": "Injury of neck, unspecified",
+"synonyms": [
+"neck wound",
+"neck injury",
+"gardan par chot",
+"gardan ka ghaav"
+]
+},
+{
+"category": "Wounds",
+"sub": "Thorax / chest",
+"term": "Open wound of the thorax",
+"icd": "NB3Z",
+"title": "Injury of thorax, unspecified",
+"synonyms": [
+"chest wound",
+"chest injury",
+"seene par chot",
+"seene ka ghaav"
+]
+},
+{
+"category": "Wounds",
+"sub": "Abdomen / lower back",
+"term": "Open wound of the abdomen",
+"icd": "NC5Z",
+"title": "Injury of abdomen, lower back or pelvis, unspecified",
+"synonyms": [
+"abdominal wound",
+"belly injury",
+"pet par chot",
+"pet ka ghaav"
+]
+},
+{
+"category": "Wounds",
+"sub": "Shoulder / upper arm",
+"term": "Open wound of the shoulder or upper arm",
+"icd": "ND2Z",
+"title": "Injury of shoulder or upper arm, unspecified",
+"synonyms": [
+"arm wound",
+"shoulder injury",
+"baazu par chot",
+"kandhe ki chot"
+]
+},
+{
+"category": "Wounds",
+"sub": "Forearm / wrist / hand",
+"term": "Open wound of the wrist or hand",
+"icd": "ND56",
+"title": "Injury of wrist or hand",
+"synonyms": [
+"hand cut",
+"wrist laceration",
+"haath par chot",
+"haath kat-na",
+"kalai ki chot"
+]
+},
+{
+"category": "Wounds",
+"sub": "Hip / thigh / leg",
+"term": "Open wound of the lower limb",
+"icd": "ND7Z",
+"title": "Injury of hip or thigh, unspecified",
+"synonyms": [
+"leg wound",
+"thigh injury",
+"taang par chot",
+"jangh ki chot",
+"paer ka ghaav"
+]
+},
+{
+"category": "Wounds",
+"sub": "Ankle / foot",
+"term": "Open wound of the ankle or foot",
+"icd": "ND9Z",
+"title": "Injury of ankle or foot, unspecified",
+"synonyms": [
+"foot wound",
+"ankle injury",
+"pair par chot",
+"takhne ki chot",
+"pair kat-na"
+]
+},
+{
+"category": "Wounds",
+"sub": "Unspecified site",
+"term": "Traumatic wound",
+"icd": "NF2Z",
+"title": "Injury of unspecified body region",
+"synonyms": [
+"cut",
+"laceration",
+"abrasion",
+"open wound",
+"graze",
+"chot",
+"ghaav",
+"zakhm",
+"kat"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Protein-energy malnutrition",
+"term": "Protein-energy malnutrition",
+"icd": "5B53",
+"title": "Protein-energy malnutrition, unspecified",
+"synonyms": [
+"malnutrition",
+"PEM",
+"undernutrition",
+"low weight",
+"kuposhan",
+"kamzori",
+"weakness"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Severe acute malnutrition",
+"term": "Severe protein-energy malnutrition",
+"icd": "5B52",
+"title": "Severe protein-energy malnutrition",
+"synonyms": [
+"SAM",
+"marasmus",
+"kwashiorkor",
+"severe malnutrition",
+"gambhir kuposhan"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Iron deficiency anaemia",
+"term": "Iron deficiency anaemia",
+"icd": "3A00",
+"title": "Iron deficiency anaemia",
+"synonyms": [
+"anaemia",
+"anemia",
+"low haemoglobin",
+"low Hb",
+"khoon ki kami",
+"pandu",
+"khoon ghatna"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Vitamin A deficiency",
+"term": "Vitamin A deficiency",
+"icd": "5B55",
+"title": "Vitamin A deficiency",
+"synonyms": [
+"night blindness",
+"vitamin A ki kami",
+"ratondhi"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Vitamin D deficiency",
+"term": "Vitamin D deficiency",
+"icd": "5B57",
+"title": "Vitamin D deficiency",
+"synonyms": [
+"rickets",
+"osteomalacia",
+"vitamin D ki kami",
+"haddi kamzori",
+"sukha rog"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Vitamin B12 / folate deficiency",
+"term": "Vitamin B12 or folate deficiency anaemia",
+"icd": "3A01",
+"title": "Megaloblastic anaemia due to B12/folate deficiency",
+"synonyms": [
+"megaloblastic anaemia",
+"B12 ki kami",
+"vitamin B12 deficiency"
+]
+},
+{
+"category": "Nutritional",
+"sub": "Iodine deficiency",
+"term": "Iodine deficiency",
+"icd": "5B5K",
+"title": "Iodine deficiency",
+"synonyms": [
+"goitre",
+"iodine ki kami",
+"ghengha",
+"gale ki soojan"
+]
+},
+{
+"category": "Skin",
+"sub": "Scabies",
+"term": "Scabies",
+"icd": "1G04",
+"title": "Scabies",
+"synonyms": [
+"itching",
+"scabies",
+"mite infestation",
+"khujli",
+"kharish",
+"khaaj"
+]
+},
+{
+"category": "Skin",
+"sub": "Dermatophytosis (ringworm)",
+"term": "Dermatophytosis",
+"icd": "1F28",
+"title": "Dermatophytosis",
+"synonyms": [
+"ringworm",
+"tinea",
+"fungal infection",
+"daad",
+"daad-khaaj",
+"fungal sankraman"
+]
+},
+{
+"category": "Skin",
+"sub": "Eczema / atopic dermatitis",
+"term": "Atopic eczema",
+"icd": "EA80",
+"title": "Atopic eczema",
+"synonyms": [
+"eczema",
+"dermatitis",
+"itchy rash",
+"atopic",
+"khujli wala chakatta",
+"eczema"
+]
+},
+{
+"category": "Skin",
+"sub": "Contact dermatitis",
+"term": "Contact dermatitis",
+"icd": "EK00",
+"title": "Contact dermatitis",
+"synonyms": [
+"allergic rash",
+"contact dermatitis",
+"allergy",
+"allergy ke daane"
+]
+},
+{
+"category": "Skin",
+"sub": "Urticaria",
+"term": "Urticaria",
+"icd": "EB00",
+"title": "Urticaria",
+"synonyms": [
+"hives",
+"urticaria",
+"allergy welts",
+"sheet-pitt",
+"pitti",
+"chakatte"
+]
+},
+{
+"category": "Skin",
+"sub": "Cellulitis",
+"term": "Cellulitis",
+"icd": "1B70",
+"title": "Cellulitis",
+"synonyms": [
+"skin infection",
+"soft tissue infection",
+"cellulitis",
+"twacha sankraman"
+]
+},
+{
+"category": "Skin",
+"sub": "Impetigo / pyoderma",
+"term": "Impetigo",
+"icd": "1B72",
+"title": "Impetigo",
+"synonyms": [
+"impetigo",
+"pyoderma",
+"skin sores",
+"boil",
+"phoda",
+"phunsi",
+"ghaav"
+]
+},
+{
+"category": "Skin",
+"sub": "Acne",
+"term": "Acne",
+"icd": "ED80",
+"title": "Acne",
+"synonyms": [
+"pimples",
+"acne",
+"muhase",
+"kil-muhase"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Osteoarthritis",
+"term": "Osteoarthritis",
+"icd": "FA0Z",
+"title": "Osteoarthritis, unspecified",
+"synonyms": [
+"OA",
+"joint pain",
+"knee pain",
+"osteoarthritis",
+"jodon ka dard",
+"ghutne ka dard",
+"gathiya"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Rheumatoid arthritis",
+"term": "Rheumatoid arthritis",
+"icd": "FA20",
+"title": "Rheumatoid arthritis",
+"synonyms": [
+"RA",
+"rheumatoid arthritis",
+"joint pain",
+"arthritis",
+"gathiya",
+"jodon ki soojan"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Gout",
+"term": "Gout",
+"icd": "FA25",
+"title": "Gout",
+"synonyms": [
+"gout",
+"high uric acid",
+"joint pain",
+"gathiya",
+"uric acid badhna"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Low back pain",
+"term": "Low back pain",
+"icd": "ME84",
+"title": "Low back pain",
+"synonyms": [
+"back pain",
+"lumbago",
+"LBP",
+"kamar dard",
+"peeth dard"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Soft-tissue / sprain",
+"term": "Sprain or strain",
+"icd": "NC3Z",
+"title": "Sprain or strain",
+"synonyms": [
+"sprain",
+"strain",
+"muscle pull",
+"moch",
+"maans peshi khinchav"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Myalgia / body ache",
+"term": "Myalgia",
+"icd": "FB56",
+"title": "Myalgia",
+"synonyms": [
+"body ache",
+"muscle pain",
+"myalgia",
+"badan dard",
+"shareer dard",
+"muscle dard"
+]
+},
+{
+"category": "Musculoskeletal",
+"sub": "Osteoporosis",
+"term": "Osteoporosis",
+"icd": "FB83",
+"title": "Osteoporosis",
+"synonyms": [
+"weak bones",
+"osteoporosis",
+"haddi kamzori",
+"haddi bhurbhuri"
+]
+},
+{
+"category": "Dental",
+"sub": "Dental caries",
+"term": "Dental caries",
+"icd": "DA08",
+"title": "Dental caries",
+"synonyms": [
+"cavity",
+"tooth decay",
+"caries",
+"daant me keeda",
+"daant sadna"
+]
+},
+{
+"category": "Dental",
+"sub": "Pulpitis / toothache",
+"term": "Pulpitis",
+"icd": "DA09",
+"title": "Diseases of pulp and periapical tissues",
+"synonyms": [
+"toothache",
+"tooth pain",
+"pulpitis",
+"daant me dard"
+]
+},
+{
+"category": "Dental",
+"sub": "Gingivitis",
+"term": "Gingivitis",
+"icd": "DA0C",
+"title": "Gingivitis",
+"synonyms": [
+"gum inflammation",
+"bleeding gums",
+"gingivitis",
+"masude me soojan",
+"masude se khoon"
+]
+},
+{
+"category": "Dental",
+"sub": "Periodontitis",
+"term": "Periodontitis",
+"icd": "DA0D",
+"title": "Periodontitis",
+"synonyms": [
+"gum disease",
+"periodontitis",
+"masude ki bimari"
+]
+},
+{
+"category": "Dental",
+"sub": "Oral / mouth ulcer",
+"term": "Mouth ulcers",
+"icd": "DA01.15",
+"title": "Mouth ulcers",
+"synonyms": [
+"canker sore",
+"aphthous ulcer",
+"muh ke chhale",
+"muh me chhala",
+"oral ulcer",
+"mouth sore",
+"mouth ulcer",
+"jeebh ke chhale"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "Gastritis",
+"term": "Gastritis",
+"icd": "DA42.Z",
+"title": "Gastritis, unspecified",
+"synonyms": [
+"acidity",
+"gastric",
+"gastritis",
+"stomach inflammation",
+"gas",
+"pet me jalan",
+"amlapitta",
+"hyperacidity",
+"heartburn",
+"acid reflux",
+"indigestion"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "GERD / acid reflux",
+"term": "Gastro-oesophageal reflux disease",
+"icd": "DA22",
+"title": "Gastro-oesophageal reflux disease",
+"synonyms": [
+"acid reflux",
+"heartburn",
+"GERD",
+"seene me jalan",
+"khatti dakaar"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "Functional dyspepsia / indigestion",
+"term": "Functional dyspepsia",
+"icd": "DD90.3",
+"title": "Functional dyspepsia",
+"synonyms": [
+"indigestion",
+"gas",
+"bloating",
+"dyspepsia",
+"badhazmi",
+"pet phoolna"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "Peptic ulcer",
+"term": "Peptic ulcer",
+"icd": "DA61",
+"title": "Peptic ulcer, site unspecified",
+"synonyms": [
+"stomach ulcer",
+"duodenal ulcer",
+"peptic ulcer",
+"aamashay ka ghaav"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "Constipation",
+"term": "Constipation",
+"icd": "ME05",
+"title": "Constipation",
+"synonyms": [
+"hard stools",
+"no motion",
+"constipation",
+"kabz",
+"kabzi",
+"pet saaf na hona"
+]
+},
+{
+"category": "Gastrointestinal",
+"sub": "Irritable bowel syndrome",
+"term": "Irritable bowel syndrome",
+"icd": "DD91",
+"title": "Irritable bowel syndrome",
+"synonyms": [
+"IBS",
+"irritable bowel",
+"baar-baar dast ya kabz"
+]
+},
+{
+"category": "Eye",
+"sub": "Conjunctivitis",
+"term": "Conjunctivitis",
+"icd": "9A60",
+"title": "Conjunctivitis",
+"synonyms": [
+"red eye",
+"eye infection",
+"pink eye",
+"conjunctivitis",
+"aankh aana",
+"aankh laal",
+"aankh me sankraman"
+]
+},
+{
+"category": "Eye",
+"sub": "Refractive error",
+"term": "Refractive error",
+"icd": "9D00",
+"title": "Disorders of refraction",
+"synonyms": [
+"vision problem",
+"weak eyesight",
+"refractive error",
+"najar kamzor",
+"chashma number"
+]
+},
+{
+"category": "Eye",
+"sub": "Cataract",
+"term": "Cataract",
+"icd": "9B10",
+"title": "Cataract",
+"synonyms": [
+"cataract",
+"clouding of lens",
+"white in eye",
+"motiyabind",
+"safed motiya"
+]
+},
+{
+"category": "Eye",
+"sub": "Stye / hordeolum",
+"term": "Hordeolum",
+"icd": "9A01",
+"title": "Hordeolum",
+"synonyms": [
+"stye",
+"eyelid boil",
+"hordeolum",
+"aankh ki phunsi",
+"bilni",
+"guhanjani"
+]
+},
+{
+"category": "Eye",
+"sub": "Glaucoma",
+"term": "Glaucoma",
+"icd": "9C61",
+"title": "Glaucoma",
+"synonyms": [
+"glaucoma",
+"high eye pressure",
+"kala motiya",
+"aankh ka dabaav"
+]
+},
+{
+"category": "Eye",
+"sub": "Dry eye / irritation",
+"term": "Dry eye disease",
+"icd": "9A06",
+"title": "Dry eye disease",
+"synonyms": [
+"dry eye",
+"watering eyes",
+"eye irritation",
+"aankh me jalan",
+"aankh sookhna"
+]
+},
+{
+"category": "ENT",
+"sub": "Otitis media",
+"term": "Otitis media",
+"icd": "AB0Z",
+"title": "Otitis media, unspecified",
+"synonyms": [
+"ear infection",
+"ear pain",
+"earache",
+"otitis media",
+"kaan dard",
+"kaan me sankraman",
+"kaan baha"
+]
+},
+{
+"category": "ENT",
+"sub": "Otitis externa",
+"term": "Otitis externa",
+"icd": "AA0Z",
+"title": "Otitis externa, unspecified",
+"synonyms": [
+"outer ear infection",
+"ear discharge",
+"otitis externa",
+"kaan baha",
+"kaan se paani"
+]
+},
+{
+"category": "ENT",
+"sub": "Allergic / vasomotor rhinitis",
+"term": "Rhinitis",
+"icd": "CA08",
+"title": "Vasomotor or allergic rhinitis",
+"synonyms": [
+"nasal block",
+"sneezing",
+"runny nose",
+"allergic rhinitis",
+"naak band",
+"chheenk",
+"naak behna"
+]
+},
+{
+"category": "ENT",
+"sub": "Hearing loss",
+"term": "Hearing impairment",
+"icd": "AB50",
+"title": "Conductive or sensorineural hearing impairment",
+"synonyms": [
+"hearing problem",
+"deafness",
+"hearing loss",
+"kam sunai dena",
+"behrapan"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Dysmenorrhoea",
+"term": "Dysmenorrhoea",
+"icd": "GA34.3",
+"title": "Dysmenorrhoea",
+"synonyms": [
+"period pain",
+"painful periods"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Abnormal / heavy menstruation",
+"term": "Abnormal uterine bleeding",
+"icd": "GA20",
+"title": "Menstrual cycle disorders",
+"synonyms": [
+"heavy periods",
+"irregular periods",
+"AUB",
+"jyada mahwari",
+"anyamit mahwari"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Vaginal discharge / leucorrhoea",
+"term": "Abnormal vaginal discharge",
+"icd": "MF3A",
+"title": "Vaginal discharge",
+"synonyms": [
+"white discharge",
+"leucorrhoea",
+"PV discharge",
+"safed paani",
+"likoria"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Vaginitis / vaginal infection",
+"term": "Vaginitis",
+"icd": "GA02",
+"title": "Vaginitis",
+"synonyms": [
+"vaginal infection",
+"vaginitis",
+"yoni sankraman"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Polycystic ovary syndrome",
+"term": "Polycystic ovary syndrome",
+"icd": "5A80.1",
+"title": "Polycystic ovary syndrome",
+"synonyms": [
+"PCOS",
+"PCOD",
+"polycystic ovary",
+"ovary me cyst"
+]
+},
+{
+"category": "Gynaecological",
+"sub": "Pelvic inflammatory disease",
+"term": "Pelvic inflammatory disease",
+"icd": "GA05",
+"title": "Inflammatory diseases of female pelvic organs",
+"synonyms": [
+"PID",
+"pelvic inflammatory disease",
+"pet ke neeche sankraman"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Hypertension",
+"term": "Essential hypertension",
+"icd": "BA00",
+"title": "Essential hypertension",
+"synonyms": [
+"high BP",
+"high blood pressure",
+"HTN",
+"BP",
+"uchch raktchaap",
+"BP badhna",
+"hypertension",
+"blood pressure",
+"raktchaap"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Angina / ischaemic heart disease",
+"term": "Angina pectoris",
+"icd": "BA40",
+"title": "Angina pectoris",
+"synonyms": [
+"chest pain",
+"IHD",
+"CAD",
+"angina",
+"seene me dard",
+"dil ka dard"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Myocardial infarction",
+"term": "Acute myocardial infarction",
+"icd": "BA41",
+"title": "Acute myocardial infarction",
+"synonyms": [
+"heart attack",
+"cardiac arrest",
+"MI",
+"myocardial infarction",
+"dil ka daura"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Heart failure",
+"term": "Heart failure",
+"icd": "BD10",
+"title": "Congestive heart failure",
+"synonyms": [
+"CHF",
+"cardiac failure",
+"heart failure",
+"dil ki kamzori"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Arrhythmia / palpitations",
+"term": "Cardiac arrhythmia",
+"icd": "BC9Z",
+"title": "Cardiac arrhythmia, unspecified",
+"synonyms": [
+"palpitations",
+"irregular heartbeat",
+"arrhythmia",
+"dhadkan tej"
+]
+},
+{
+"category": "Cardiovascular",
+"sub": "Rheumatic heart disease",
+"term": "Rheumatic heart disease",
+"icd": "BB40",
+"title": "Chronic rheumatic heart disease",
+"synonyms": [
+"RHD",
+"rheumatic heart disease"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Stroke",
+"term": "Cerebral ischaemic stroke",
+"icd": "8B11",
+"title": "Cerebral ischaemic stroke",
+"synonyms": [
+"stroke",
+"paralysis",
+"brain attack",
+"lakwa"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Epilepsy / seizures",
+"term": "Epilepsy",
+"icd": "8A6Z",
+"title": "Epilepsy or seizures, unspecified",
+"synonyms": [
+"fits",
+"convulsions",
+"seizure",
+"epilepsy",
+"mirgi",
+"daura"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Migraine",
+"term": "Migraine",
+"icd": "8A80",
+"title": "Migraine",
+"synonyms": [
+"migraine",
+"half-head pain",
+"aadha sir dard",
+"adhkapari"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Tension-type headache",
+"term": "Tension-type headache",
+"icd": "8A81",
+"title": "Tension-type headache",
+"synonyms": [
+"headache",
+"tension headache",
+"sir dard"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Vertigo / dizziness",
+"term": "Vertigo",
+"icd": "AB31",
+"title": "Vertigo / vestibular disorder",
+"synonyms": [
+"giddiness",
+"dizziness",
+"vertigo",
+"chakkar",
+"sir ghoomna"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Peripheral neuropathy",
+"term": "Peripheral neuropathy",
+"icd": "8C0Z",
+"title": "Polyneuropathy, unspecified",
+"synonyms": [
+"numbness",
+"tingling",
+"nerve pain",
+"neuropathy",
+"jhunjhuni",
+"sunnpan",
+"jhanjhanahat"
+]
+},
+{
+"category": "Nervous System",
+"sub": "Bell's / facial palsy",
+"term": "Facial palsy",
+"icd": "8B88",
+"title": "Facial palsy",
+"synonyms": [
+"facial weakness",
+"facial palsy",
+"Bell palsy",
+"chehre ka lakwa",
+"muh tedha"
+]
+},
+{
+"category": "Psychiatry",
+"sub": "Depression",
+"term": "Depressive disorder",
+"icd": "6A7Z",
+"title": "Depressive disorder, unspecified",
+"synonyms": [
+"depression",
+"low mood",
+"sadness",
+"avsaad",
+"udaasi",
+"man udaas"
+]
+},
+{
+"category": "Psychiatry",
+"sub": "Anxiety",
+"term": "Anxiety or fear-related disorder",
+"icd": "6B0Z",
+"title": "Anxiety or fear-related disorder, unspecified",
+"synonyms": [
+"anxiety",
+"tension",
+"stress",
+"ghabrahat",
+"chinta",
+"bechaini"
+]
+},
+{
+"category": "Psychiatry",
+"sub": "Insomnia / sleep problem",
+"term": "Insomnia disorder",
+"icd": "7A0Z",
+"title": "Insomnia disorder, unspecified",
+"synonyms": [
+"sleeplessness",
+"no sleep",
+"insomnia",
+"neend na aana",
+"anidra"
+]
+},
+{
+"category": "Psychiatry",
+"sub": "Somatic / stress symptoms",
+"term": "Stress-related symptoms",
+"icd": "6C20",
+"title": "Bodily distress disorder",
+"synonyms": [
+"stress",
+"tension",
+"bodily distress",
+"tanaav"
+]
+},
+{
+"category": "Psychiatry",
+"sub": "Alcohol / substance use",
+"term": "Disorder due to substance use",
+"icd": "6C4Z",
+"title": "Disorders due to substance use, unspecified",
+"synonyms": [
+"addiction",
+"alcohol",
+"tobacco",
+"nasha",
+"sharab",
+"tambaaku",
+"lat"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Urinary tract infection",
+"term": "Urinary tract infection",
+"icd": "GC08",
+"title": "Urinary tract infection, site not specified",
+"synonyms": [
+"UTI",
+"burning urination",
+"urine infection",
+"peshab me jalan",
+"peshab sankraman",
+"mutra sankraman"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Chronic kidney disease",
+"term": "Chronic kidney disease",
+"icd": "GB61",
+"title": "Chronic kidney disease",
+"synonyms": [
+"CKD",
+"kidney failure",
+"renal failure",
+"gurde ki kharabi",
+"gurda fail"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Acute kidney injury",
+"term": "Acute kidney failure",
+"icd": "GB60",
+"title": "Acute kidney failure",
+"synonyms": [
+"AKI",
+"acute renal failure",
+"gurde ki kharabi"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Urinary stones",
+"term": "Urolithiasis",
+"icd": "GC00",
+"title": "Urolithiasis",
+"synonyms": [
+"kidney stone",
+"renal calculi",
+"stone",
+"pathri",
+"gurde ki pathri",
+"calculi"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Benign prostate enlargement",
+"term": "Benign prostatic hyperplasia",
+"icd": "GA91",
+"title": "Hyperplasia of prostate",
+"synonyms": [
+"BPH",
+"prostate enlargement",
+"prostate badhna"
+]
+},
+{
+"category": "Nephro-urological",
+"sub": "Prostatitis",
+"term": "Prostatitis",
+"icd": "GA90",
+"title": "Prostatitis",
+"synonyms": [
+"prostate infection",
+"prostatitis",
+"prostate soojan"
+]
+},
+{
+"category": "Diabetes",
+"sub": "",
+"term": "Diabetes mellitus",
+"icd": "5A14",
+"title": "Diabetes mellitus, type unspecified",
+"synonyms": [
+"diabetes",
+"sugar",
+"high blood sugar",
+"DM",
+"T1DM",
+"T2DM",
+"sugar ki bimari",
+"madhumeh",
+"shakkar ki bimari"
+]
+},
+{
+"category": "COPD",
+"sub": "",
+"term": "Chronic obstructive pulmonary disease",
+"icd": "CA22",
+"title": "Chronic obstructive pulmonary disease",
+"synonyms": [
+"COPD",
+"chronic bronchitis",
+"emphysema",
+"breathlessness",
+"saans phoolna",
+"dama"
+]
+},
+{
+"category": "Bronchial Asthma",
+"sub": "",
+"term": "Asthma",
+"icd": "CA23",
+"title": "Asthma",
+"synonyms": [
+"asthma",
+"bronchial asthma",
+"wheezing",
+"breathlessness",
+"dama",
+"saans ki bimari",
+"saans phoolna",
+"saans ukhadna"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Burn",
+"icd": "NE2Z",
+"title": "Burns, unspecified",
+"synonyms": [
+"burn",
+"scald",
+"thermal injury",
+"thermal burn",
+"jalna",
+"jal jana",
+"aag se jalna"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Dengue",
+"icd": "1D2Z",
+"title": "Dengue, unspecified",
+"synonyms": [
+"dengue",
+"dengue fever",
+"DHF",
+"dengue bukhar",
+"haddi tod bukhar",
+"break bone fever"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Hepatitis A",
+"icd": "1E50.0",
+"title": "Acute hepatitis A",
+"synonyms": [
+"hepatitis A",
+"viral hepatitis A",
+"HAV",
+"jaundice (viral)",
+"piliya",
+"kamla"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Hepatitis C",
+"icd": "1E50.2",
+"title": "Acute hepatitis C",
+"synonyms": [
+"hepatitis C",
+"HCV",
+"viral hepatitis C",
+"piliya"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Hepatitis E",
+"icd": "1E50.4",
+"title": "Acute hepatitis E",
+"synonyms": [
+"hepatitis E",
+"HEV",
+"viral hepatitis E",
+"piliya"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Anal fissure",
+"icd": "DB50.0",
+"title": "Fissure or fistula of anal regions",
+"synonyms": [
+"fissure-in-ano",
+"rectal fissure",
+"anal tear",
+"fissure"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Wheezing",
+"icd": "MD11.C",
+"title": "Wheezing (symptom)",
+"synonyms": [
+"wheeze",
+"wheezy breathing",
+"whistling breath",
+"saans me seeti",
+"ghar-ghar",
+"saans phoolna"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Diarrhoea",
+"icd": "ME05.1",
+"title": "Diarrhoea",
+"synonyms": [
+"diarrhoea",
+"loose stools",
+"loose motions",
+"dast",
+"patli tatti",
+"pet kharab",
+"motions"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Fever",
+"icd": "MG26",
+"title": "Fever of other or unknown origin",
+"synonyms": [
+"fever",
+"pyrexia",
+"raised temperature",
+"high temperature",
+"bukhar",
+"taap",
+"jvar"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Covid-19",
+"icd": "RA01",
+"title": "COVID-19",
+"synonyms": [
+"COVID-19",
+"coronavirus",
+"corona",
+"SARS-CoV-2",
+"covid",
+"corona bimari"
+]
+},
+{
+"category": "Other",
+"sub": "Fracture",
+"term": "Fracture",
+"icd": "NC72",
+"title": "Fracture (by site)",
+"synonyms": [
+"broken bone",
+"fracture",
+"haddi tutna"
+]
+},
+{
+"category": "Other",
+"sub": "Cough",
+"term": "Cough",
+"icd": "MD12",
+"title": "Cough",
+"synonyms": [
+"cough",
+"dry cough",
+"wet cough",
+"khaansi",
+"sookhi khaansi",
+"balgam wali khaansi"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Fatigue",
+"icd": "MG22",
+"title": "Fatigue",
+"synonyms": [
+"weakness",
+"fatigue",
+"tiredness",
+"asthenia",
+"lethargy",
+"kamzori",
+"thakaan",
+"susti"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Headache",
+"icd": "8A8Z",
+"title": "Headache disorders, unspecified",
+"synonyms": [
+"headache",
+"head pain",
+"migraine",
+"tension headache",
+"sir dard"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Dehydration",
+"icd": "5C70.0",
+"title": "Dehydration",
+"synonyms": [
+"dehydration",
+"fluid loss",
+"volume depletion",
+"paani ki kami"
+]
+},
+{
+"category": "Other",
+"sub": "",
+"term": "Cracked heels / heel fissures",
+"icd": "ED54",
+"title": "Xerosis cutis or asteatosis",
+"synonyms": [
+"cracked heels",
+"heel fissures",
+"fissured feet",
+"dry skin",
+"edi phatna",
+"phati ediyan",
+"pair phatna"
+]
+}
+]
