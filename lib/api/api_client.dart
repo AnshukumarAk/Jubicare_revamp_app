@@ -162,6 +162,12 @@ class ApiClient {
 
   /// Run exactly one refresh-token exchange, no matter how many callers
   /// need one right now. Returns null if the session died in the process.
+  ///
+  /// Only DEFINITIVE auth failures (SIGNED_OUT_REMOTELY / INVALID_TOKEN /
+  /// REFRESH_EXPIRED) sign the user out. Network hiccups, 5xx server
+  /// blips and unexpected exceptions leave the session intact — the
+  /// caller returns null and the request fails, but the counsellor
+  /// stays logged in and can retry when connectivity is back.
   Future<StoredTokens?> _refreshOnce() async {
     final inflight = _refreshInFlight;
     if (inflight != null) return inflight.future;
@@ -170,14 +176,25 @@ class ApiClient {
     try {
       final current = await TokenStore.load();
       if (current == null || current.refreshExpired) {
+        // Refresh token past its 30-day life OR no token at all — this
+        // one IS definitive; nothing left to reissue against.
         await onSignedOutRemotely?.call();
         completer.complete(null);
         return null;
       }
-      final res = await _do(
-        'POST', '/auth/refresh',
-        body: {'refresh_token': current.refreshToken},
-      );
+      final http.Response res;
+      try {
+        res = await _do('POST', '/auth/refresh',
+            body: {'refresh_token': current.refreshToken});
+      } on SocketException {
+        // Offline. Keep the session — the next successful request will
+        // trigger another refresh attempt.
+        completer.complete(null);
+        return null;
+      } on http.ClientException {
+        completer.complete(null);
+        return null;
+      }
       if (res.statusCode == 200) {
         final decoded = _tryDecode(res.body);
         if (decoded is Map<String, dynamic>) {
@@ -192,14 +209,25 @@ class ApiClient {
           return rolled;
         }
       }
-      // Refresh failed — 401 SIGNED_OUT_REMOTELY, network, or garbage
-      // response. Either way the session is over.
-      await onSignedOutRemotely?.call();
+      // Non-200 response. Sign out ONLY on definitive auth failures so a
+      // 500 during backend restart doesn't kick the counsellor to login.
+      final env = _tryDecode(res.body);
+      final code = env is Map && env['error'] is Map
+          ? (env['error']['code'] as String? ?? '')
+          : '';
+      final definitiveAuthFailure = res.statusCode == 401 && (
+          code == 'SIGNED_OUT_REMOTELY' ||
+          code == 'INVALID_TOKEN' ||
+          code == 'REFRESH_EXPIRED');
+      if (definitiveAuthFailure) {
+        await onSignedOutRemotely?.call();
+      }
       completer.complete(null);
       return null;
     } catch (_) {
+      // Unexpected — parse failure, disk I/O, whatever. Don't sign out
+      // for a bug in refresh handling; better to fail a single request.
       completer.complete(null);
-      await onSignedOutRemotely?.call();
       return null;
     } finally {
       _refreshInFlight = null;

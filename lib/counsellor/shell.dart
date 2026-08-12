@@ -3,7 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:provider/provider.dart';
+import '../api/api_errors.dart';
 import '../api/auth_api.dart';
+import '../api/queues_api.dart';
+import '../api/sync_service.dart';
 import '../screens/unified_login.dart';
 import '../services/location_service.dart';
 import '../state/app_state.dart';
@@ -41,6 +44,13 @@ class _ShellState extends State<_Shell> {
   // grows at most O(tabs).
   final List<int> _tabHistory = [0];
 
+  // Backend refresh plumbing (mirrors the doctor/pharmacist shell pattern).
+  // On mount we fetch /queues/summary/tiles + /queues/counsellor/past-7-days
+  // once, then re-fetch each time SyncService drains a batch — that keeps the
+  // tiles + list live with what the server actually sees.
+  SyncService? _sync;
+  int _lastDrainSig = -1;
+
   static const _nav = [
     (Icons.grid_view_rounded, 'Home'),
     (Icons.fact_check_outlined, 'Status'),
@@ -66,11 +76,31 @@ class _ShellState extends State<_Shell> {
       if (mmuId != null && mmuId.isNotEmpty) {
         tracker.start(mmuId: mmuId, counsellor: widget.userName);
       }
+      // First backend pull — populates the Home tiles + list before the
+      // counsellor taps anything. Fire-and-forget: any error surfaces via
+      // CounsellorState.lastRefreshError which the dashboard renders as a
+      // retry banner.
+      _refreshFromBackend();
     });
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Subscribe to SyncService drains — every time a batch (patient
+    // register, doctor submit, dispense, attendance) lands on the server
+    // we re-pull so the counsellor's Home reflects the fresh state without
+    // a manual refresh. This mirrors dshell.dart / pshell.dart.
+    final s = context.read<SyncService>();
+    if (!identical(_sync, s)) {
+      _sync?.removeListener(_onSyncTick);
+      _sync = s..addListener(_onSyncTick);
+    }
+  }
+
+  @override
   void dispose() {
+    _sync?.removeListener(_onSyncTick);
     // If the counsellor closes the app without hitting Logout, still stop the
     // sampler so we don't leak a Timer. Fire-and-forget is fine — the timer is
     // local and gets GC'd when the state does.
@@ -78,6 +108,54 @@ class _ShellState extends State<_Shell> {
       context.read<LocationService>().stop();
     } catch (_) {}
     super.dispose();
+  }
+
+  /// Called every time SyncService notifies. Refresh only when a drain
+  /// has actually landed something (applied/rejected/failed differs from
+  /// the last snapshot) so an idle-notification storm doesn't hammer the
+  /// backend.
+  void _onSyncTick() {
+    final s = _sync;
+    if (s == null || s.lastDrainAt == null) return;
+    final sig = s.lastApplied * 100000 + s.lastRejected * 100 + s.lastFailed;
+    if (sig == _lastDrainSig) return;
+    _lastDrainSig = sig;
+    _refreshFromBackend();
+  }
+
+  /// Pull the counsellor tiles + past-7-days list from /api/queues/*, feed
+  /// them into CounsellorState, and reflect success / error via
+  /// setRefreshState so the dashboard's loading strip + banner update.
+  Future<void> _refreshFromBackend() async {
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final api = context.read<QueuesApi>();
+    store.setRefreshState(loading: true);
+    try {
+      // Two calls run in parallel so the wall-clock is the slower one, not
+      // the sum. Both are cheap read-only queries against the same server
+      // snapshot so drift between the tile counts and the list is minimal.
+      final results = await Future.wait([
+        api.tiles(),
+        api.counsellorPast7Days(limit: 200),
+      ]);
+      if (!mounted) return;
+      final tiles = results[0] as Map<String, dynamic>;
+      final list = results[1] as QueueList;
+      store.applyTiles(tiles);
+      // Merge backend rows into the shared patient list. Uses the 'B'-id
+      // prefix in `mergeBackendPatients` so demo seed / locally-added
+      // patients aren't touched. statusOverride left null — each row
+      // carries its own status from the appointment_status_t enum.
+      store.mergeBackendPatients(list.items);
+      store.setRefreshState(loading: false);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      store.setRefreshState(loading: false, error: e.message);
+    } catch (e) {
+      if (!mounted) return;
+      store.setRefreshState(loading: false, error: e.toString());
+    }
   }
 
   void _go(int i) => setState(() {
@@ -112,7 +190,7 @@ class _ShellState extends State<_Shell> {
     }
     final initials = widget.userName.isEmpty ? 'C' : widget.userName[0].toUpperCase();
     final pages = [
-      CounDashboard(onRegister: () => _go(2), name: widget.userName),
+      CounDashboard(onRegister: () => _go(2), name: widget.userName, onRefresh: _refreshFromBackend),
       // Status → Register tab jump for the Re-Appointment button. Uses the
       // shared CounsellorState.setPrefill so the Register form picks it up on
       // the next frame.

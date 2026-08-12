@@ -285,12 +285,68 @@ class DeniedDelivery {
 /// Shared MMU patient store + counsellor data. Provided at app root so the
 /// Counsellor → Doctor → Pharmacist flow shares one set of patients.
 class CounsellorState extends ChangeNotifier {
-  // 5 curated demo patients (with rich detail — past history, previous Rx,
-  // completed cases) plus 100 procedurally-seeded patients spread across the
-  // past 7 days. The 100 give the doctor's "Past 7 Days" tile enough volume
-  // for the search filter to be meaningful; each still has a real name,
-  // gender/age, block/village, symptoms, and a distributed status.
-  final List<CPatient> patients = _initialPatientSeed();
+  /// Compile-time toggle for the demo seed. Off by default so real installs
+  /// start blank and only render backend data. Turn on for screenshots or
+  /// offline demos with `flutter run --dart-define=DEMO_SEED=true`.
+  static const bool _useDemoSeed =
+      bool.fromEnvironment('DEMO_SEED', defaultValue: false);
+
+  // Patient list. Empty at first launch — populated by:
+  //   1. `mergeBackendPatients()` after /api/queues/counsellor/past-7-days
+  //      (and /api/queues/doctor, /api/queues/pharmacist) lands.
+  //   2. `addPatient()` when the counsellor submits the Register form —
+  //      which also enqueues the mutation for /api/mobile/sync/push so a
+  //      backend row eventually replaces the local one.
+  final List<CPatient> patients =
+      _useDemoSeed ? _initialPatientSeed() : <CPatient>[];
+
+  // Backend tile counts (from /api/queues/summary/tiles). Null until the
+  // first refresh lands. The dashboard getters fall back to local counts
+  // if this is still null, so offline first-open still shows something.
+  int? backendRegisteredToday;
+  int? backendVisitsCompleted;
+  int? backendPast7DaysTotal;
+  int? backendDoctorQueue;
+  int? backendLabQueue;
+  int? backendPharmaQueue;
+  int? backendPendingPayment;
+
+  /// True while a backend refresh is in flight; false when idle.
+  bool refreshing = false;
+  /// Last error surfaced by the backend refresh loop; null on success.
+  String? lastRefreshError;
+  /// Timestamp of the last successful backend refresh.
+  DateTime? lastRefreshAt;
+
+  /// Record the outcome of a backend refresh cycle. Emits a single notify
+  /// so any watching widget rebuilds against the fresh flags / counts.
+  void setRefreshState({required bool loading, String? error}) {
+    refreshing = loading;
+    lastRefreshError = error;
+    if (!loading && error == null) lastRefreshAt = DateTime.now();
+    notifyListeners();
+  }
+
+  /// Apply the /queues/summary/tiles response. Any missing key leaves that
+  /// count untouched so a partial response can't zero-out a good number.
+  void applyTiles(Map<String, dynamic> tiles) {
+    int? asInt(dynamic v) => v is num ? v.toInt() : null;
+    final t = asInt(tiles['today']);
+    final c = asInt(tiles['completed']);
+    final p = asInt(tiles['past_7_days']);
+    final dq = asInt(tiles['doctor_queue']);
+    final lq = asInt(tiles['lab_queue']);
+    final pq = asInt(tiles['pharmacist_queue']);
+    final pp = asInt(tiles['pending_payment']);
+    if (t != null) backendRegisteredToday = t;
+    if (c != null) backendVisitsCompleted = c;
+    if (p != null) backendPast7DaysTotal = p;
+    if (dq != null) backendDoctorQueue = dq;
+    if (lq != null) backendLabQueue = lq;
+    if (pq != null) backendPharmaQueue = pq;
+    if (pp != null) backendPendingPayment = pp;
+    notifyListeners();
+  }
 
   // Re-Appointment flow (rule 2026-07-29): when the counsellor picks
   // "Re-Appointment" on a Status row, the source patient is stashed here and
