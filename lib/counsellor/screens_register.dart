@@ -312,6 +312,37 @@ class _CounRegisterState extends State<CounRegister> {
       masters.masterRows('categories'), category,
       idKey: 'category_id', nameKey: 'category_name');
 
+    // Diagnoses — the counsellor form's "Likely Condition" pre-fill goes
+    // here as one appointment_diagnosis row so the doctor sees the
+    // prediction on their case detail. `disease_id` is resolved from the
+    // masters cache when possible; the backend stores diagnosis_text
+    // regardless so free-text diagnoses (not in the master) still land.
+    final diseaseId = _lookupIdByName(
+      masters.masterRows('diseases'), p.disease,
+      idKey: 'id', nameKey: 'term');
+    final diagnoses = <Map<String, dynamic>>[
+      if (p.disease.trim().isNotEmpty)
+        {
+          'diagnosis_text': p.disease,
+          if (diseaseId != null) 'disease_id': diseaseId,
+          'is_primary': true,
+        },
+    ];
+
+    // Attachments — Prescription / Report / Other photos the counsellor
+    // picked up at registration. For now we send the local file path
+    // (backend stores it as-is); a future upload endpoint will replace
+    // that with a server-hosted URL so the doctor can see the file from
+    // any device, not just the counsellor's phone.
+    final attachments = <Map<String, dynamic>>[
+      for (final a in _attachments)
+        {
+          'file_path': a.path,
+          'kind': a.kind.label,
+          if (a.description.isNotEmpty) 'description': a.description,
+        },
+    ];
+
     // Age/DOB: form enforces one-or-the-other, so send whichever is set.
     // DOB is preferred when the user picked the calendar option.
     final ageValue = knowAge
@@ -356,7 +387,10 @@ class _CounRegisterState extends State<CounRegister> {
       'disability':                pwd == 'Yes',
       if (p.pastHistory.trim().isNotEmpty) 'past_history': p.pastHistory,
       // Appointment leg
-      'appointment_date':  p.regDate,
+      // ISO date (yyyy-mm-dd) — backend Pydantic AppointmentIn expects
+      // Python `date` format, NOT the dd-MM-yyyy display format that
+      // CPatient.regDate uses.
+      'appointment_date':  _isoDate(_apptDate ?? DateTime.now()),
       'payment_type':      payment,
       'paid_amount':       payment == 'Paid'
           ? (num.tryParse(_amount.text.trim()) ?? 0) : 0,
@@ -377,8 +411,13 @@ class _CounRegisterState extends State<CounRegister> {
       if (_asDouble(_hb)    != null) 'hemoglobin':   _asDouble(_hb),
       if (_asDouble(_height) != null) 'height':      _asDouble(_height),
       if (_asDouble(_weight) != null) 'weight':      _asDouble(_weight),
-      // Clinical arrays
+      // Clinical arrays — child tables the backend will insert:
+      //   appointment_symptom  ← symptom_ids
+      //   appointment_diagnosis ← diagnoses
+      //   appointment_attachment ← attachments
       if (symptomIds.isNotEmpty) 'symptom_ids': symptomIds,
+      if (diagnoses.isNotEmpty)  'diagnoses':   diagnoses,
+      if (attachments.isNotEmpty) 'attachments': attachments,
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),
