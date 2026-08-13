@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import '../api/api_errors.dart';
+import '../api/appointments_api.dart';
 import '../api/sync_service.dart';
 import 'cw.dart';
 import 'cdata.dart';
@@ -128,13 +130,117 @@ class _PatientRow extends StatelessWidget {
   }
 }
 
-class CounPatientDetail extends StatelessWidget {
+class CounPatientDetail extends StatefulWidget {
   final CPatient p;
   /// Show the Re-Appointment CTA (rule 2026-07-31). Only the counsellor
   /// Status list opts in — Home / doctor / pharmacist opens keep it off so
   /// the button doesn't show up where it isn't actionable.
   final bool showReAppointment;
   const CounPatientDetail({super.key, required this.p, this.showReAppointment = false});
+  @override
+  State<CounPatientDetail> createState() => _CounPatientDetailState();
+}
+
+class _CounPatientDetailState extends State<CounPatientDetail> {
+  bool _loading = false;
+  String? _err;
+
+  CPatient get p => widget.p;
+
+  @override
+  void initState() {
+    super.initState();
+    // Backend rows (id 'B…') carry only the queue-list summary. Fetch
+    // the full appointment via /api/appointments/{id} so this screen
+    // shows symptoms, diagnoses, vitals + counsellor remarks — none of
+    // which are in the list response. Locally-added patients ('P…')
+    // and demo seed (numeric) already have all fields in memory, so
+    // we skip the network call for them.
+    if (p.backendAppointmentId != null && p.id.startsWith('B')) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _hydrate());
+    }
+  }
+
+  Future<void> _hydrate() async {
+    if (!mounted) return;
+    setState(() { _loading = true; _err = null; });
+    try {
+      final api = context.read<AppointmentsApi>();
+      final d = await api.detail(p.backendAppointmentId!);
+      if (!mounted) return;
+      // Merge server-side clinical fields into the local CPatient in
+      // place. `p` is the same object the shell's `patients` list
+      // holds, so subsequent opens of this screen (or the Status tab)
+      // see the enriched data too — no repeated fetch on re-open.
+      //
+      // Direct assignment (not .clear()..addAll(...)) is deliberate:
+      // the CPatient collection fields may hold a const [] literal
+      // when the queue merge fell through empty, and calling .clear()
+      // on that throws UnmodifiableListMixin. Assignment side-steps
+      // the mutation entirely and the old list becomes garbage.
+      final syms = (d['symptoms'] as List?) ?? const [];
+      p.symptoms = <String>[
+        for (final s in syms)
+          if (s is Map) (s['symptom_name'] ?? s['name'] ?? '').toString()
+      ];
+      final dx = (d['diagnoses'] as List?) ?? const [];
+      if (dx.isNotEmpty && dx.first is Map) {
+        p.disease = ((dx.first as Map)['diagnosis_text'] ?? '').toString();
+      }
+      // Vitals — key/value map keyed by human labels the existing
+      // CCard(Vitals) block already renders.
+      final vitals = <String, String>{};
+      void v(String label, String key) {
+        final val = d[key];
+        if (val != null) vitals[label] = val.toString();
+      }
+      v('Systolic BP', 'systolic_bp');
+      v('Diastolic BP', 'diastolic_bp');
+      v('Blood Sugar', 'blood_sugar');
+      v('Body Temp (°F)', 'body_temp');
+      v('Oxygen', 'oxygen');
+      v('Heart Rate', 'heart_rate');
+      v('Hemoglobin', 'hemoglobin');
+      v('Height (cm)', 'height');
+      v('Weight (kg)', 'weight');
+      p.vitals = vitals;
+      p.remarks = (d['counsellor_remarks'] ?? '').toString();
+      p.doctorRemarks = (d['doctor_remarks'] ?? '').toString();
+      p.observations = (d['observation'] ?? '').toString();
+      p.pregnant = (d['pregnant'] as bool?) ?? p.pregnant;
+      // Prescription — pharmacist-visible rows the doctor entered.
+      final rxRows = (d['prescription'] as List?) ?? const [];
+      p.prescription = <RxItem>[
+        for (final r in rxRows)
+          if (r is Map)
+            RxItem(
+              name: (r['medicine_name'] ?? '').toString(),
+              dosage: (r['dosage'] ?? '').toString(),
+              interval: (r['frequency'] ?? 'TDS').toString(),
+              days: '${r['duration_days'] ?? 5} Days',
+              qty: (r['qty'] as num?)?.toInt() ?? 0,
+              dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+              dispensed: (r['dispensed'] as bool?) ?? false,
+            ),
+      ];
+      // Also tell CounsellorState so the Home list rebuilds against
+      // the enriched row (symptoms show under the name, etc).
+      context.read<CounsellorState>().updateRequisitions();
+      setState(() { _loading = false; });
+    } on ApiException catch (e) {
+      // ignore: avoid_print
+      print('[CounPatientDetail] hydrate ApiException: code=${e.code} '
+            'status=${e.statusCode} message=${e.message}');
+      if (!mounted) return;
+      setState(() { _loading = false; _err = e.message; });
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('[CounPatientDetail] hydrate error: $e\n$st');
+      if (!mounted) return;
+      setState(() { _loading = false; _err = e.toString(); });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return MediaQuery(
@@ -146,7 +252,28 @@ class CounPatientDetail extends StatelessWidget {
           shape: const Border(bottom: BorderSide(color: C2.cyan, width: 3)),
           title: Text('Patient Details', style: ct(16, FontWeight.w700, C2.navy)),
         ),
-        body: SingleChildScrollView(
+        body: Column(children: [
+          // Backend fetch progress — thin bar while /appointments/{id}
+          // is being pulled to enrich this screen (symptoms + vitals +
+          // remarks that the queue list didn't carry).
+          if (_loading) const SizedBox(height: 2, child: LinearProgressIndicator(minHeight: 2)),
+          if (!_loading && _err != null)
+            Padding(padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+              child: InkWell(
+                onTap: _hydrate,
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),
+                  child: Row(children: [
+                    const Icon(Icons.cloud_off, size: 14, color: C2.danger),
+                    const SizedBox(width: 6),
+                    Expanded(child: Text('Showing cached view — tap to retry',
+                      style: ct(11, FontWeight.w500, C2.danger))),
+                    const Icon(Icons.refresh, size: 14, color: C2.danger),
+                  ]),
+                ),
+              )),
+          Expanded(child: SingleChildScrollView(
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -178,7 +305,7 @@ class CounPatientDetail extends StatelessWidget {
               // Re-Appointment CTA (rule 2026-07-31). Sits at the end of the
               // Registration Details card so the counsellor sees it right
               // where they read the demographics.
-              if (showReAppointment) ...[
+              if (widget.showReAppointment) ...[
                 const SizedBox(height: 12),
                 CPrimaryButton(
                   'Re-Appointment',
@@ -220,7 +347,8 @@ class CounPatientDetail extends StatelessWidget {
                 Text(p.doctorRemarks, style: ct(13, FontWeight.w400, C2.text)),
               ])),
           ]),
-        ),
+        )),
+        ]),
       ),
     );
   }
