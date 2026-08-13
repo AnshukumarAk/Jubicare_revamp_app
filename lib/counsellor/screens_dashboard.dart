@@ -226,9 +226,14 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       context.read<CounsellorState>().updateRequisitions();
       setState(() { _loading = false; });
     } on ApiException catch (e) {
+      // ignore: avoid_print
+      print('[CounPatientDetail] hydrate ApiException: code=${e.code} '
+            'status=${e.statusCode} message=${e.message}');
       if (!mounted) return;
       setState(() { _loading = false; _err = e.message; });
-    } catch (e) {
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('[CounPatientDetail] hydrate error: $e\n$st');
       if (!mounted) return;
       setState(() { _loading = false; _err = e.toString(); });
     }
