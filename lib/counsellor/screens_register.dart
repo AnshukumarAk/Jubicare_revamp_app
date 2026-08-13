@@ -48,6 +48,35 @@ int? _lookupIdByName(List<Map<String, dynamic>> rows, String? name,
   return null;
 }
 
+/// Disease-specific lookup that also matches against the `synonyms`
+/// array each master row carries. Backend seeds Dengue with synonyms
+/// ["dengue","dengue fever","DHF","dengue bukhar","haddi tod bukhar",
+/// "break bone fever"] — without this pass, the mobile's "Dengue
+/// Fever" pick from the ML scorer wouldn't link to id 97.
+int? _lookupDiseaseId(List<Map<String, dynamic>> rows, String? name) {
+  if (name == null || name.trim().isEmpty) return null;
+  final n = name.trim().toLowerCase();
+  for (final r in rows) {
+    final rn = (r['term'] ?? r['name'] ?? r['disease_name'])?.toString().trim().toLowerCase();
+    if (rn == n) return _asIntFromDynamic(r['id'] ?? r['disease_id']);
+    final syns = r['synonyms'];
+    if (syns is List) {
+      for (final s in syns) {
+        if (s != null && s.toString().trim().toLowerCase() == n) {
+          return _asIntFromDynamic(r['id'] ?? r['disease_id']);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+int? _asIntFromDynamic(dynamic v) {
+  if (v is num) return v.toInt();
+  if (v is String) return int.tryParse(v);
+  return null;
+}
+
 /// Convert a numeric-in-a-controller to a nullable double. Empty or
 /// unparseable → null (so the backend stores NULL instead of `0`, which
 /// would look like a real reading).
@@ -309,23 +338,20 @@ class _CounRegisterState extends State<CounRegister> {
     final masters = context.read<MastersStore>();
     final appState = context.read<AppState>();
 
-    // Resolve symptom name → id via the masters cache. Names that
-    // resolve go in `symptom_ids`; anything unresolved (custom entries
-    // like "Rash" that the backend's symptom_master hasn't been seeded
-    // with yet) goes in `symptom_names` so the backend can auto-insert
-    // them and still link the appointment_symptom row on this visit.
+    // Master-driven only. Resolve symptom name → id via the masters
+    // cache and send `symptom_ids` alone. Names that don't resolve are
+    // dropped here rather than sent as free-text — polluting the
+    // symptom_master with client-typed variants ("Rash" vs "Skin rash")
+    // is a data-quality problem the backend team should fix by seeding
+    // the master properly, not by client auto-add. The mobile symptom
+    // picker is already restricted to master-list entries, so a miss
+    // here means the counsellor typed something outside that list.
     final symptomRows = masters.masterRows('symptoms');
-    final symptomIds = <int>[];
-    final symptomNames = <String>[];
-    for (final s in symptoms) {
-      final id = _lookupIdByName(symptomRows, s,
-          idKey: 'id', nameKey: 'term');
-      if (id != null) {
-        symptomIds.add(id);
-      } else {
-        symptomNames.add(s);
-      }
-    }
+    final symptomIds = <int>[
+      for (final s in symptoms)
+        if (_lookupIdByName(symptomRows, s, idKey: 'id', nameKey: 'term') is int)
+          _lookupIdByName(symptomRows, s, idKey: 'id', nameKey: 'term')!,
+    ];
 
     // Resolve category label → id via masters.categories. Bootstrap
     // returns rows as `{id, name}` so the plain 'id'/'name' keys work
@@ -339,9 +365,13 @@ class _CounRegisterState extends State<CounRegister> {
     // prediction on their case detail. `disease_id` is resolved from the
     // masters cache when possible; the backend stores diagnosis_text
     // regardless so free-text diagnoses (not in the master) still land.
-    final diseaseId = _lookupIdByName(
-      masters.masterRows('diseases'), p.disease,
-      idKey: 'id', nameKey: 'term');
+    //
+    // Match against both `term` (canonical name) and `synonyms` (e.g.
+    // "Dengue Fever" → synonym of master "Dengue" id 97). Without the
+    // synonym pass the mobile's ML picker sends "Dengue Fever" and the
+    // backend link stays NULL because there's no exact-name row.
+    final diseaseId = _lookupDiseaseId(
+      masters.masterRows('diseases'), p.disease);
     final diagnoses = <Map<String, dynamic>>[
       if (p.disease.trim().isNotEmpty)
         {
@@ -434,13 +464,12 @@ class _CounRegisterState extends State<CounRegister> {
       if (_asDouble(_height) != null) 'height':      _asDouble(_height),
       if (_asDouble(_weight) != null) 'weight':      _asDouble(_weight),
       // Clinical arrays — child tables the backend will insert:
-      //   appointment_symptom  ← symptom_ids + symptom_names (auto-added)
-      //   appointment_diagnosis ← diagnoses
+      //   appointment_symptom  ← symptom_ids (master-driven, no free-text)
+      //   appointment_diagnosis ← diagnoses (text-primary; disease_id optional)
       //   appointment_attachment ← attachments
-      if (symptomIds.isNotEmpty)   'symptom_ids':   symptomIds,
-      if (symptomNames.isNotEmpty) 'symptom_names': symptomNames,
-      if (diagnoses.isNotEmpty)    'diagnoses':     diagnoses,
-      if (attachments.isNotEmpty)  'attachments':   attachments,
+      if (symptomIds.isNotEmpty)  'symptom_ids': symptomIds,
+      if (diagnoses.isNotEmpty)   'diagnoses':   diagnoses,
+      if (attachments.isNotEmpty) 'attachments': attachments,
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),

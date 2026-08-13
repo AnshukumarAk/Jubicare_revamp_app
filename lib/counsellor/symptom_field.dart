@@ -163,15 +163,21 @@ class _SymptomFieldState extends State<SymptomField> {
           children.add(_sugItem(s, null, null));
         }
       }
-      // Always allow adding the typed symptom as free text (so any typed
-      // symptom is captured and shows on the Home registered-patients list).
-      // Backend handler now accepts unresolved symptoms via `symptom_names`
-      // (mirror array to `symptom_ids`) — unknown terms get inserted into
-      // symptom_master on the fly so the next registration finds them.
-      final exact = matches.any((s) => s.toLowerCase() == q) || _has(_q.trim());
-      if (!exact) {
-        children.add(_sugHeader('Add typed symptom', const Color(0xFFEDF7E0), C2.green));
-        children.add(_sugItem('Add "${_q.trim()}"', Icons.add_circle_outline, C2.green, value: _q.trim()));
+      // Master-driven only (2026-08-13 rule). If nothing in the master
+      // list matches what the counsellor typed, show a gentle prompt
+      // instead of an "Add typed symptom" shortcut — the earlier
+      // free-text path polluted symptom_master with duplicate variants
+      // ("Rash" vs "Skin rash"). Missing entries are a backend
+      // data-seed issue: add the row via migrate.sql, not from the app.
+      if (matches.isEmpty && !kSymAlias.containsKey(q)) {
+        children.add(_sugHeader('Not in list', const Color(0xFFFEECEA), C2.danger));
+        children.add(Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          child: Text(
+            '"${_q.trim()}" is not a recognised symptom. Try a keyword like "fever" or "rash" — or ask the admin to add it to the master list.',
+            style: ct(11.5, FontWeight.w400, C2.text2),
+          ),
+        ));
       }
     }
     if (children.isEmpty) return const SizedBox.shrink();
