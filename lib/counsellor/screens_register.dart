@@ -18,19 +18,29 @@ String _isoDate(DateTime d) =>
     '${d.month.toString().padLeft(2, '0')}-'
     '${d.day.toString().padLeft(2, '0')}';
 
-/// Best-effort id lookup for a value in a `masters` sublist. Handles the
-/// two common shapes the bootstrap payload returns rows in — either
-/// `{symptom_id, symptom_name}` (per-domain keys) or `{id, name}` — and
-/// matches case-insensitively so "Fever" and "fever" both resolve.
+/// Best-effort id lookup for a value in a `masters` sublist. The bootstrap
+/// payload returns each master row with `{id, name}` OR `{id, term}` OR
+/// per-domain keys like `{symptom_id, symptom_name}` (depending on how
+/// each master was aliased in the backend's SELECT). The fallback chain
+/// covers all three shapes so callers don't have to worry which one
+/// applies to which master. Case-insensitive so "Fever" and "fever" match.
 int? _lookupIdByName(List<Map<String, dynamic>> rows, String? name,
     {String idKey = 'id', String nameKey = 'name'}) {
   if (name == null || name.trim().isEmpty) return null;
   final n = name.trim().toLowerCase();
   for (final r in rows) {
-    final rn = (r[nameKey] ?? r['name'] ?? r['symptom_name'] ?? r['category_name'])
+    final rn = (r[nameKey]
+            ?? r['name']
+            ?? r['term']          // symptoms + diseases are aliased to `term`
+            ?? r['symptom_name']
+            ?? r['category_name'])
         ?.toString().trim().toLowerCase();
     if (rn == n) {
-      final id = r[idKey] ?? r['id'] ?? r['symptom_id'] ?? r['category_id'];
+      final id = r[idKey]
+          ?? r['id']
+          ?? r['symptom_id']
+          ?? r['category_id']
+          ?? r['disease_id'];
       if (id is num) return id.toInt();
       if (id is String) return int.tryParse(id);
     }
@@ -78,6 +88,13 @@ class CounRegister extends StatefulWidget {
 }
 
 class _CounRegisterState extends State<CounRegister> {
+  /// Bumped on every _reset() so the VoiceMicButton (patient remarks) gets
+  /// a fresh key. That forces Flutter to dispose the old widget State —
+  /// killing any in-flight speech recognition, and dropping the internal
+  /// `_base` transcript that would otherwise leak into the next patient's
+  /// form. Root cause of "old value showing on user2's remarks field".
+  int _voiceMicSeq = 0;
+
   // basic
   final _name = TextEditingController();
   String gender = 'Female';
@@ -292,25 +309,30 @@ class _CounRegisterState extends State<CounRegister> {
     final masters = context.read<MastersStore>();
     final appState = context.read<AppState>();
 
-    // Resolve symptom name → id via the masters cache. Names that don't
-    // match any master (custom / free-text entries) are silently dropped
-    // for now — the appointment_symptom link table only accepts real ids.
-    // TODO: when the backend adds a `symptom_names` accept path, send raw
-    // names too so custom symptoms round-trip.
+    // Resolve symptom name → id via the masters cache. Names that
+    // resolve go in `symptom_ids`; anything unresolved (custom entries
+    // like "Rash" that the backend's symptom_master hasn't been seeded
+    // with yet) goes in `symptom_names` so the backend can auto-insert
+    // them and still link the appointment_symptom row on this visit.
     final symptomRows = masters.masterRows('symptoms');
-    final symptomIds = <int>[
-      for (final s in symptoms)
-        if (_lookupIdByName(symptomRows, s,
-                idKey: 'symptom_id', nameKey: 'symptom_name') is int)
-          _lookupIdByName(symptomRows, s,
-              idKey: 'symptom_id', nameKey: 'symptom_name')!,
-    ];
+    final symptomIds = <int>[];
+    final symptomNames = <String>[];
+    for (final s in symptoms) {
+      final id = _lookupIdByName(symptomRows, s,
+          idKey: 'id', nameKey: 'term');
+      if (id != null) {
+        symptomIds.add(id);
+      } else {
+        symptomNames.add(s);
+      }
+    }
 
-    // Resolve category label → id via masters.categories. Null if the
-    // user didn't pick a category or the name isn't in the master.
+    // Resolve category label → id via masters.categories. Bootstrap
+    // returns rows as `{id, name}` so the plain 'id'/'name' keys work
+    // (the fallback in _lookupIdByName also covers the aliased shape).
     final categoryId = _lookupIdByName(
       masters.masterRows('categories'), category,
-      idKey: 'category_id', nameKey: 'category_name');
+      idKey: 'id', nameKey: 'name');
 
     // Diagnoses — the counsellor form's "Likely Condition" pre-fill goes
     // here as one appointment_diagnosis row so the doctor sees the
@@ -412,12 +434,13 @@ class _CounRegisterState extends State<CounRegister> {
       if (_asDouble(_height) != null) 'height':      _asDouble(_height),
       if (_asDouble(_weight) != null) 'weight':      _asDouble(_weight),
       // Clinical arrays — child tables the backend will insert:
-      //   appointment_symptom  ← symptom_ids
+      //   appointment_symptom  ← symptom_ids + symptom_names (auto-added)
       //   appointment_diagnosis ← diagnoses
       //   appointment_attachment ← attachments
-      if (symptomIds.isNotEmpty) 'symptom_ids': symptomIds,
-      if (diagnoses.isNotEmpty)  'diagnoses':   diagnoses,
-      if (attachments.isNotEmpty) 'attachments': attachments,
+      if (symptomIds.isNotEmpty)   'symptom_ids':   symptomIds,
+      if (symptomNames.isNotEmpty) 'symptom_names': symptomNames,
+      if (diagnoses.isNotEmpty)    'diagnoses':     diagnoses,
+      if (attachments.isNotEmpty)  'attachments':   attachments,
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),
@@ -443,6 +466,12 @@ class _CounRegisterState extends State<CounRegister> {
       // Drop the re-appointment source so the next fresh registration
       // doesn't accidentally inherit history from the previous submit.
       _reAppointmentSource = null;
+      // Bump the mic key so the VoiceMicButton on Patient Remarks is
+      // fully torn down + rebuilt — otherwise its in-flight speech
+      // recogniser (with the previous patient's transcript in `_base`)
+      // keeps writing to the freshly-cleared controller as new words
+      // arrive, resurrecting the old text.
+      _voiceMicSeq++;
     });
   }
 
@@ -656,7 +685,9 @@ class _CounRegisterState extends State<CounRegister> {
           CField('Paid Amount (₹)', TextField(controller: _amount, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)], decoration: cInput()), required: true),
         CField('Doctor Assignment', _dd(kDoctors, doctor, (v) => setState(() => doctor = v), hint: 'Select Doctor'), required: true),
         CField('Patient Remarks', TextField(controller: _remarks, minLines: 2, maxLines: 4, decoration: cInput('Type or use the mic').copyWith(
-          suffixIcon: VoiceMicButton(controller: _remarks)))),
+          suffixIcon: VoiceMicButton(
+            key: ValueKey('remarks-mic-$_voiceMicSeq'),
+            controller: _remarks)))),
       ])),
 
       const SizedBox(height: 4),

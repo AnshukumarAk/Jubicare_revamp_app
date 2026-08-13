@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../api/masters_store.dart';
 import '../services/connectivity_service.dart';
 import 'cdata.dart';
 import 'cw.dart';
@@ -16,6 +17,15 @@ class SymptomField extends StatefulWidget {
 }
 
 class _SymptomFieldState extends State<SymptomField> {
+  /// Compile-time flag for the three AI panels ("Common in {block}",
+  /// "Related symptoms", "Likely Conditions"). Off by default so the
+  /// counsellor doesn't see suggestions that are drifting from what
+  /// the backend actually knows. Turn back on with
+  /// `flutter run --dart-define=AI_PANELS=true` once the panels' data
+  /// comes from backend masters instead of hardcoded cdata.dart maps.
+  static const bool _showAiPanels =
+      bool.fromEnvironment('AI_PANELS', defaultValue: false);
+
   final _c = TextEditingController();
   final _focus = FocusNode();
   String _q = '';
@@ -88,8 +98,14 @@ class _SymptomFieldState extends State<SymptomField> {
       ),
       // suggestion dropdown
       if (_focus.hasFocus) _suggestions(geo),
-      // AI panels
-      if (_sel.isNotEmpty) ...[
+      // AI panels — "Common in {block}", "Related symptoms", "Likely
+      // Conditions". Hidden per user request (2026-08-13) because the
+      // underlying data (kGeoDb / kRelated / kDiseaseDb in cdata.dart)
+      // is local hardcoded rather than pulled from backend masters, so
+      // the panels can lie relative to what the doctor / lab actually see.
+      // Turn back on with `flutter run --dart-define=AI_PANELS=true` once
+      // backend endpoints exist for these three feeds.
+      if (_showAiPanels && _sel.isNotEmpty) ...[
         const SizedBox(height: 8),
         _geoPanel(geo),
         const SizedBox(height: 6),
@@ -102,9 +118,30 @@ class _SymptomFieldState extends State<SymptomField> {
     ]);
   }
 
+  /// Symptom list pulled from the backend masters cache (bootstrap →
+  /// MastersStore). Rows are `{id, term}`; we return just the terms so
+  /// the suggestion dropdown is drop-in compatible with the old
+  /// `kAllSymptoms` list. Falls back to the local hardcoded list if
+  /// the masters cache hasn't hydrated yet (first launch, no network) —
+  /// so the counsellor is never staring at an empty picker.
+  List<String> _symptomTerms(MastersStore masters) {
+    final rows = masters.masterRows('symptoms');
+    if (rows.isEmpty) return kAllSymptoms;
+    return [
+      for (final r in rows)
+        if ((r['term'] ?? r['name'] ?? r['symptom_name']) != null)
+          (r['term'] ?? r['name'] ?? r['symptom_name']).toString()
+    ];
+  }
+
   Widget _suggestions(GeoBlock geo) {
     final q = _q.trim().toLowerCase();
     final children = <Widget>[];
+    // Pull the symptom list from backend masters so the counsellor only
+    // picks values the DB actually knows — no more "Rash selected on
+    // mobile but silently dropped because symptom_master doesn't have it".
+    final masters = context.watch<MastersStore>();
+    final allSymptoms = _symptomTerms(masters);
     if (q.isEmpty) {
       children.add(_sugHeader('Common in ${widget.block ?? "Gajraula"}', const Color(0xFFFEF7E0), const Color(0xFFB8860B)));
       for (final s in geo.geo.where((s) => !_has(s)).take(6)) {
@@ -117,7 +154,7 @@ class _SymptomFieldState extends State<SymptomField> {
           children.add(_sugItem(s, Icons.subdirectory_arrow_right, C2.green));
         }
       }
-      final matches = kAllSymptoms.where((s) => s.toLowerCase().contains(q) && !_has(s)).take(8).toList();
+      final matches = allSymptoms.where((s) => s.toLowerCase().contains(q) && !_has(s)).take(8).toList();
       if (matches.isNotEmpty) {
         children.add(_sugHeader('Symptoms', C2.navyLight, C2.navy));
         for (final s in matches) {
@@ -126,6 +163,9 @@ class _SymptomFieldState extends State<SymptomField> {
       }
       // Always allow adding the typed symptom as free text (so any typed
       // symptom is captured and shows on the Home registered-patients list).
+      // Backend handler now accepts unresolved symptoms via `symptom_names`
+      // (mirror array to `symptom_ids`) — unknown terms get inserted into
+      // symptom_master on the fly so the next registration finds them.
       final exact = matches.any((s) => s.toLowerCase() == q) || _has(_q.trim());
       if (!exact) {
         children.add(_sugHeader('Add typed symptom', const Color(0xFFEDF7E0), C2.green));
