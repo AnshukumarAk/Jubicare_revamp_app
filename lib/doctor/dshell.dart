@@ -8,6 +8,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../api/api_errors.dart';
+import '../api/attendance_api.dart';
 import '../api/auth_api.dart';
 import '../api/queues_api.dart';
 import '../api/sync_service.dart';
@@ -476,10 +477,73 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
   void initState() {
     super.initState();
     _date = fmtDate(DateTime.now());
+    _hydrateTodayFromBackend();
   }
 
   @override
   void dispose() { _notes.dispose(); super.dispose(); }
+
+  /// Rebuild today's shift from the server so Check-Out survives a restart.
+  ///
+  /// `doctorAttendance` is in-memory only — a relaunch (or a hot restart)
+  /// empties it, so `_openDoctorShift` returns null and Check-Out stays
+  /// disabled all day even though the morning's Check-In is safely on the
+  /// server. GET /api/attendance/today is the authority on whether this
+  /// user has an open shift, so ask it before deciding what the form allows.
+  Future<void> _hydrateTodayFromBackend() async {
+    try {
+      final res = await context.read<AttendanceApi>().today();
+      final row = res['attendance'];
+      if (row is! Map) return;
+      final m = row.cast<String, dynamic>();
+      final date    = _fmtServerDate('${m['attendance_date'] ?? ''}');
+      final checkIn = _fmtServerTime('${m['check_in'] ?? ''}');
+      // No usable check-in means there is nothing to reopen.
+      if (date.isEmpty || checkIn.isEmpty) return;
+      if (!mounted) return;
+      final s = context.read<CounsellorState>();
+      // A record marked in this same session already covers the day —
+      // re-adding it would show the shift twice in History.
+      if (s.doctorAttendance.any((r) => r.date == date)) return;
+      s.addDoctorAttendance(AttendanceRecord(
+        date:      date,
+        checkIn:   checkIn,
+        checkOut:  _fmtServerTime('${m['check_out'] ?? ''}'),
+        location:  '${m['location'] ?? m['anchor_name'] ?? ''}',
+        status:    '${m['status'] ?? 'Present'}',
+        notes:     '${m['notes'] ?? ''}',
+        photoPath: '${m['photo_path'] ?? ''}',
+        photo:     '${m['photo_path'] ?? ''}'.isNotEmpty,
+        lat:       (m['latitude']  as num?)?.toDouble(),
+        lng:       (m['longitude'] as num?)?.toDouble(),
+      ));
+      if (mounted) setState(() {});
+    } catch (_) {
+      // Offline, or the endpoint isn't deployed — fall back to local state.
+      // Check-In still works; Check-Out stays gated exactly as before.
+    }
+  }
+
+  /// '2026-08-13' (or an ISO datetime) -> '13-08-2026', matching [fmtDate].
+  static String _fmtServerDate(String v) {
+    if (v.length < 10) return '';
+    final p = v.substring(0, 10).split('-');
+    if (p.length != 3) return '';
+    return '${p[2]}-${p[1]}-${p[0]}';
+  }
+
+  /// '14:05:00' (or an ISO datetime) -> '2:05 PM'. Blank/null stays blank,
+  /// which is what marks a shift as still open.
+  static String _fmtServerTime(String v) {
+    if (v.isEmpty || v == 'null') return '';
+    final t = v.contains('T') ? v.split('T').last : v;
+    final p = t.split(':');
+    if (p.length < 2) return '';
+    final h = int.tryParse(p[0]);
+    final m = int.tryParse(p[1]);
+    if (h == null || m == null || h > 23 || m > 59) return '';
+    return fmtTime12(TimeOfDay(hour: h, minute: m));
+  }
 
   /// Today's open check-in record for the doctor (rule 2026-08-05).
   /// Non-null when a check-in without a matching check-out exists — that's
