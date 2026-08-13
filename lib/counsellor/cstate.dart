@@ -54,7 +54,25 @@ class Attachment {
   final String path;         // local filesystem path (from ImagePicker)
   final AttachmentKind kind; // Prescription / Report / Other
   final String description;  // free-text description entered by counsellor
-  const Attachment({required this.path, required this.kind, this.description = ''});
+  /// Server-side name returned by POST /api/mobile/uploads
+  /// ("patient_docs/<random>.jpg"). Null until the upload lands — the sync
+  /// payload falls back to [path] so an offline registration still records
+  /// that a photo existed, even if only the capturing phone can open it.
+  final String? serverPath;
+  const Attachment({
+    required this.path,
+    required this.kind,
+    this.description = '',
+    this.serverPath,
+  });
+
+  Attachment copyWith({AttachmentKind? kind, String? description, String? serverPath}) =>
+      Attachment(
+        path: path,
+        kind: kind ?? this.kind,
+        description: description ?? this.description,
+        serverPath: serverPath ?? this.serverPath,
+      );
 }
 
 class CPatient {
@@ -879,12 +897,15 @@ class CounsellorState extends ChangeNotifier {
       final regDateFmt = _fmtIsoDate(apptDateIso);
       final registeredOn = _relRegisteredOn(apptDateIso);
       // Symptoms come back as a Postgres text[] which the JSON encoder
-      // renders as a Dart List. Missing / empty rows land as null and
-      // we skip cleanly.
+      // renders as a Dart List. Missing / empty rows land as null.
+      // Always produce a MUTABLE list — CounPatientDetail's hydrate
+      // does `p.symptoms.clear()..addAll(...)`, and a const empty list
+      // fallback throws UnmodifiableListMixin.clear on the empty case
+      // (backend deploy of the queue-symptoms commit still pending).
       final rawSyms = row['symptoms'];
       final syms = rawSyms is List
-          ? [ for (final s in rawSyms) if (s != null) s.toString() ]
-          : const <String>[];
+          ? <String>[ for (final s in rawSyms) if (s != null) s.toString() ]
+          : <String>[];
       final adapted = CPatient(
         id:          'B$patientId',
         name:        (row['patient_name'] as String?)?.trim().isNotEmpty == true

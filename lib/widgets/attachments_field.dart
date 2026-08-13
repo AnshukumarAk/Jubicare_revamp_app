@@ -2,7 +2,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:provider/provider.dart';
 
+import '../api/uploads_api.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/cw.dart';
 
@@ -72,6 +74,12 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
       if (shot == null) return;
       final next = [...widget.value, Attachment(path: shot.path, kind: AttachmentKind.prescription)];
       widget.onChanged(next);
+      // Fire the server upload immediately — don't block the camera flow.
+      // On success the matching row gains serverPath so the sync payload
+      // sends "patient_docs/<random>.jpg" instead of the phone-local path.
+      // On failure (offline / server hiccup) the row keeps only the local
+      // path; the register still works, just without a server copy.
+      _uploadInBackground(shot.path);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -82,9 +90,30 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
     }
   }
 
+  Future<void> _uploadInBackground(String localPath) async {
+    try {
+      final api = context.read<UploadsApi>();
+      final res = await api.uploadImage(localPath);
+      final serverName = (res['file_name'] as String?) ?? '';
+      if (serverName.isEmpty || !mounted) return;
+      // Find the row by its local path (the list may have grown/reordered
+      // while the upload was in flight) and stamp the server name on it.
+      final list = [...widget.value];
+      final i = list.indexWhere((a) => a.path == localPath);
+      if (i < 0) return; // row was removed while uploading — drop silently
+      list[i] = list[i].copyWith(serverPath: serverName);
+      widget.onChanged(list);
+    } catch (_) {
+      // Best-effort: offline or server error. Local path stays; nothing
+      // to surface — the counsellor shouldn't be interrupted mid-camera.
+    }
+  }
+
   void _updateKind(int i, AttachmentKind kind) {
     final list = [...widget.value];
-    list[i] = Attachment(path: list[i].path, kind: kind, description: _descCtrls[i].text);
+    // copyWith so the serverPath stamped by the background upload survives
+    // a kind / description edit made while (or after) the upload ran.
+    list[i] = list[i].copyWith(kind: kind, description: _descCtrls[i].text);
     widget.onChanged(list);
   }
 
@@ -92,7 +121,7 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
     // Do NOT rebuild — the TextEditingController already reflects the text.
     // We only need the parent state so the value is committed on submit.
     final list = [...widget.value];
-    list[i] = Attachment(path: list[i].path, kind: list[i].kind, description: desc);
+    list[i] = list[i].copyWith(description: desc);
     widget.onChanged(list);
   }
 

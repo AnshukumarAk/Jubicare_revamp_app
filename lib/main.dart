@@ -15,6 +15,7 @@ import 'api/staff_api.dart';
 import 'api/sync_api.dart';
 import 'api/sync_service.dart';
 import 'api/token_store.dart';
+import 'api/uploads_api.dart';
 import 'models/models.dart';
 import 'state/app_state.dart';
 import 'state/auth_persistence.dart';
@@ -69,6 +70,7 @@ void main() async {
   final devicesApi       = DevicesApi(apiClient);
   final requisitionsApi  = RequisitionsApi(apiClient);
   final staffApi         = StaffApi(apiClient);
+  final uploadsApi       = UploadsApi(apiClient);
 
   final mastersStore = MastersStore(bootstrapApi);
   await mastersStore.hydrate();
@@ -95,6 +97,7 @@ void main() async {
     devicesApi:       devicesApi,
     requisitionsApi:  requisitionsApi,
     staffApi:         staffApi,
+    uploadsApi:       uploadsApi,
     mastersStore:     mastersStore,
     syncService:      syncService,
   ));
@@ -115,6 +118,7 @@ class JubiCareApp extends StatelessWidget {
   final DevicesApi devicesApi;
   final RequisitionsApi requisitionsApi;
   final StaffApi staffApi;
+  final UploadsApi uploadsApi;
   final MastersStore mastersStore;
   final SyncService syncService;
 
@@ -133,6 +137,7 @@ class JubiCareApp extends StatelessWidget {
     required this.devicesApi,
     required this.requisitionsApi,
     required this.staffApi,
+    required this.uploadsApi,
     required this.mastersStore,
     required this.syncService,
     this.session,
@@ -196,6 +201,7 @@ class JubiCareApp extends StatelessWidget {
         Provider<DevicesApi>.value(value: devicesApi),
         Provider<RequisitionsApi>.value(value: requisitionsApi),
         Provider<StaffApi>.value(value: staffApi),
+        Provider<UploadsApi>.value(value: uploadsApi),
         ChangeNotifierProvider<MastersStore>.value(value: mastersStore),
         ChangeNotifierProvider<SyncService>.value(value: syncService),
         // Existing services.

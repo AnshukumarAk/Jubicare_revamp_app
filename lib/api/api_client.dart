@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart' show MediaType;
 
 import 'api_errors.dart';
 import 'token_store.dart';
@@ -71,6 +72,65 @@ class ApiClient {
 
   Future<dynamic> delete(String path, {Object? body, bool auth = true}) =>
       _send('DELETE', path, body: body, auth: auth);
+
+  /// Multipart file upload (POST). Used by UploadsApi for prescription /
+  /// report photos. Reuses the same token plumbing as _send — proactive
+  /// refresh before the request, one reactive refresh + retry on 401
+  /// TOKEN_EXPIRED.
+  Future<dynamic> postMultipartFile(String path, {
+    required String filePath,
+    String field = 'file',
+    String? contentTypeOverride,
+  }) async {
+    final t = await _validAccessToken();
+    if (t == null) {
+      throw const ApiException(
+        code: ApiErrorCode.signedOutRemotely,
+        message: 'You have been signed out. Please sign in again.',
+      );
+    }
+
+    Future<http.Response> doSend(String bearer) async {
+      final req = http.MultipartRequest('POST', _uri(path, null));
+      req.headers['Accept'] = 'application/json';
+      req.headers['Authorization'] = 'Bearer $bearer';
+      // Infer content type from the extension — the backend allowlists
+      // by declared type, and MultipartFile defaults to octet-stream
+      // which would be refused.
+      final lower = filePath.toLowerCase();
+      final mime = contentTypeOverride ??
+          (lower.endsWith('.png') ? 'image/png'
+           : lower.endsWith('.webp') ? 'image/webp'
+           : 'image/jpeg');
+      req.files.add(await http.MultipartFile.fromPath(
+        field, filePath,
+        contentType: MediaType.parse(mime),
+      ));
+      final streamed = await req.send();
+      return http.Response.fromStream(streamed);
+    }
+
+    try {
+      var res = await doSend(t);
+      if (res.statusCode == 401) {
+        final env = _tryDecode(res.body);
+        final code = env is Map && env['error'] is Map
+            ? env['error']['code']?.toString() ?? ''
+            : '';
+        if (code == 'TOKEN_EXPIRED') {
+          final rolled = await _refreshOnce();
+          if (rolled != null) {
+            res = await doSend(rolled.accessToken);
+          }
+        }
+      }
+      return _decode(res);
+    } on SocketException catch (e) {
+      throw ApiException.network(e);
+    } on http.ClientException catch (e) {
+      throw ApiException.network(e);
+    }
+  }
 
   Future<dynamic> _send(String method, String path,
       {Object? body, Map<String, dynamic>? query, bool auth = true}) async {

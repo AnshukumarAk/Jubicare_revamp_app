@@ -382,14 +382,16 @@ class _CounRegisterState extends State<CounRegister> {
     ];
 
     // Attachments — Prescription / Report / Other photos the counsellor
-    // picked up at registration. For now we send the local file path
-    // (backend stores it as-is); a future upload endpoint will replace
-    // that with a server-hosted URL so the doctor can see the file from
-    // any device, not just the counsellor's phone.
+    // picked up at registration. Each photo was uploaded to
+    // /api/mobile/uploads the moment it was captured; `serverPath` holds
+    // the returned "patient_docs/<random>.jpg" name that any device can
+    // fetch via GET /uploads/<name>. Falls back to the phone-local path
+    // only when the upload never landed (offline capture) so the record
+    // still notes a photo existed.
     final attachments = <Map<String, dynamic>>[
       for (final a in _attachments)
         {
-          'file_path': a.path,
+          'file_path': a.serverPath ?? a.path,
           'kind': a.kind.label,
           if (a.description.isNotEmpty) 'description': a.description,
         },

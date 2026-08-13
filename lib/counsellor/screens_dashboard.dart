@@ -172,11 +172,17 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       // place. `p` is the same object the shell's `patients` list
       // holds, so subsequent opens of this screen (or the Status tab)
       // see the enriched data too — no repeated fetch on re-open.
+      //
+      // Direct assignment (not .clear()..addAll(...)) is deliberate:
+      // the CPatient collection fields may hold a const [] literal
+      // when the queue merge fell through empty, and calling .clear()
+      // on that throws UnmodifiableListMixin. Assignment side-steps
+      // the mutation entirely and the old list becomes garbage.
       final syms = (d['symptoms'] as List?) ?? const [];
-      p.symptoms
-        ..clear()
-        ..addAll([for (final s in syms) if (s is Map)
-          (s['symptom_name'] ?? s['name'] ?? '').toString()]);
+      p.symptoms = <String>[
+        for (final s in syms)
+          if (s is Map) (s['symptom_name'] ?? s['name'] ?? '').toString()
+      ];
       final dx = (d['diagnoses'] as List?) ?? const [];
       if (dx.isNotEmpty && dx.first is Map) {
         p.disease = ((dx.first as Map)['diagnosis_text'] ?? '').toString();
@@ -197,30 +203,26 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       v('Hemoglobin', 'hemoglobin');
       v('Height (cm)', 'height');
       v('Weight (kg)', 'weight');
-      p.vitals
-        ..clear()
-        ..addAll(vitals);
+      p.vitals = vitals;
       p.remarks = (d['counsellor_remarks'] ?? '').toString();
       p.doctorRemarks = (d['doctor_remarks'] ?? '').toString();
       p.observations = (d['observation'] ?? '').toString();
       p.pregnant = (d['pregnant'] as bool?) ?? p.pregnant;
       // Prescription — pharmacist-visible rows the doctor entered.
       final rxRows = (d['prescription'] as List?) ?? const [];
-      p.prescription
-        ..clear()
-        ..addAll([
-          for (final r in rxRows)
-            if (r is Map)
-              RxItem(
-                name: (r['medicine_name'] ?? '').toString(),
-                dosage: (r['dosage'] ?? '').toString(),
-                interval: (r['frequency'] ?? 'TDS').toString(),
-                days: '${r['duration_days'] ?? 5} Days',
-                qty: (r['qty'] as num?)?.toInt() ?? 0,
-                dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
-                dispensed: (r['dispensed'] as bool?) ?? false,
-              ),
-        ]);
+      p.prescription = <RxItem>[
+        for (final r in rxRows)
+          if (r is Map)
+            RxItem(
+              name: (r['medicine_name'] ?? '').toString(),
+              dosage: (r['dosage'] ?? '').toString(),
+              interval: (r['frequency'] ?? 'TDS').toString(),
+              days: '${r['duration_days'] ?? 5} Days',
+              qty: (r['qty'] as num?)?.toInt() ?? 0,
+              dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+              dispensed: (r['dispensed'] as bool?) ?? false,
+            ),
+      ];
       // Also tell CounsellorState so the Home list rebuilds against
       // the enriched row (symptoms show under the name, etc).
       context.read<CounsellorState>().updateRequisitions();
