@@ -163,22 +163,12 @@ class _SymptomFieldState extends State<SymptomField> {
           children.add(_sugItem(s, null, null));
         }
       }
-      // Master-driven only (2026-08-13 rule). If nothing in the master
-      // list matches what the counsellor typed, show a gentle prompt
-      // instead of an "Add typed symptom" shortcut — the earlier
-      // free-text path polluted symptom_master with duplicate variants
-      // ("Rash" vs "Skin rash"). Missing entries are a backend
-      // data-seed issue: add the row via migrate.sql, not from the app.
-      if (matches.isEmpty && !kSymAlias.containsKey(q)) {
-        children.add(_sugHeader('Not in list', const Color(0xFFFEECEA), C2.danger));
-        children.add(Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-          child: Text(
-            '"${_q.trim()}" is not a recognised symptom. Try a keyword like "fever" or "rash" — or ask the admin to add it to the master list.',
-            style: ct(11.5, FontWeight.w400, C2.text2),
-          ),
-        ));
-      }
+      // Master-driven only (2026-08-13 rule). No fallback shown when
+      // nothing matches — the dropdown simply doesn't surface a
+      // suggestion for that keystroke, and the counsellor keeps typing
+      // or backs off to something the master knows. Silent is better
+      // than a red "Not in list" banner that adds visual noise on every
+      // typo.
     }
     if (children.isEmpty) return const SizedBox.shrink();
     return Container(
