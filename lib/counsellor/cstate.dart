@@ -878,6 +878,13 @@ class CounsellorState extends ChangeNotifier {
       final apptDateIso = (row['appointment_date'] as String?) ?? '';
       final regDateFmt = _fmtIsoDate(apptDateIso);
       final registeredOn = _relRegisteredOn(apptDateIso);
+      // Symptoms come back as a Postgres text[] which the JSON encoder
+      // renders as a Dart List. Missing / empty rows land as null and
+      // we skip cleanly.
+      final rawSyms = row['symptoms'];
+      final syms = rawSyms is List
+          ? [ for (final s in rawSyms) if (s != null) s.toString() ]
+          : const <String>[];
       final adapted = CPatient(
         id:          'B$patientId',
         name:        (row['patient_name'] as String?)?.trim().isNotEmpty == true
@@ -889,12 +896,18 @@ class CounsellorState extends ChangeNotifier {
         uniqueCode:  (row['unique_code']  as String?) ?? '',
         block:       (row['block_name']   as String?) ?? '',
         village:     (row['village_name'] as String?) ?? '',
+        symptoms:    syms,
+        // primary diagnosis text if the doctor / counsellor has set one
+        // — used as "Likely" label on Home + detail screen without a
+        // separate /appointments/{id} fetch.
+        disease:     (row['primary_diagnosis'] as String?) ?? '',
         status:      statusOverride ?? (row['status'] as String?) ?? 'registered',
         registeredOn: registeredOn,
         regDate:     regDateFmt,
         // Carry the appointment_id from the queue row so the detail
-        // screen can lazy-fetch symptoms + diagnoses + vitals via
-        // /api/appointments/{id} (the queue list is summary-only).
+        // screen can lazy-fetch vitals + remarks + Rx via
+        // /api/appointments/{id} (symptoms + primary diagnosis now come
+        // with the list already).
         backendAppointmentId: (row['appointment_id'] as num?)?.toInt(),
       );
       patients.insert(0, adapted);
