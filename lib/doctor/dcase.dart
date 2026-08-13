@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import '../api/appointments_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
@@ -31,6 +32,33 @@ const List<({String key, String label, String hint})> _kVitalSpecs = [
   (key: 'Hemoglobin',        label: 'Hemoglobin',         hint: 'g/dL'),
 ];
 
+// _kVitalSpecs label -> the column GET /api/appointments/{id} returns it as.
+// Heart Rate has no counterpart: the appointment table stores no heart-rate
+// column, so that field stays empty for the doctor to fill in.
+const Map<String, String> _kVitalColumns = {
+  'Systolic BP':       'systolic_bp',
+  'Diastolic BP':      'diastolic_bp',
+  'Blood Sugar':       'blood_sugar',
+  'Body Temp (°F)':    'body_temp',
+  'Oxygen Saturation': 'oxygen',
+  'Hemoglobin':        'hemoglobin',
+};
+
+/// Readings come back as int, double or numeric string depending on column.
+/// Render 120.0 as '120' so the field reads the way it was typed, and treat
+/// 0 as "not recorded" rather than a real measurement.
+String _fmtVital(Object? v) {
+  if (v == null) return '';
+  if (v is num) {
+    if (v == 0) return '';
+    return v == v.roundToDouble() ? v.toInt().toString() : v.toString();
+  }
+  final s = v.toString().trim();
+  if (s.isEmpty || s == 'null') return '';
+  final n = num.tryParse(s);
+  return n != null ? _fmtVital(n) : s;
+}
+
 class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late List<String> symptoms;
   final List<String> diagnoses = []; // multi-select; master "Term · ICD" or typed free text
@@ -47,6 +75,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late final Map<String, TextEditingController> _vitals;
   bool _showVitals = false;
   bool _advisoryDismissed = false;
+  // True while GET /api/appointments/{id} is in flight — see
+  // _loadRegistrationDetail. Without it the Registration Details card shows
+  // a bare '—' during the round-trip, which reads as "none recorded".
+  bool _loadingRegDetail = false;
   // Page-level focus sink. Picker buttons (Add Diagnosis / Add Test / Add
   // Medicine) move focus to this BEFORE opening the bottom-sheet AND right
   // after it closes, so Flutter's focus restoration can't land back on the
@@ -83,6 +115,68 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       }
     }
     DiseaseMaster.load().then((_) { if (mounted) setState(() {}); });
+    _loadRegistrationDetail();
+  }
+
+  /// Pull what the counsellor recorded at registration for a backend patient.
+  ///
+  /// /api/queues/doctor returns one flat appointment row — no symptoms, no
+  /// vitals — so a CPatient built by mergeBackendPatients always arrives with
+  /// an empty `symptoms` list and an empty `vitals` map however much the
+  /// counsellor entered. GET /api/appointments/{id} is the only endpoint that
+  /// joins `appointment_symptom` and returns the vitals columns. Demo-seed
+  /// rows already carry their own values and are skipped.
+  Future<void> _loadRegistrationDetail() async {
+    final apptId = p.backendAppointmentId;
+    if (apptId == null) return;
+    // Assigned directly, not via setState — initState runs before first build.
+    _loadingRegDetail = true;
+    try {
+      final d = await context.read<AppointmentsApi>().detail(apptId);
+      if (!mounted) return;
+      final freshSymptoms = <String>[
+        for (final s in (d['symptoms'] as List? ?? const []))
+          if (s is Map)
+            (s['symptom_name'] ?? s['name'] ?? '').toString().trim()
+      ]..removeWhere((s) => s.isEmpty);
+      // Keyed by the labels _kVitalSpecs uses, so the values land in the
+      // matching editable field. Blank/zero readings are left out — an empty
+      // box for the doctor to fill beats a bogus 0.
+      final freshVitals = <String, String>{};
+      for (final spec in _kVitalSpecs) {
+        final raw = d[_kVitalColumns[spec.key]];
+        final val = _fmtVital(raw);
+        if (val.isNotEmpty) freshVitals[spec.key] = val;
+      }
+      setState(() {
+        if (freshSymptoms.isNotEmpty) {
+          p.symptoms = freshSymptoms;
+          // `symptoms` was seeded from the (empty) p.symptoms above and drives
+          // both the editable chips and the AI advisory scoring, so it has to
+          // be refreshed too — not just the read-only card.
+          symptoms = List.from(freshSymptoms);
+        }
+        final cRemarks = (d['counsellor_remarks'] ?? '').toString().trim();
+        if (cRemarks.isNotEmpty) p.remarks = cRemarks;
+        if (freshVitals.isNotEmpty) {
+          p.vitals = {...p.vitals, ...freshVitals};
+          // Fill only fields the doctor hasn't already typed into, so a slow
+          // response can never overwrite a reading being entered right now.
+          for (final e in freshVitals.entries) {
+            final c = _vitals[e.key];
+            if (c != null && c.text.trim().isEmpty) c.text = e.value;
+          }
+          // Counsellor readings exist — open the section so they're visible
+          // and editable instead of hidden behind the collapsed toggle.
+          _showVitals = true;
+        }
+      });
+    } catch (_) {
+      // Non-blocking by design: offline is the normal case in an MMU. The
+      // card falls back to '—' and empty vitals the doctor can fill in.
+    } finally {
+      if (mounted) setState(() => _loadingRegDetail = false);
+    }
   }
 
   @override
@@ -106,6 +200,28 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
 
   void _parkFocus() {
     if (_focusSink.canRequestFocus) _focusSink.requestFocus();
+  }
+
+  /// Doctor's remarks with any advised tests appended.
+  ///
+  /// Tests are advice here, not lab orders (see the submit payload), and
+  /// DoctorSubmitIn has no free-text field for them — so without this they
+  /// would be recorded nowhere and the patient would leave with no written
+  /// note of what to get done. Remarks is the right home: the field is
+  /// labelled "Advice / follow-up" on this screen.
+  String _remarksWithTests() {
+    final base = _remarks.text.trim();
+    if (tests.isEmpty) return base;
+    final line = 'Tests advised: ${tests.join(', ')}';
+    return base.isEmpty ? line : '$base\n$line';
+  }
+
+  /// '5 Days' -> 5. The server requires a positive int and defaults to 5,
+  /// so an unparseable label falls back to the same value rather than
+  /// failing the whole push.
+  static int _daysToInt(String days) {
+    final n = int.tryParse(RegExp(r'\d+').firstMatch(days)?.group(0) ?? '');
+    return (n == null || n <= 0) ? 5 : n;
   }
 
   static const _perDay = {'OD': 1, 'BD': 2, 'TDS': 3, 'QID': 4, 'SOS': 1, 'HS': 1};
@@ -166,7 +282,9 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // registration details (read-only, filled by counsellor)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Counsellor', bg: C2.cyanLight, fg: C2.cyan)]),
-            _kv('Symptoms', p.symptoms.isEmpty ? '—' : p.symptoms.join(', ')),
+            _kv('Symptoms', p.symptoms.isNotEmpty
+                ? p.symptoms.join(', ')
+                : (_loadingRegDetail ? 'Loading…' : '—')),
             if (p.remarks.isNotEmpty) _kv('Remarks', p.remarks),
           ])),
           // Editable Vitals card (rule 2026-07-31). Collapsible — same
@@ -267,19 +385,41 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // Enqueue appointment.doctor_submit (v2 §4). Server decides
             // the next status based on tests vs medicines.
             context.read<SyncService>().enqueue(kind: 'appointment.doctor_submit', payload: {
+              // The server resolves the case by appointment_id and rejects the
+              // push outright without it ("appointment_id is required", 422 —
+              // mobile.py `_doctor_submit`). p.id is the local row key ('B71'),
+              // never an appointment id, so sending only client_appointment_ref
+              // meant every consultation was rejected: the phone showed the
+              // case as done while the server kept it at 'with_doctor', and the
+              // next queue refresh pulled that stale status back as In Progress.
+              if (p.backendAppointmentId != null)
+                'appointment_id': p.backendAppointmentId,
               'client_appointment_ref': p.id,
               'observation':            _obs.text.trim(),
-              'doctor_remarks':         _remarks.text.trim(),
+              'doctor_remarks':         _remarksWithTests(),
               'past_history':           _pastHistory.text.trim(),
-              'diagnoses':              [ for (final d in diagnoses) {'text': d} ],
-              'lab_test_names':         [ for (final t in tests) t ],
+              // DoctorSubmitIn reads `diagnosis_text`; a bare `text` key was
+              // dropped on the floor, losing the diagnosis on every case.
+              'diagnoses': [
+                for (var i = 0; i < diagnoses.length; i++)
+                  {'diagnosis_text': diagnoses[i], 'is_primary': i == 0},
+              ],
+              // lab_test_ids is deliberately NOT sent. This MMU runs
+              // Counsellor -> Doctor -> Pharmacist with no lab desk and no test
+              // payment, but the server routes any formally-ordered test to
+              // 'with_counsellor' to collect a fee — a state nothing in this app
+              // can clear, which stranded the patient short of the pharmacist.
+              // The doctor only *advises* tests here, so they ride along as text
+              // (see _remarksWithTests) and the case routes on medicines alone.
+              'lab_test_names': [ for (final t in tests) t ],
               'prescription': [
                 for (final m in rx)
                   {
                     'medicine_name': m.name,
                     'dosage':        m.dosage,
                     'frequency':     m.interval,
-                    'duration':      m.days,
+                    // Schema wants a day count, not a label like '5 Days'.
+                    'duration_days': _daysToInt(m.days),
                     'qty':           m.qty,
                   },
               ],

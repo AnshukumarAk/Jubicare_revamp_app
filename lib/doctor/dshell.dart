@@ -14,11 +14,12 @@ import '../api/queues_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
-import '../counsellor/screens_dashboard.dart' show CounPatientDetail;
+import '../services/connectivity_service.dart';
 import '../screens/unified_login.dart';
 import '../state/app_state.dart';
 import '../widgets/attendance_capture.dart';
 import 'dcase.dart';
+import 'patient_history.dart';
 import 'voice.dart';
 
 /// Doctor module shell — 2.0 white header (official logo + profile) and a
@@ -32,31 +33,54 @@ class DoctorShell extends StatefulWidget {
 
 class _DoctorShellState extends State<DoctorShell> {
   int _tab = 0;
+  // Lets the shell poke the dashboard when Home is re-selected or pulled
+  // down. Same library, so the private State type is reachable here.
+  final _dashboardKey = GlobalKey<_DoctorDashboardState>();
   static const _nav = [
     (Icons.grid_view_rounded, 'Home'),
     (Icons.medical_services_outlined, 'Case'),
     // Report tab removed 2026-08-05 per user rule.
     (Icons.event_available_outlined, 'Attend'),
   ];
-  void _go(int i) => setState(() => _tab = i);
+  void _go(int i) {
+    setState(() => _tab = i);
+    // Coming back to Home from Case/Attend is a natural moment to re-check
+    // the queue. Throttled inside the dashboard so tab-tapping can't spam it.
+    if (i == 0) _dashboardKey.currentState?.refreshOnReturn();
+  }
 
   @override
   Widget build(BuildContext context) {
     final initials = widget.userName.replaceAll('Dr. ', '').isEmpty ? 'D' : widget.userName.replaceAll('Dr. ', '')[0].toUpperCase();
     final pages = [
-      DoctorDashboard(name: widget.userName, onOpenCase: () => _go(1)),
+      DoctorDashboard(key: _dashboardKey, name: widget.userName,
+          active: _tab == 0, onOpenCase: () => _go(1)),
       const DoctorCaseList(),
       // DoctorReport removed 2026-08-05 per user rule.
       const DoctorAttendance(),
     ];
+    const pad = EdgeInsets.fromLTRB(14, 14, 14, 24);
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
       child: Scaffold(
         backgroundColor: C2.bg,
         body: Column(children: [
           DocHeader(initials: initials, userName: widget.userName, role: 'Doctor'),
-          Expanded(child: IndexedStack(index: _tab, children: pages.map((p) =>
-            SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 24), child: p)).toList())),
+          Expanded(child: IndexedStack(index: _tab, children: [
+            // Home gets pull-to-refresh: the counsellor registers on a
+            // different handset, so nothing on this device can know a new
+            // patient exists until we ask. AlwaysScrollable so the gesture
+            // works even when the queue is short enough not to overflow.
+            RefreshIndicator(
+              onRefresh: () async => _dashboardKey.currentState?.refreshNow(),
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: pad,
+                child: pages[0]),
+            ),
+            for (final p in pages.skip(1))
+              SingleChildScrollView(padding: pad, child: p),
+          ])),
         ]),
         bottomNavigationBar: DocBottomNav(items: _nav, current: _tab, onTap: _go),
       ),
@@ -163,22 +187,63 @@ class DocBottomNav extends StatelessWidget {
 class DoctorDashboard extends StatefulWidget {
   final String name;
   final VoidCallback onOpenCase;
-  const DoctorDashboard({super.key, required this.name, required this.onOpenCase});
+  /// Whether Home is the visible tab. IndexedStack keeps every page mounted,
+  /// so the background poll has to be told when it is off screen.
+  final bool active;
+  const DoctorDashboard({super.key, required this.name, required this.onOpenCase, this.active = true});
   @override
   State<DoctorDashboard> createState() => _DoctorDashboardState();
 }
 
-class _DoctorDashboardState extends State<DoctorDashboard> {
+class _DoctorDashboardState extends State<DoctorDashboard>
+    with WidgetsBindingObserver {
   bool _refreshing = false;
   String? _lastError;
   SyncService? _sync;
   int _lastDrainSignature = -1;
+  Timer? _poll;
+  DateTime? _lastFetchAt;
+
+  /// Background poll cadence while Home is on screen.
+  ///
+  /// _onSyncTick only fires for pushes made *on this handset*, and in an MMU
+  /// the counsellor is on a different phone — so a newly registered patient
+  /// was invisible here until the app was restarted. Until the backend can
+  /// push, asking on a timer is what keeps the queue current.
+  static const _pollEvery = Duration(seconds: 30);
+
+  /// Floor between automatic fetches, so a resume landing next to a tab
+  /// switch and a timer tick don't fire three round-trips back to back.
+  /// Pull-to-refresh bypasses this — that one is the doctor asking directly.
+  static const _minGap = Duration(seconds: 10);
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshFromBackend());
+    WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshFromBackend(immediate: true));
+    _poll = Timer.periodic(_pollEvery, (_) {
+      // Quiet unless Home is actually showing, the app is foregrounded and
+      // there's a network — no point burning field data in someone's pocket.
+      if (!mounted || !widget.active) return;
+      if (!context.read<ConnectivityService>().isOnline) return;
+      _refreshFromBackend();
+    });
   }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // The phone was locked or the app backgrounded while the counsellor
+    // registered someone — the commonest way this queue goes stale.
+    if (state == AppLifecycleState.resumed) _refreshFromBackend();
+  }
+
+  /// Pull-to-refresh from the shell. Always fetches.
+  Future<void> refreshNow() => _refreshFromBackend(immediate: true);
+
+  /// Home tab re-selected. Throttled — tapping between tabs shouldn't hammer
+  /// the API.
+  void refreshOnReturn() => _refreshFromBackend();
 
   @override
   void didChangeDependencies() {
@@ -195,6 +260,8 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
 
   @override
   void dispose() {
+    _poll?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _sync?.removeListener(_onSyncTick);
     super.dispose();
   }
@@ -210,8 +277,13 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
     }
   }
 
-  Future<void> _refreshFromBackend() async {
+  Future<void> _refreshFromBackend({bool immediate = false}) async {
     if (_refreshing || !mounted) return;
+    final last = _lastFetchAt;
+    if (!immediate && last != null && DateTime.now().difference(last) < _minGap) {
+      return;
+    }
+    _lastFetchAt = DateTime.now();
     setState(() { _refreshing = true; _lastError = null; });
     try {
       final api = context.read<QueuesApi>();
@@ -219,12 +291,25 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
       // consistent with the same server-side snapshot.
       final queue = await api.doctorQueue(limit: 200);
       final attended = await api.doctorAttended(limit: 200);
+      // /queues/doctor covers registered+with_doctor and /queues/doctor/attended
+      // covers with_pharma+completed — nothing returns the two rungs in between.
+      // A case the doctor sent for tests sits at with_counsellor (awaiting test
+      // payment) then with_lab, so without these two calls it disappears from
+      // the dashboard entirely instead of counting as attended. Both are
+      // facility-scoped like the others.
+      final awaitingPayment = await api.pendingPayment(limit: 200);
+      final atLab = await api.labQueue(limit: 200);
       if (!mounted) return;
       final store = context.read<CounsellorState>();
-      // One merge call carrying both queue + attended rows — server
-      // status ('with_doctor', 'with_pharma', 'completed') decides
-      // whether each lands in doctorQueue vs doctorAttended.
-      final combined = [ ...queue.items, ...attended.items ];
+      // One merge call carrying every rung of the ladder the doctor can see —
+      // the server's status on each row decides whether it lands in
+      // doctorQueue or doctorAttended.
+      final combined = [
+        ...queue.items,
+        ...attended.items,
+        ...awaitingPayment.items,
+        ...atLab.items,
+      ];
       store.mergeBackendPatients(combined);
     } on ApiException catch (e) {
       if (mounted) setState(() => _lastError = e.message);
@@ -301,7 +386,8 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
           Padding(padding: const EdgeInsets.all(12), child: Center(child: Text('No attended patients yet', style: ct(12, FontWeight.w400, C2.text2))))
         else ...[
           ...s.doctorAttended.take(5).map((p) => InkWell(
-            onTap: () => showAttendedCase(context, p),
+            onTap: () => Navigator.push(context,
+                MaterialPageRoute(builder: (_) => PatientHistoryScreen(patient: p))),
             child: Container(
               padding: const EdgeInsets.symmetric(vertical: 10),
               decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
@@ -310,7 +396,7 @@ class _DoctorDashboardState extends State<DoctorDashboard> {
                   Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
                   Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.length} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                 ])),
-                CBadge(p.status == 'completed' ? 'Completed' : 'At Pharmacy', bg: p.status == 'completed' ? const Color(0xFFEDF7E0) : C2.cyanLight, fg: p.status == 'completed' ? C2.green : C2.cyan),
+                doctorStatusBadge(p.status),
                 const SizedBox(width: 6), const Icon(Icons.lock_outline, size: 15, color: C2.text3),
               ]),
             ))),
@@ -334,6 +420,28 @@ class DoctorPatientList extends StatefulWidget {
 
 class _DoctorPatientListState extends State<DoctorPatientList> {
   String _q = '';
+
+  /// Open the screen that matches the patient's stage.
+  ///
+  /// Mirrors how the dashboard's own cards route: a case still waiting on the
+  /// doctor opens the editable Case Details, a finished one opens the
+  /// read-only summary. This list is shared by the In Queue / Completed /
+  /// Past 7 Days tiles and used to send every row to the counsellor's
+  /// read-only screen, so tapping a queued patient here gave the doctor no
+  /// way to actually record the consultation.
+  void _openPatient(BuildContext context, CPatient p) {
+    final awaitingDoctor = p.status == 'registered' || p.status == 'with_doctor';
+    if (awaitingDoctor) {
+      Navigator.push(context,
+          MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p)));
+    } else {
+      // Finished case → the full record. The old bottom sheet only rendered
+      // whatever the in-memory CPatient happened to hold, which for a backend
+      // row is a single visit with most fields blank.
+      Navigator.push(context,
+          MaterialPageRoute(builder: (_) => PatientHistoryScreen(patient: p)));
+    }
+  }
   @override
   Widget build(BuildContext context) {
     final q = _q.trim().toLowerCase();
@@ -356,7 +464,7 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
             ? Center(child: Text(q.isEmpty ? 'No patients' : 'No patient matches "$_q"', style: ct(13, FontWeight.w400, C2.text2)))
             : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [
                 CCard(child: Column(children: list.map((p) => InkWell(
-                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientDetail(p: p, showReAppointment: false))),
+                  onTap: () => _openPatient(context, p),
                   child: Container(
                     padding: const EdgeInsets.symmetric(vertical: 10),
                     decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
@@ -376,15 +484,23 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
     );
   }
 
-  Widget _statusBadge(String status) {
-    final (label, bg, fg) = switch (status) {
-      'completed' => ('Completed', const Color(0xFFEDF7E0), C2.green),
-      'with_pharma' => ('At Pharmacy', C2.cyanLight, C2.cyan),
-      'with_doctor' => ('In Progress', C2.cyanLight, C2.cyan),
-      _ => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
-    };
-    return CBadge(label, bg: bg, fg: fg);
-  }
+  Widget _statusBadge(String status) => doctorStatusBadge(status);
+}
+
+/// Badge for a case's position on the status ladder (§6.2). Shared by the
+/// dashboard cards and the drill-down list so a patient never reads as two
+/// different things on two screens.
+Widget doctorStatusBadge(String status) {
+  final (label, bg, fg) = switch (status) {
+    'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
+    'with_pharma'     => ('At Pharmacy', C2.cyanLight, C2.cyan),
+    // Post-consultation rungs: the doctor is done, the case is moving on.
+    'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
+    'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
+    'with_doctor'     => ('In Progress', C2.cyanLight, C2.cyan),
+    _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
+  };
+  return CBadge(label, bg: bg, fg: fg);
 }
 
 class QueueRow extends StatelessWidget {

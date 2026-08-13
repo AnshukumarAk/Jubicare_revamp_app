@@ -800,7 +800,19 @@ class CounsellorState extends ChangeNotifier {
 
   // ----- Doctor views -----
   List<CPatient> get doctorQueue => patients.where((p) => p.status == 'registered' || p.status == 'with_doctor').toList();
-  List<CPatient> get doctorAttended => patients.where((p) => p.status == 'with_pharma' || p.status == 'completed').toList();
+  /// Cases the doctor has finished consulting on.
+  ///
+  /// Deliberately wider than with_pharma/completed. The status ladder (§6.2)
+  /// sends a case the doctor ordered tests for to `with_counsellor` (pay for
+  /// the tests) and then `with_lab`, and only later back to the doctor. Those
+  /// two states were in neither doctorQueue nor doctorAttended, so finishing a
+  /// consultation with any lab test made the patient vanish from every tile —
+  /// In Queue went down, Completed never went up.
+  static const _doctorDoneStatuses = {
+    'with_counsellor', 'with_lab', 'with_pharma', 'completed',
+  };
+  List<CPatient> get doctorAttended =>
+      patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList();
   int get doctorCompleted => doctorAttended.length;
 
   /// Every patient the doctor has interacted with in the last 7 days —
