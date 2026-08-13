@@ -15,6 +15,11 @@ import 'cdata.dart';
 
 /// A prescribed medicine line.
 class RxItem {
+  /// Server's prescription_item_id. The dispense endpoint identifies each
+  /// line by this — a medicine name won't do, since the same drug can be
+  /// prescribed twice on one visit at different strengths. Null for locally
+  /// created rows that haven't round-tripped through the backend yet.
+  final int? itemId;
   final String name;
   String dosage; // strength e.g. "500 mg" — typed by the doctor
   String days;
@@ -22,7 +27,7 @@ class RxItem {
   int qty;
   int dispensedQty;
   bool dispensed;
-  RxItem({required this.name, this.dosage = '', this.days = '5 Days', this.interval = 'TDS', this.qty = 10, int? dispensedQty, this.dispensed = false})
+  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '5 Days', this.interval = 'TDS', this.qty = 10, int? dispensedQty, this.dispensed = false})
       : dispensedQty = dispensedQty ?? qty;
 }
 
@@ -118,6 +123,11 @@ class CPatient {
   /// use this to lazy-fetch full appointment data (symptoms,
   /// diagnoses, vitals) that the list endpoint doesn't return.
   int? backendAppointmentId;
+  /// medicine_count from the queue row. The queue payload carries no
+  /// prescription lines, only their count, so lists can show "3 meds"
+  /// without a per-patient fetch. `prescription` stays authoritative once
+  /// the detail screen has loaded it.
+  int medicineCount;
 
   CPatient({
     required this.id,
@@ -154,6 +164,7 @@ class CPatient {
     this.pin = '',
     this.address = '',
     this.backendAppointmentId,
+    this.medicineCount = 0,
   })  : symptoms = symptoms ?? [],
         vitals = vitals ?? {},
         attachments = attachments ?? [],
@@ -942,6 +953,7 @@ class CounsellorState extends ChangeNotifier {
         // /api/appointments/{id} (symptoms + primary diagnosis now come
         // with the list already).
         backendAppointmentId: (row['appointment_id'] as num?)?.toInt(),
+        medicineCount: (row['medicine_count'] as num?)?.toInt() ?? 0,
       );
       patients.insert(0, adapted);
     }

@@ -7,6 +7,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import '../api/api_errors.dart';
+import '../api/appointments_api.dart';
 import '../api/queues_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
@@ -186,7 +187,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
           child: Row(children: [
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-              Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.length} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+              Text('${p.disease.isEmpty ? "—" : p.disease} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
             ])),
             const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
           ]),
@@ -231,7 +232,7 @@ class _PharmaQueueListState extends State<PharmaQueueList> {
                   child: Row(children: [
                     Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${p.prescription.length} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                     ])),
                     const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
                   ]),
@@ -278,7 +279,7 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
                   child: Row(children: [
                     Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${p.prescription.length} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                     ])),
                     const CBadge('Dispensed', bg: Color(0xFFEDF7E0), fg: C2.green),
                     const SizedBox(width: 6), const Icon(Icons.chevron_right, color: C2.text3, size: 18),
@@ -326,6 +327,15 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
       );
 }
 
+/// How many medicines to show in a list row.
+///
+/// Loaded lines win once a detail fetch has filled them in; before that the
+/// queue row's own `medicine_count` is the only number available. Reading
+/// `prescription.length` alone showed every backend patient as "0 meds",
+/// which reads as "nothing to dispense" for someone sent to the pharmacy.
+int medsLabel(CPatient p) =>
+    p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount;
+
 // ───────────────── Deliver one patient ─────────────────
 class PharmaDispense extends StatefulWidget {
   final CPatient patient;
@@ -337,8 +347,59 @@ class PharmaDispense extends StatefulWidget {
 class _PharmaDispenseState extends State<PharmaDispense> {
   CPatient get p => widget.patient;
   final Map<RxItem, TextEditingController> _reason = {};
+  bool _loadingRx = false;
 
   TextEditingController _reasonCtl(RxItem m) => _reason.putIfAbsent(m, () => TextEditingController());
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPrescription();
+  }
+
+  /// Fetch the medicines the doctor prescribed.
+  ///
+  /// /queues/pharmacist returns a flat appointment row carrying only
+  /// `medicine_count` — no lines — so a CPatient built by
+  /// mergeBackendPatients reaches this screen with an empty `prescription`
+  /// and the pharmacist is told "No medicines prescribed" for a patient who
+  /// was sent here precisely because medicines were prescribed.
+  /// GET /appointments/{id} returns the lines, each with the
+  /// prescription_item_id the dispense call has to quote back.
+  Future<void> _loadPrescription() async {
+    final apptId = p.backendAppointmentId;
+    // Demo/local rows already carry their prescription in memory.
+    if (apptId == null || p.prescription.isNotEmpty) return;
+    _loadingRx = true;
+    try {
+      final d = await context.read<AppointmentsApi>().detail(apptId);
+      if (!mounted) return;
+      final lines = <RxItem>[
+        for (final r in (d['prescription'] as List? ?? const []))
+          if (r is Map)
+            RxItem(
+              itemId:   (r['prescription_item_id'] as num?)?.toInt(),
+              name:     '${r['medicine_name'] ?? ''}',
+              dosage:   '${r['dosage'] ?? ''}',
+              interval: '${r['frequency'] ?? 'TDS'}',
+              days:     '${r['duration_days'] ?? 5} Days',
+              qty:      (r['qty'] as num?)?.toInt() ?? 0,
+              // Falls back to the prescribed qty so the Delivered field opens
+              // pre-filled with the expected amount, as it does for seed rows.
+              dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+              dispensed: (r['dispensed'] as bool?) ?? false,
+            ),
+      ]..removeWhere((m) => m.name.trim().isEmpty);
+      setState(() {
+        if (lines.isNotEmpty) p.prescription = lines;
+        _loadingRx = false;
+      });
+    } catch (_) {
+      // Offline: leave the list empty rather than blocking. The pharmacist
+      // still sees the patient and can retry once the network is back.
+      if (mounted) setState(() => _loadingRx = false);
+    }
+  }
 
   @override
   void dispose() {
@@ -366,7 +427,11 @@ class _PharmaDispenseState extends State<PharmaDispense> {
           ])),
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const SecBar('Prescribed Medicines'),
-            if (p.prescription.isEmpty) Text('No medicines prescribed', style: ct(12, FontWeight.w400, C2.text2)),
+            if (_loadingRx)
+              const Padding(padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Center(child: CircularProgressIndicator(strokeWidth: 2)))
+            else if (p.prescription.isEmpty)
+              Text('No medicines prescribed', style: ct(12, FontWeight.w400, C2.text2)),
             ...p.prescription.map(_medRow),
             const SizedBox(height: 8),
             CPrimaryButton('Confirm Delivery', icon: Icons.check_circle_outline, onTap: () {
@@ -379,14 +444,24 @@ class _PharmaDispenseState extends State<PharmaDispense> {
               }
               s.pharmacistDispense(p);
               // Enqueue appointment.dispense for /mobile/sync/push (v2 §4).
+              // Same contract the doctor submit needs: the server resolves the
+              // case by appointment_id and 422s without it, and DispenseLineIn
+              // identifies each line by prescription_item_id — a medicine_name
+              // is dropped, so every dispense was silently rejected and the
+              // patient stayed in the pharmacy queue.
               context.read<SyncService>().enqueue(kind: 'appointment.dispense', payload: {
+                if (p.backendAppointmentId != null)
+                  'appointment_id': p.backendAppointmentId,
                 'client_appointment_ref': p.id,
                 'lines': [
                   for (final m in p.prescription)
-                    {
-                      'medicine_name': m.name,
-                      'dispensed_qty': m.dispensedQty,
-                    },
+                    if (m.itemId != null)
+                      {
+                        'prescription_item_id': m.itemId,
+                        'dispensed_qty': m.dispensedQty,
+                        if (m.dispensedQty != m.qty)
+                          'qty_change_reason': _reasonCtl(m).text.trim(),
+                      },
                 ],
               });
               ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Delivered for ${p.name}'), backgroundColor: C2.green));
