@@ -17,14 +17,13 @@ class SymptomField extends StatefulWidget {
 }
 
 class _SymptomFieldState extends State<SymptomField> {
-  /// Compile-time flag for the three AI panels ("Common in {block}",
-  /// "Related symptoms", "Likely Conditions"). Off by default so the
-  /// counsellor doesn't see suggestions that are drifting from what
-  /// the backend actually knows. Turn back on with
-  /// `flutter run --dart-define=AI_PANELS=true` once the panels' data
-  /// comes from backend masters instead of hardcoded cdata.dart maps.
-  static const bool _showAiPanels =
-      bool.fromEnvironment('AI_PANELS', defaultValue: false);
+  /// Compile-time flag for the "Likely Conditions" panel only. The other
+  /// two suggestion cards ("Common in {block}", "Related symptoms") stay
+  /// visible unconditionally. Off by default because scoreDiseases() runs
+  /// on hardcoded kDiseaseDb weights — enable with
+  /// `flutter run --dart-define=SHOW_LIKELY=true` for local demos.
+  static const bool _showLikelyPanel =
+      bool.fromEnvironment('SHOW_LIKELY', defaultValue: false);
 
   final _c = TextEditingController();
   final _focus = FocusNode();
@@ -98,22 +97,25 @@ class _SymptomFieldState extends State<SymptomField> {
       ),
       // suggestion dropdown
       if (_focus.hasFocus) _suggestions(geo),
-      // AI panels — "Common in {block}", "Related symptoms", "Likely
-      // Conditions". Hidden per user request (2026-08-13) because the
-      // underlying data (kGeoDb / kRelated / kDiseaseDb in cdata.dart)
-      // is local hardcoded rather than pulled from backend masters, so
-      // the panels can lie relative to what the doctor / lab actually see.
-      // Turn back on with `flutter run --dart-define=AI_PANELS=true` once
-      // backend endpoints exist for these three feeds.
-      if (_showAiPanels && _sel.isNotEmpty) ...[
+      // Symptom panels below the input. Two are visible:
+      //   * "Common in {block}"   — geo-common symptom quick-adds
+      //   * "Related symptoms"    — suggestions based on picks so far
+      // "Likely Conditions" is hidden per user request (2026-08-13). The
+      // underlying kDiseaseDb weights are local hardcoded rather than
+      // backend-driven, so the percentages can drift from what the doctor
+      // actually diagnoses. Turn back on with `flutter run
+      // --dart-define=SHOW_LIKELY=true` once a backend endpoint provides
+      // the disease-scoring feed.
+      if (_sel.isNotEmpty) ...[
         const SizedBox(height: 8),
         _geoPanel(geo),
         const SizedBox(height: 6),
         _relatedPanel(),
-        const SizedBox(height: 6),
-        // Likely Conditions is the ML/scoring surface — hide when offline
-        // per user rule ("no AI/ML features when the counsellor is offline").
-        if (context.watch<ConnectivityService>().isOnline) _likelyPanel(),
+        if (_showLikelyPanel &&
+            context.watch<ConnectivityService>().isOnline) ...[
+          const SizedBox(height: 6),
+          _likelyPanel(),
+        ],
       ],
     ]);
   }
