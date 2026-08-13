@@ -9,51 +9,90 @@ import 'cstate.dart';
 class CounDashboard extends StatelessWidget {
   final VoidCallback onRegister;
   final String name;
-  const CounDashboard({super.key, required this.onRegister, this.name = 'Divya'});
+  /// The counsellor shell passes its `_refreshFromBackend` here so the
+  /// dashboard's retry banner (and, later, pull-to-refresh) can trigger a
+  /// fresh pull without duplicating the API logic.
+  final Future<void> Function()? onRefresh;
+  const CounDashboard({super.key, required this.onRegister, this.name = 'Divya', this.onRefresh});
 
   @override
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
     final initials = name.isEmpty ? 'C' : name[0].toUpperCase();
+    // Tile counts prefer the server number (from /queues/summary/tiles) so
+    // the dashboard reflects the whole facility, not just what happened
+    // to be pulled into the local list. Falls back to the local count while
+    // the first refresh is still in flight or the backend is unreachable.
+    final today = s.backendRegisteredToday ?? s.registeredToday;
+    final done = s.backendVisitsCompleted ?? s.visitsCompleted;
+    final past7 = s.backendPast7DaysTotal ?? s.counsellorPast7Days.length;
+    // "Registered Patients (Today)" section — filter the shared patient
+    // list to just today's rows so the counsellor sees the day's work
+    // (older visits are one tap away via the stat tiles).
+    final todaysList = s.patients.where((p) => p.registeredOn == 'Today').toList();
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       GradGreeting(name: name, sub: 'Counsellor Dashboard', initials: initials),
       // Sync status pill — shows how many mutations were pushed to the
       // backend the last time /mobile/sync/push ran, plus anything still
       // queued. Tap to force a drain.
       const _SyncStatusPill(),
-      Row(children: [
-        Expanded(child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
-            title: 'Registered Today',
-            patients: s.patients.where((p) => p.registeredOn == 'Today').toList()))),
-          child: StatTile('${s.registeredToday}', 'Registered Today', C2.navy))),
-        const SizedBox(width: 8),
-        Expanded(child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
-            title: 'Visits Completed',
-            patients: s.patients.where((p) => p.status == 'completed').toList()))),
-          child: StatTile('${s.visitsCompleted}', 'Visits Completed', C2.cyan))),
-        const SizedBox(width: 8),
-        // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
-        // Tap opens the shared CounPatientsList filtered to newest-first
-        // patients registered in the last week.
-        Expanded(child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
-            title: 'Past 7 Days', patients: s.counsellorPast7Days))),
-          child: StatTile('${s.counsellorPast7Days.length}', 'Past 7 Days', C2.green))),
-      ]),
+      // Backend refresh status: thin loading bar while the shell's
+      // _refreshFromBackend is in flight, and a red retry banner if the
+      // last pull failed. Doctor/pharmacist shells show the same UI.
+      if (s.refreshing)
+        const Padding(
+          padding: EdgeInsets.only(bottom: 6),
+          child: SizedBox(height: 2, child: LinearProgressIndicator(minHeight: 2)),
+        ),
+      if (!s.refreshing && s.lastRefreshError != null)
+        Padding(padding: const EdgeInsets.only(bottom: 6),
+          child: InkWell(
+            onTap: onRefresh,
+            child: Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),
+              child: Row(children: [
+                const Icon(Icons.cloud_off, size: 14, color: C2.danger),
+                const SizedBox(width: 6),
+                Expanded(child: Text('Showing cached list — tap to retry',
+                  style: ct(11, FontWeight.w500, C2.danger))),
+                const Icon(Icons.refresh, size: 14, color: C2.danger),
+              ]),
+            ),
+          )),
+      IntrinsicHeight(child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(child: StatTile(
+            '$today', 'Registered Today', C2.navy,
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
+              title: 'Registered Today',
+              patients: todaysList))))),
+          const SizedBox(width: 8),
+          Expanded(child: StatTile(
+            '$done', 'Visits Completed', C2.cyan,
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
+              title: 'Visits Completed',
+              patients: s.patients.where((p) => p.status == 'completed').toList()))))),
+          const SizedBox(width: 8),
+          // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
+          // Tap opens the shared CounPatientsList filtered to newest-first
+          // patients registered in the last week.
+          Expanded(child: StatTile(
+            '$past7', 'Past 7 Days', C2.green,
+            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
+              title: 'Past 7 Days', patients: s.counsellorPast7Days))))),
+        ],
+      )),
       const SizedBox(height: 14),
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SecBar('Registered Patients'),
-        if (s.patients.isEmpty)
+        const SecBar('Registered Patients (Today)'),
+        if (todaysList.isEmpty)
           Padding(padding: const EdgeInsets.all(16), child: Center(
-            child: Text('No registered patients yet', style: ct(12, FontWeight.w400, C2.text2)))),
-        ...s.patients.take(5).map((p) => _PatientRow(p)),
-        if (s.patients.length > 5)
-          Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${s.patients.length} registered patients', style: ct(11, FontWeight.w500, C2.text2))),
+            child: Text('No patients registered today', style: ct(12, FontWeight.w400, C2.text2)))),
+        ...todaysList.take(5).map((p) => _PatientRow(p)),
+        if (todaysList.length > 5)
+          Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${todaysList.length} registered today', style: ct(11, FontWeight.w500, C2.text2))),
       ])),
       const SizedBox(height: 8),
       CPrimaryButton('Register New Patient', icon: Icons.person_add_alt_1, onTap: onRegister),

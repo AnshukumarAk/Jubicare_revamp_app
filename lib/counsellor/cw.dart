@@ -108,19 +108,48 @@ class GradGreeting extends StatelessWidget {
 class StatTile extends StatelessWidget {
   final String value, label;
   final Color color;
-  const StatTile(this.value, this.label, this.color, {super.key});
+  final VoidCallback? onTap;
+  const StatTile(this.value, this.label, this.color, {super.key, this.onTap});
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: C2.white, borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: C2.cyanLight), boxShadow: C2.shadow),
-      child: Column(children: [
-        Text(value, style: _t(22, FontWeight.w800, color)),
-        const SizedBox(height: 3),
-        Text(label.toUpperCase(), textAlign: TextAlign.center, style: _t(10, FontWeight.w600, C2.text2)),
-      ]),
+    // Material + Ink.decoration so the InkWell splash paints ON TOP of the
+    // card fill — a plain Container hides the ripple. FittedBox scales the
+    // value + label down when they overflow (long numbers like "105" or
+    // two-line labels like "REGISTERED TODAY") so the row stays legible on
+    // narrow screens without wrapping into the neighbour.
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(10),
+      clipBehavior: Clip.antiAlias,
+      child: Ink(
+        decoration: BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: C2.cyanLight),
+          boxShadow: C2.shadow,
+        ),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(value, maxLines: 1, style: _t(22, FontWeight.w800, color)),
+              ),
+              const SizedBox(height: 3),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(label.toUpperCase(),
+                    maxLines: 2,
+                    textAlign: TextAlign.center,
+                    style: _t(10, FontWeight.w600, C2.text2)),
+              ),
+            ]),
+          ),
+        ),
+      ),
     );
   }
 }

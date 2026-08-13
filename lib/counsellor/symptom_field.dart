@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../api/masters_store.dart';
 import '../services/connectivity_service.dart';
 import 'cdata.dart';
 import 'cw.dart';
@@ -16,6 +17,14 @@ class SymptomField extends StatefulWidget {
 }
 
 class _SymptomFieldState extends State<SymptomField> {
+  /// Compile-time flag for the "Likely Conditions" panel only. The other
+  /// two suggestion cards ("Common in {block}", "Related symptoms") stay
+  /// visible unconditionally. Off by default because scoreDiseases() runs
+  /// on hardcoded kDiseaseDb weights — enable with
+  /// `flutter run --dart-define=SHOW_LIKELY=true` for local demos.
+  static const bool _showLikelyPanel =
+      bool.fromEnvironment('SHOW_LIKELY', defaultValue: false);
+
   final _c = TextEditingController();
   final _focus = FocusNode();
   String _q = '';
@@ -88,23 +97,53 @@ class _SymptomFieldState extends State<SymptomField> {
       ),
       // suggestion dropdown
       if (_focus.hasFocus) _suggestions(geo),
-      // AI panels
+      // Symptom panels below the input. Two are visible:
+      //   * "Common in {block}"   — geo-common symptom quick-adds
+      //   * "Related symptoms"    — suggestions based on picks so far
+      // "Likely Conditions" is hidden per user request (2026-08-13). The
+      // underlying kDiseaseDb weights are local hardcoded rather than
+      // backend-driven, so the percentages can drift from what the doctor
+      // actually diagnoses. Turn back on with `flutter run
+      // --dart-define=SHOW_LIKELY=true` once a backend endpoint provides
+      // the disease-scoring feed.
       if (_sel.isNotEmpty) ...[
         const SizedBox(height: 8),
         _geoPanel(geo),
         const SizedBox(height: 6),
         _relatedPanel(),
-        const SizedBox(height: 6),
-        // Likely Conditions is the ML/scoring surface — hide when offline
-        // per user rule ("no AI/ML features when the counsellor is offline").
-        if (context.watch<ConnectivityService>().isOnline) _likelyPanel(),
+        if (_showLikelyPanel &&
+            context.watch<ConnectivityService>().isOnline) ...[
+          const SizedBox(height: 6),
+          _likelyPanel(),
+        ],
       ],
     ]);
+  }
+
+  /// Symptom list pulled from the backend masters cache (bootstrap →
+  /// MastersStore). Rows are `{id, term}`; we return just the terms so
+  /// the suggestion dropdown is drop-in compatible with the old
+  /// `kAllSymptoms` list. Falls back to the local hardcoded list if
+  /// the masters cache hasn't hydrated yet (first launch, no network) —
+  /// so the counsellor is never staring at an empty picker.
+  List<String> _symptomTerms(MastersStore masters) {
+    final rows = masters.masterRows('symptoms');
+    if (rows.isEmpty) return kAllSymptoms;
+    return [
+      for (final r in rows)
+        if ((r['term'] ?? r['name'] ?? r['symptom_name']) != null)
+          (r['term'] ?? r['name'] ?? r['symptom_name']).toString()
+    ];
   }
 
   Widget _suggestions(GeoBlock geo) {
     final q = _q.trim().toLowerCase();
     final children = <Widget>[];
+    // Pull the symptom list from backend masters so the counsellor only
+    // picks values the DB actually knows — no more "Rash selected on
+    // mobile but silently dropped because symptom_master doesn't have it".
+    final masters = context.watch<MastersStore>();
+    final allSymptoms = _symptomTerms(masters);
     if (q.isEmpty) {
       children.add(_sugHeader('Common in ${widget.block ?? "Gajraula"}', const Color(0xFFFEF7E0), const Color(0xFFB8860B)));
       for (final s in geo.geo.where((s) => !_has(s)).take(6)) {
@@ -117,20 +156,19 @@ class _SymptomFieldState extends State<SymptomField> {
           children.add(_sugItem(s, Icons.subdirectory_arrow_right, C2.green));
         }
       }
-      final matches = kAllSymptoms.where((s) => s.toLowerCase().contains(q) && !_has(s)).take(8).toList();
+      final matches = allSymptoms.where((s) => s.toLowerCase().contains(q) && !_has(s)).take(8).toList();
       if (matches.isNotEmpty) {
         children.add(_sugHeader('Symptoms', C2.navyLight, C2.navy));
         for (final s in matches) {
           children.add(_sugItem(s, null, null));
         }
       }
-      // Always allow adding the typed symptom as free text (so any typed
-      // symptom is captured and shows on the Home registered-patients list).
-      final exact = matches.any((s) => s.toLowerCase() == q) || _has(_q.trim());
-      if (!exact) {
-        children.add(_sugHeader('Add typed symptom', const Color(0xFFEDF7E0), C2.green));
-        children.add(_sugItem('Add "${_q.trim()}"', Icons.add_circle_outline, C2.green, value: _q.trim()));
-      }
+      // Master-driven only (2026-08-13 rule). No fallback shown when
+      // nothing matches — the dropdown simply doesn't surface a
+      // suggestion for that keystroke, and the counsellor keeps typing
+      // or backs off to something the master knows. Silent is better
+      // than a red "Not in list" banner that adds visual noise on every
+      // typo.
     }
     if (children.isEmpty) return const SizedBox.shrink();
     return Container(

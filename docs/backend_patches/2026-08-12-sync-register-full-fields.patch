@@ -1,0 +1,97 @@
+diff --git a/jubicare_api/app/routers/mobile.py b/jubicare_api/app/routers/mobile.py
+index dc377d1..6367d3b 100644
+--- a/jubicare_api/app/routers/mobile.py
++++ b/jubicare_api/app/routers/mobile.py
+@@ -451,7 +451,12 @@ def _apply(act: MobileAction, user: dict) -> dict:
+ 
+ 
+ def _register(p: dict, user: dict) -> dict:
+-    """A registration made offline: the patient, then the visit."""
++    """A registration made offline: the patient, then the visit.
++
++    Persists the full PatientIn + AppointmentIn shape so an offline
++    submission carries the same fields as a paired POST /patients +
++    POST /appointments would. Any missing field is stored as NULL.
++    """
+     from .patients import _resolve_geography           # noqa: PLC0415
+     from ..schemas import PatientIn                    # noqa: PLC0415
+ 
+@@ -467,28 +472,70 @@ def _register(p: dict, user: dict) -> dict:
+             "FROM patient WHERE unique_code LIKE 'GN-%%'")
+         code = cur.fetchone()["code"]
+ 
++        # Full patient insert — parity with POST /patients so nothing the
++        # counsellor typed on the form is silently dropped on the way through
++        # the sync path.
+         cur.execute(
+             "INSERT INTO patient (unique_code, org_id, facility_id, registered_by, "
+-            "  patient_name, gender, age, contact_number, "
+-            "  state_id, district_id, block_id, village_id) "
+-            "VALUES (%s,%s,%s,%s,%s,%s::gender_t,%s,%s,%s,%s,%s,%s) "
++            "  patient_name, gender, age, dob, marital_status, contact_number, "
++            "  aadhar_number, blood_group, category_id, disability, pin_code, address, "
++            "  state_id, district_id, block_id, village_id, past_history) "
++            "VALUES (%s,%s,%s,%s,"
++            "        %s,%s::gender_t,%s,%s,%s,%s,"
++            "        %s,%s,%s,%s,%s,%s,"
++            "        %s,%s,%s,%s,%s) "
+             "RETURNING patient_id",
+             (code, user["org_id"], user.get("facility_id"), user["user_id"],
+-             pin.patient_name.strip(), pin.gender, pin.age, pin.contact_number,
+-             state_id, district_id, block_id, village_id),
++             pin.patient_name.strip(), pin.gender, pin.age, pin.dob,
++             pin.marital_status, pin.contact_number,
++             pin.aadhar_number, pin.blood_group, pin.category_id,
++             pin.disability, pin.pin_code, pin.address,
++             state_id, district_id, block_id, village_id,
++             pin.past_history or ""),
+         )
+         patient_id = cur.fetchone()["patient_id"]
+ 
++        # Full appointment insert — parity with POST /appointments so vitals,
++        # pregnancy details and counsellor remarks land on the same row that
++        # the online path would have written.
+         cur.execute(
+             "INSERT INTO appointment (patient_id, facility_id, org_id, source, "
+-            "  appointment_date, registered_by, payment_type, paid_amount, status) "
+-            "VALUES (%s,%s,%s,'mmu',COALESCE(%s, CURRENT_DATE),%s,"
+-            "        %s::payment_t,%s,'with_doctor') RETURNING appointment_id",
++            "  appointment_date, registered_by, taken_prescribed_medicine, pregnant, "
++            "  lmp_date, edd_date, counsellor_remarks, "
++            "  height, weight, systolic_bp, diastolic_bp, blood_sugar, "
++            "  body_temp, oxygen, hemoglobin, payment_type, paid_amount, status) "
++            "VALUES (%s,%s,%s,'mmu',"
++            "        COALESCE(%s, CURRENT_DATE),%s,%s,%s,"
++            "        %s,%s,%s,"
++            "        %s,%s,%s,%s,%s,"
++            "        %s,%s,%s,%s::payment_t,%s,'with_doctor') "
++            "RETURNING appointment_id",
+             (patient_id, user.get("facility_id"), user["org_id"],
+              p.get("appointment_date"), user["user_id"],
++             bool(p.get("taken_prescribed_medicine", False)),
++             bool(p.get("pregnant", False)),
++             p.get("lmp_date"), p.get("edd_date"),
++             p.get("counsellor_remarks", "") or "",
++             p.get("height"), p.get("weight"),
++             p.get("systolic_bp"), p.get("diastolic_bp"), p.get("blood_sugar"),
++             p.get("body_temp"), p.get("oxygen"), p.get("hemoglobin"),
+              p.get("payment_type", "Free"), p.get("paid_amount", 0)),
+         )
+         appointment_id = cur.fetchone()["appointment_id"]
++
++        # Symptoms — mobile sends resolved ids from the local masters cache.
++        # Ignore malformed entries; ON CONFLICT DO NOTHING protects against a
++        # duplicate id in the same batch.
++        for sid in (p.get("symptom_ids") or []):
++            try:
++                sid_int = int(sid)
++            except (TypeError, ValueError):
++                continue
++            cur.execute(
++                "INSERT INTO appointment_symptom (appointment_id, symptom_id) "
++                "VALUES (%s, %s) ON CONFLICT DO NOTHING",
++                (appointment_id, sid_int))
++
+     return {"patient_id": patient_id, "unique_code": code,
+             "appointment_id": appointment_id}
+ 

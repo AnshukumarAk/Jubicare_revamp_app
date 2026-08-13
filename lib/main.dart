@@ -1,12 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'api/api_client.dart';
+import 'api/appointments_api.dart';
 import 'api/attendance_api.dart';
 import 'api/auth_api.dart';
 import 'api/bootstrap_api.dart';
+import 'api/camps_api.dart';
+import 'api/devices_api.dart';
 import 'api/masters_store.dart';
 import 'api/patients_api.dart';
 import 'api/queues_api.dart';
+import 'api/requisitions_api.dart';
+import 'api/staff_api.dart';
 import 'api/sync_api.dart';
 import 'api/sync_service.dart';
 import 'api/token_store.dart';
@@ -53,12 +58,17 @@ void main() async {
       await AuthPersistence.clear();
     },
   );
-  final authApi       = AuthApi(apiClient);
-  final bootstrapApi  = BootstrapApi(apiClient);
-  final syncApi       = SyncApi(apiClient);
-  final queuesApi     = QueuesApi(apiClient);
-  final patientsApi   = PatientsApi(apiClient);
-  final attendanceApi = AttendanceApi(apiClient);
+  final authApi          = AuthApi(apiClient);
+  final bootstrapApi     = BootstrapApi(apiClient);
+  final syncApi          = SyncApi(apiClient);
+  final queuesApi        = QueuesApi(apiClient);
+  final patientsApi      = PatientsApi(apiClient);
+  final appointmentsApi  = AppointmentsApi(apiClient);
+  final attendanceApi    = AttendanceApi(apiClient);
+  final campsApi         = CampsApi(apiClient);
+  final devicesApi       = DevicesApi(apiClient);
+  final requisitionsApi  = RequisitionsApi(apiClient);
+  final staffApi         = StaffApi(apiClient);
 
   final mastersStore = MastersStore(bootstrapApi);
   await mastersStore.hydrate();
@@ -71,17 +81,22 @@ void main() async {
   if (session != null) syncService.drain();
 
   runApp(JubiCareApp(
-    firebase:    firebase,
-    session:     session,
-    apiClient:   apiClient,
-    authApi:     authApi,
-    bootstrapApi: bootstrapApi,
-    syncApi:     syncApi,
-    queuesApi:   queuesApi,
-    patientsApi: patientsApi,
-    attendanceApi: attendanceApi,
-    mastersStore: mastersStore,
-    syncService: syncService,
+    firebase:         firebase,
+    session:          session,
+    apiClient:        apiClient,
+    authApi:          authApi,
+    bootstrapApi:     bootstrapApi,
+    syncApi:          syncApi,
+    queuesApi:        queuesApi,
+    patientsApi:      patientsApi,
+    appointmentsApi:  appointmentsApi,
+    attendanceApi:    attendanceApi,
+    campsApi:         campsApi,
+    devicesApi:       devicesApi,
+    requisitionsApi:  requisitionsApi,
+    staffApi:         staffApi,
+    mastersStore:     mastersStore,
+    syncService:      syncService,
   ));
 }
 
@@ -94,7 +109,12 @@ class JubiCareApp extends StatelessWidget {
   final SyncApi syncApi;
   final QueuesApi queuesApi;
   final PatientsApi patientsApi;
+  final AppointmentsApi appointmentsApi;
   final AttendanceApi attendanceApi;
+  final CampsApi campsApi;
+  final DevicesApi devicesApi;
+  final RequisitionsApi requisitionsApi;
+  final StaffApi staffApi;
   final MastersStore mastersStore;
   final SyncService syncService;
 
@@ -107,7 +127,12 @@ class JubiCareApp extends StatelessWidget {
     required this.syncApi,
     required this.queuesApi,
     required this.patientsApi,
+    required this.appointmentsApi,
     required this.attendanceApi,
+    required this.campsApi,
+    required this.devicesApi,
+    required this.requisitionsApi,
+    required this.staffApi,
     required this.mastersStore,
     required this.syncService,
     this.session,
@@ -165,7 +190,12 @@ class JubiCareApp extends StatelessWidget {
         Provider<SyncApi>.value(value: syncApi),
         Provider<QueuesApi>.value(value: queuesApi),
         Provider<PatientsApi>.value(value: patientsApi),
+        Provider<AppointmentsApi>.value(value: appointmentsApi),
         Provider<AttendanceApi>.value(value: attendanceApi),
+        Provider<CampsApi>.value(value: campsApi),
+        Provider<DevicesApi>.value(value: devicesApi),
+        Provider<RequisitionsApi>.value(value: requisitionsApi),
+        Provider<StaffApi>.value(value: staffApi),
         ChangeNotifierProvider<MastersStore>.value(value: mastersStore),
         ChangeNotifierProvider<SyncService>.value(value: syncService),
         // Existing services.

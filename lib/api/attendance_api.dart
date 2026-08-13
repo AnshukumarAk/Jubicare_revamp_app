@@ -53,4 +53,36 @@ class AttendanceApi {
     });
     return (res as Map).cast<String, dynamic>();
   }
+
+  /// GET /attendance — historical rows for the caller (or a specific user
+  /// when the API supports admin scope). Params are ISO dates (yyyy-mm-dd).
+  Future<List<Map<String, dynamic>>> list({
+    String? dateFrom,
+    String? dateTo,
+    int? userId,
+    int? limit,
+  }) async {
+    final res = await client.get('/attendance', query: {
+      if (dateFrom != null) 'date_from': dateFrom,
+      if (dateTo   != null) 'date_to':   dateTo,
+      if (userId   != null) 'user_id':   userId,
+      if (limit    != null) 'limit':     limit,
+    });
+    if (res is List) {
+      return [ for (final r in res) if (r is Map) r.cast<String, dynamic>() ];
+    }
+    if (res is Map) {
+      final items = (res['items'] as List?) ?? const [];
+      return [ for (final r in items) if (r is Map) r.cast<String, dynamic>() ];
+    }
+    return const [];
+  }
+
+  /// GET /attendance/open — currently open shift for the caller, or null
+  /// if the last shift is already closed / none exists.
+  Future<Map<String, dynamic>?> openShift() async {
+    final res = await client.get('/attendance/open');
+    if (res is Map) return res.cast<String, dynamic>();
+    return null;
+  }
 }
