@@ -95,6 +95,11 @@ class CPatient {
   String pwd;         // 'Yes' / 'No'
   String pin;
   String address;
+  /// Backend appointment_id for the latest visit — populated by
+  /// `mergeBackendPatients` from the queues list row. Detail screens
+  /// use this to lazy-fetch full appointment data (symptoms,
+  /// diagnoses, vitals) that the list endpoint doesn't return.
+  int? backendAppointmentId;
 
   CPatient({
     required this.id,
@@ -130,6 +135,7 @@ class CPatient {
     this.pwd = 'No',
     this.pin = '',
     this.address = '',
+    this.backendAppointmentId,
   })  : symptoms = symptoms ?? [],
         vitals = vitals ?? {},
         attachments = attachments ?? [],
@@ -886,6 +892,10 @@ class CounsellorState extends ChangeNotifier {
         status:      statusOverride ?? (row['status'] as String?) ?? 'registered',
         registeredOn: registeredOn,
         regDate:     regDateFmt,
+        // Carry the appointment_id from the queue row so the detail
+        // screen can lazy-fetch symptoms + diagnoses + vitals via
+        // /api/appointments/{id} (the queue list is summary-only).
+        backendAppointmentId: (row['appointment_id'] as num?)?.toInt(),
       );
       patients.insert(0, adapted);
     }
