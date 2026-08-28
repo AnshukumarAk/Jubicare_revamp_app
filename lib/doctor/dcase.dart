@@ -1,16 +1,28 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../api/appointments_api.dart';
+import '../api/api_client.dart';
+import '../api/masters_store.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/symptom_field.dart';
+import '../services/appointment_detail_store.dart';
 import '../services/connectivity_service.dart';
+import '../services/terminology_store.dart';
+import '../services/translation_service.dart';
+import '../services/symptom_catalog.dart';
+import '../state/app_state.dart';
 import 'ddata.dart';
+import '../counsellor/cdata.dart' show ScoredDisease;
 import 'disease_master.dart';
-import 'voice.dart';
+import 'doctor_db_loader.dart';
+import '../services/deepgram_stt.dart';
 
 class DoctorCaseDetails extends StatefulWidget {
   final CPatient patient;
@@ -33,14 +45,16 @@ const List<({String key, String label, String hint})> _kVitalSpecs = [
 ];
 
 // _kVitalSpecs label -> the column GET /api/appointments/{id} returns it as.
-// Heart Rate has no counterpart: the appointment table stores no heart-rate
-// column, so that field stays empty for the doctor to fill in.
+// Heart Rate was mapped 2026-08-20 — appointment.heart_rate exists in the
+// backend (migration 2026-08-16); without this the counsellor-typed BPM
+// was landing in DB but not pre-filling on the doctor screen.
 const Map<String, String> _kVitalColumns = {
   'Systolic BP':       'systolic_bp',
   'Diastolic BP':      'diastolic_bp',
   'Blood Sugar':       'blood_sugar',
   'Body Temp (°F)':    'body_temp',
   'Oxygen Saturation': 'oxygen',
+  'Heart Rate':        'heart_rate',
   'Hemoglobin':        'hemoglobin',
 };
 
@@ -75,6 +89,27 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late final Map<String, TextEditingController> _vitals;
   bool _showVitals = false;
   bool _advisoryDismissed = false;
+  // Red "Required" boxes on prescription rows appear only after a Submit
+  // attempt, not while the doctor is still filling the card in (user
+  // 2026-08-21 "dont show required red box, show on submitting").
+  bool _showRxErrors = false;
+  // Village advisory (GET /appointments/{id}/advisory) — real village name
+  // + trending terms for the SymptomField panels. Null until loaded.
+  String? _advPlaceName;
+  List<Map<String, dynamic>>? _advTrending;
+  // Server-computed related symptoms (co-occurrence over real village
+  // data — user 2026-08-26: client-side terminology.relatedTerms was
+  // surfacing terms like "bleeding" that server's algorithm never
+  // returned). We prefer this when the API delivered it; the client
+  // fallback still runs offline.
+  List<String>? _advRelated;
+  // Server-ranked Likely Conditions (same reason as _advRelated —
+  // client compute was diverging from server on village bonus).
+  List<Map<String, dynamic>>? _advLikely;
+  // Next Follow-Up question (user 2026-08-21): null = not answered yet;
+  // Yes requires a date, which submits as follow_up_date.
+  bool? _nextFollowUp;
+  DateTime? _followUpDate;
   // True while GET /api/appointments/{id} is in flight — see
   // _loadRegistrationDetail. Without it the Registration Details card shows
   // a bare '—' during the round-trip, which reads as "none recorded".
@@ -91,20 +126,26 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   @override
   void initState() {
     super.initState();
+    // The advisory reads keywords out of the Observation text (user spec
+    // 2026-08-14) — rescore as the doctor dictates/types.
+    _obs.addListener(_onObsChanged);
     symptoms = List.from(p.symptoms);
     _pastHistory.text = p.pastHistory;
     _vitals = {
       for (final v in _kVitalSpecs)
         v.key: TextEditingController(text: p.vitals[v.key] ?? ''),
     };
-    // Prefill diagnosis + previously-prescribed medicines (rule 2026-07-31).
-    // Doctor can tweak either before submitting — sending re-appointment
-    // patients through with fewer clicks.
-    if (p.disease.isNotEmpty) {
-      for (final d in p.disease.split(',').map((s) => s.trim()).where((s) => s.isNotEmpty)) {
-        if (!diagnoses.contains(d)) diagnoses.add(d);
-      }
-    }
+    // Diagnosis prefill HIDDEN (user 2026-08-14): the counsellor's
+    // provisional diagnosis (p.disease) used to land here pre-selected,
+    // which read as a hardcoded value. The doctor now starts with an
+    // empty Diagnosis list and picks their own — the provisional one
+    // still shows via the AI advisory "Likely" and the village trend.
+    // Uncomment to restore the old re-appointment shortcut:
+    // if (p.disease.isNotEmpty) {
+    //   for (final d in p.disease.split(',').map((s) => s.trim()).where((s) => s.isNotEmpty)) {
+    //     if (!diagnoses.contains(d)) diagnoses.add(d);
+    //   }
+    // }
     if (p.prescription.isNotEmpty) {
       // Copy each RxItem so edits don't mutate the source until Submit.
       for (final m in p.prescription) {
@@ -115,7 +156,134 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       }
     }
     DiseaseMaster.load().then((_) { if (mounted) setState(() {}); });
+    // Full 158-condition clinical DB from assets (user 2026-08-22).
+    DoctorDbLoader.load().then((_) { if (mounted) setState(() {}); });
+    // Warm the hi/en models so the Submit-time translation is instant.
+    TranslationService.warmUp();
     _loadRegistrationDetail();
+    _loadAdvisory();
+    _loadStock();
+  }
+
+  /// Pharmacy on-hand quantities for this unit (GET /medicines/stock) —
+  /// shown under each prescribed medicine so the doctor knows what the
+  /// pharmacist can actually dispense (user 2026-08-21). Cache-first so
+  /// the numbers survive offline; a live fetch then refreshes them.
+  Map<String, int> _stock = {};
+  bool _stockLoaded = false;
+
+  static String _stockKey(String name) =>
+      name.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+  Future<void> _loadStock() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('med_stock_v1');
+      if (raw != null && mounted) {
+        final m = (jsonDecode(raw) as Map).cast<String, dynamic>();
+        setState(() {
+          _stock = {for (final e in m.entries) e.key: (e.value as num).toInt()};
+          _stockLoaded = true;
+        });
+      }
+    } catch (_) {/* no cache yet */}
+    try {
+      final res = await context.read<ApiClient>().get('/medicines/stock');
+      if (!mounted || res is! List) return;
+      final next = <String, int>{
+        for (final r in res)
+          if (r is Map && (r['medicine_name'] ?? '').toString().isNotEmpty)
+            _stockKey(r['medicine_name'].toString()):
+                (r['quantity'] as num?)?.toInt() ?? 0,
+      };
+      setState(() { _stock = next; _stockLoaded = true; });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('med_stock_v1', jsonEncode(next));
+    } catch (_) {
+      // Offline / old backend without the endpoint — the line stays hidden.
+    }
+  }
+
+  /// Village name + village trending from GET /appointments/{id}/advisory.
+  /// Cache-first (per appointment) so the "Common in <village>" panel still
+  /// renders offline with the last good pull; a live fetch then refreshes.
+  /// Passes the CURRENT chip list so the server's relevance filter tracks
+  /// what the doctor has on screen (user 2026-08-27: "Common in Baknaur"
+  /// was still showing Fever-relevant conditions for a case whose chips
+  /// were switched to Abdominal cramps + Abdominal discomfort).
+  bool _advisoryLoading = false;
+  bool _advisoryError = false;
+
+  Future<void> _loadAdvisory() async {
+    final apptId = p.backendAppointmentId;
+    if (apptId == null) return;
+    final csv = symptoms.join(',');
+    // Show "analyzing…" placeholder immediately so the panels don't
+    // flash stale data from the previous chip set (user 2026-08-27).
+    if (mounted && !_advisoryLoading) {
+      setState(() => _advisoryLoading = true);
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('advisory_v1:$apptId');
+      if (raw != null && mounted) {
+        _applyAdvisoryData(jsonDecode(raw) as Map<String, dynamic>);
+      }
+    } catch (_) {/* no cache yet */}
+    try {
+      final body = await context.read<AppointmentsApi>()
+          .advisory(apptId, symptoms: csv.isEmpty ? null : csv);
+      if (!mounted) return;
+      _advisoryError = false;
+      _applyAdvisoryData(body);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('advisory_v1:$apptId', jsonEncode(body));
+    } catch (_) {
+      // Offline / server error — friendly Retry strip on the panels
+      // (user 2026-08-28); a cached copy (if any) still rendered above.
+      if (mounted) setState(() => _advisoryError = true);
+    } finally {
+      if (mounted && _advisoryLoading) {
+        setState(() => _advisoryLoading = false);
+      }
+    }
+  }
+
+  // Debounced re-fetch of the advisory when the chip list changes at
+  // runtime (2026-08-27). Debounce keeps the API quiet during rapid
+  // edits (tap-tap-tap on chips) and coalesces to one round trip.
+  Timer? _advisoryRefetch;
+  String _advisorySymsSig = '';
+  void _maybeRefetchAdvisory() {
+    final sig = symptoms.join('|');
+    if (sig == _advisorySymsSig) return;
+    _advisorySymsSig = sig;
+    _advisoryRefetch?.cancel();
+    _advisoryRefetch = Timer(const Duration(milliseconds: 500), () {
+      if (mounted) _loadAdvisory();
+    });
+  }
+
+  void _applyAdvisoryData(Map<String, dynamic> body) {
+    final common = (body['common_in_village'] as Map?)?.cast<String, dynamic>();
+    setState(() {
+      _advPlaceName = (body['case'] as Map?)?['village_name']?.toString();
+      _advTrending = [
+        for (final t in (common?['trending'] as List? ?? const []))
+          if (t is Map) t.cast<String, dynamic>(),
+      ];
+      // Server rows look like {"symptom": "anorexia", "association": 6,
+      // "rank": 1}. We just need the term string for the chip label.
+      _advRelated = [
+        for (final r in (body['related_symptoms'] as List? ?? const []))
+          if (r is Map && (r['symptom'] ?? '').toString().trim().isNotEmpty)
+            (r['symptom'] as Object).toString(),
+      ];
+      _advLikely = [
+        for (final c in (body['likely_conditions'] as List? ?? const []))
+          if (c is Map) c.cast<String, dynamic>(),
+      ];
+    });
   }
 
   /// Pull what the counsellor recorded at registration for a backend patient.
@@ -131,59 +299,192 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     if (apptId == null) return;
     // Assigned directly, not via setState — initState runs before first build.
     _loadingRegDetail = true;
+    final app = context.read<AppState>();
+    final userKey = 'doctor_${app.backendUserId ?? app.currentUser}';
+    // Hydrate from OFFLINE CACHE first so the doctor sees symptoms +
+    // vitals immediately (user rule 2026-08-20 "case details also offline").
+    try {
+      final store = await AppointmentDetailStore.open();
+      final cached = store.load(userKey, apptId);
+      if (cached != null && mounted) {
+        _applyRegistrationDetail(cached);
+      }
+    } catch (_) {/* first-time — nothing cached */}
     try {
       final d = await context.read<AppointmentsApi>().detail(apptId);
       if (!mounted) return;
-      final freshSymptoms = <String>[
-        for (final s in (d['symptoms'] as List? ?? const []))
-          if (s is Map)
-            (s['symptom_name'] ?? s['name'] ?? '').toString().trim()
-      ]..removeWhere((s) => s.isEmpty);
-      // Keyed by the labels _kVitalSpecs uses, so the values land in the
-      // matching editable field. Blank/zero readings are left out — an empty
-      // box for the doctor to fill beats a bogus 0.
-      final freshVitals = <String, String>{};
-      for (final spec in _kVitalSpecs) {
-        final raw = d[_kVitalColumns[spec.key]];
-        final val = _fmtVital(raw);
-        if (val.isNotEmpty) freshVitals[spec.key] = val;
-      }
-      setState(() {
-        if (freshSymptoms.isNotEmpty) {
-          p.symptoms = freshSymptoms;
-          // `symptoms` was seeded from the (empty) p.symptoms above and drives
-          // both the editable chips and the AI advisory scoring, so it has to
-          // be refreshed too — not just the read-only card.
-          symptoms = List.from(freshSymptoms);
-        }
-        final cRemarks = (d['counsellor_remarks'] ?? '').toString().trim();
-        if (cRemarks.isNotEmpty) p.remarks = cRemarks;
-        if (freshVitals.isNotEmpty) {
-          p.vitals = {...p.vitals, ...freshVitals};
-          // Fill only fields the doctor hasn't already typed into, so a slow
-          // response can never overwrite a reading being entered right now.
-          for (final e in freshVitals.entries) {
-            final c = _vitals[e.key];
-            if (c != null && c.text.trim().isEmpty) c.text = e.value;
-          }
-          // Counsellor readings exist — open the section so they're visible
-          // and editable instead of hidden behind the collapsed toggle.
-          _showVitals = true;
-        }
-      });
+      // Persist the fresh copy for the next offline open (2026-08-20).
+      unawaited(AppointmentDetailStore.open()
+          .then((s) => s.save(userKey, apptId, d))
+          .catchError((_) {}));
+      _applyRegistrationDetail(d);
     } catch (_) {
-      // Non-blocking by design: offline is the normal case in an MMU. The
-      // card falls back to '—' and empty vitals the doctor can fill in.
+      // Offline / API error — the cache hydrate above already ran, so
+      // symptoms/vitals are showing whatever the last successful pull
+      // left. No banner: the user shouldn't see network noise.
     } finally {
       if (mounted) setState(() => _loadingRegDetail = false);
     }
   }
 
+  /// Apply an appointment detail JSON to the local editable state.
+  /// Extracted so cache-hydrate and live-fetch share the same mapping.
+  void _applyRegistrationDetail(Map<String, dynamic> d) {
+    final freshSymptoms = <String>[
+      for (final s in (d['symptoms'] as List? ?? const []))
+        if (s is Map)
+          (s['symptom_name'] ?? s['name'] ?? '').toString().trim()
+    ]..removeWhere((s) => s.isEmpty);
+    final freshVitals = <String, String>{};
+    for (final spec in _kVitalSpecs) {
+      final raw = d[_kVitalColumns[spec.key]];
+      final val = _fmtVital(raw);
+      if (val.isNotEmpty) freshVitals[spec.key] = val;
+    }
+    setState(() {
+      if (freshSymptoms.isNotEmpty) {
+        p.symptoms = freshSymptoms;
+        symptoms = List.from(freshSymptoms);
+      }
+      // Previously saved observation must show when the case reopens
+      // (user 2026-08-21 "Observation value not showing") — but never
+      // clobber text the doctor is typing right now.
+      final obs = (d['observation'] ?? '').toString().trim();
+      if (obs.isNotEmpty && _obs.text.trim().isEmpty) _obs.text = obs;
+      // English version leads (user 2026-08-22); original is the fallback.
+      final cRemarksEn = (d['counsellor_remarks_english'] ?? '').toString().trim();
+      final cRemarks = cRemarksEn.isNotEmpty
+          ? cRemarksEn
+          : (d['counsellor_remarks'] ?? '').toString().trim();
+      if (cRemarks.isNotEmpty) p.remarks = cRemarks;
+      if (freshVitals.isNotEmpty) {
+        p.vitals = {...p.vitals, ...freshVitals};
+        for (final e in freshVitals.entries) {
+          final c = _vitals[e.key];
+          if (c != null && c.text.trim().isEmpty) c.text = e.value;
+        }
+        _showVitals = true;
+      }
+    });
+  }
+
   @override
   void dispose() {
+    _obsDebounce?.cancel();
+    _obs.removeListener(_onObsChanged);
     for (final c in _vitals.values) { c.dispose(); }
     _focusSink.dispose();
     super.dispose();
+  }
+
+  final Set<String> _autoAdded = {};
+
+  /// Every problem the doctor dictates in the Observation — Hindi,
+  /// Hinglish or English, several in one sentence — becomes a selected
+  /// symptom chip automatically (user 2026-08-22 "बुखार हो रहा है" →
+  /// Fever). Two passes:
+  ///   1. SymptomCatalog — the explicit spoken-word → chip mapping
+  ///      ("bukhar"/"बुखार"/"fever" → Fever), spelling-tolerant.
+  ///   2. Clinical sheet synonyms, but a chip is only added when the
+  ///      match lines up with a name from the server's SYMPTOM MASTER —
+  ///      the same names the counsellor's picker uses, so no long
+  ///      clinical phrases or condition names sneak into the chips.
+  // Cache the last text auto-add ran on, so a debounce fire that reflects
+  // no new speech (e.g. cursor moved, whitespace-only edit) skips the
+  // heavy master + terminology scan entirely.
+  String _lastAutoText = '';
+  void _autoAddFromTranscript() {
+    final text = _obs.text.trim();
+    if (text.isEmpty) return;
+    if (text == _lastAutoText) return;
+    _lastAutoText = text;
+    final found = <String>{...SymptomCatalog.match(text)};
+    final textWords = SymptomCatalog.wordsOf(text);
+    final store = context.read<TerminologyStore>();
+    if (store.isLoaded) {
+      final masterByKey = <String, String>{};
+      for (final r in context.read<MastersStore>().masterRows('symptoms')) {
+        final name = (r['term'] ?? r['name'] ?? r['symptom_name'])?.toString();
+        if (name == null || name.trim().isEmpty) continue;
+        masterByKey[TerminologyStore.loose(TerminologyStore.normalize(name))] =
+            name;
+      }
+      // Words that are too generic to carry a diagnosis on their own —
+      // "दर्द" (dard) matches every Xxx-dard synonym, "pain" matches
+      // every English pain phrase; plus vocative honorifics ("sar,
+      // hamne..." starts many dictations, and 'sar' ALSO means "head",
+      // which was mis-adding Headache — user 2026-08-26).
+      const ambiguous = {'dard', 'pain', 'ache', 'problem', 'ho', 'hota',
+        'takleef', 'taklif', 'dikkat', 'issue',
+        'sir', 'sar', 'madam', 'sahab', 'sahib', 'doctor', 'sirji'};
+      for (final m in store.matchInputs([text])) {
+        // A single shared word ("dard") is not evidence — the WHOLE
+        // matched synonym must be present in the dictation (user
+        // 2026-08-22: "हाथ में जलन" was adding Headache + Abdominal pain).
+        if (!SymptomCatalog.phraseHit(textWords, m.matchedSynonym)) continue;
+        // Reject synonyms whose only meaningful words are ≤3 chars —
+        // 3-char words are usually filler / grammar / honorifics in
+        // Hindi and produce false positives when combined with a
+        // generic pain word (user 2026-08-26).
+        final synWords = SymptomCatalog.wordsOf(m.matchedSynonym);
+        final meaningful = synWords.where(
+            (w) => w.length >= 4 && !ambiguous.contains(w)).toList();
+        if (meaningful.isEmpty) continue;
+        var mapped = false;
+        for (final cand in [m.matchedSynonym, m.entry.standardTerm]) {
+          final master = masterByKey[
+              TerminologyStore.loose(TerminologyStore.normalize(cand))];
+          if (master != null) {
+            found.add(master);
+            mapped = true;
+            break;
+          }
+        }
+        // Sheet fallback (user 2026-08-22 "your mapping word + Synonyms
+        // word"): the Excel's Symptoms column rides in the synonym table
+        // too — when the dictation matched one of those SHORT symptom
+        // names and the server master doesn't carry it, the sheet term
+        // itself becomes the chip. Disease names stay out: only terms
+        // listed in the entry's own Symptoms column qualify.
+        if (!mapped) {
+          final syn = m.matchedSynonym.trim();
+          final synKey = TerminologyStore.loose(TerminologyStore.normalize(syn));
+          final fromSymptomsColumn = m.entry.symptoms.any((s) =>
+              TerminologyStore.loose(TerminologyStore.normalize(s)) == synKey);
+          if (fromSymptomsColumn && syn.length <= 30) found.add(syn);
+        }
+      }
+    }
+    var addedAny = false;
+    for (final canonical in found) {
+      final key = canonical.toLowerCase();
+      if (_autoAdded.contains(key)) continue;
+      if (symptoms.any((s) => s.toLowerCase() == key)) continue;
+      _autoAdded.add(key);
+      symptoms.add(canonical);
+      addedAny = true;
+    }
+    _autoAddedThisRun = addedAny;
+  }
+  bool _autoAddedThisRun = false;
+
+  Timer? _obsDebounce;
+
+  /// Debounced (user 2026-08-25 "lagging while taking observation and
+  /// after apply"). Deepgram streams partial transcripts every ~200 ms,
+  /// so a short debounce fires the heavy work over and over WHILE the
+  /// doctor is still speaking. 800 ms lands the work AFTER the user
+  /// pauses (user 2026-08-26 "app fully freezing during observation").
+  /// Also skips the setState when nothing new was auto-added — no
+  /// visual change to render, so the frame stays free.
+  void _onObsChanged() {
+    if (!mounted) return;
+    _obsDebounce?.cancel();
+    _obsDebounce = Timer(const Duration(milliseconds: 800), () {
+      if (!mounted) return;
+      _autoAddFromTranscript();
+      if (_autoAddedThisRun) setState(() {});
+    });
   }
 
   /// Commit the current controller values into p.vitals. Called from the
@@ -224,6 +525,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     return (n == null || n <= 0) ? 5 : n;
   }
 
+  // HS mapping kept — legacy rows might still carry it (dropdown option
+  // itself is removed per user rule 2026-08-16, see kFrequencies).
   static const _perDay = {'OD': 1, 'BD': 2, 'TDS': 3, 'QID': 4, 'SOS': 1, 'HS': 1};
   void _recalcQty(RxItem m) {
     final perDay = _perDay[m.interval] ?? 1;
@@ -231,20 +534,71 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     m.qty = perDay * days;
   }
 
+  // Trackers for the LAST auto-applied advisory items (user 2026-08-26:
+  // re-Apply was accumulating stale diagnoses/tests/medicines instead of
+  // replacing them). Only these get removed on the next Apply — anything
+  // the doctor added by hand stays put.
+  String? _lastAppliedDx;
+  List<String> _lastAppliedTests = const [];
+  List<String> _lastAppliedRxNames = const [];
+
   void _applyAdvisory(String name, DPlan plan) {
     final resolved = DiseaseMaster.resolve(name);
     final dxStr = resolved?.display ?? name;
+    final newTests = List<String>.from(plan.tests);
+    final newRxItems = plan.rx.map((r) {
+      final (mn, md) = splitMedicine(r.name);
+      return RxItem(name: mn, dosage: md, days: r.days, interval: r.interval, qty: r.qty);
+    }).toList();
     setState(() {
+      // 1. Drop the PREVIOUS auto-applied items (only if they are still
+      //    present — doctor may have deleted them manually).
+      if (_lastAppliedDx != null) {
+        diagnoses.remove(_lastAppliedDx);
+      }
+      for (final t in _lastAppliedTests) {
+        tests.remove(t);
+      }
+      for (final rxName in _lastAppliedRxNames) {
+        rx.removeWhere((m) => m.name == rxName);
+      }
+      // 2. Add the new advisory items (dedup against what's already there).
       if (!diagnoses.contains(dxStr)) diagnoses.add(dxStr);
-      tests..clear()..addAll(plan.tests);
-      // Apply puts the medicine name in the name field and its strength in Dosage.
-      rx..clear()..addAll(plan.rx.map((r) {
-        final (mn, md) = splitMedicine(r.name);
-        return RxItem(name: mn, dosage: md, days: r.days, interval: r.interval, qty: r.qty);
-      }));
+      for (final t in newTests) {
+        if (!tests.contains(t)) tests.add(t);
+      }
+      for (final m in newRxItems) {
+        if (!rx.any((x) => x.name == m.name)) rx.add(m);
+      }
+      // 3. Remember what we just applied for the NEXT re-Apply.
+      _lastAppliedDx = dxStr;
+      _lastAppliedTests = newTests;
+      _lastAppliedRxNames = newRxItems.map((m) => m.name).toList();
+      _appliedAdvSig = _advSig;
     });
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Applied $name protocol'), backgroundColor: C2.green));
   }
+
+  // Memoized advisory computation (user 2026-08-25: lag after each
+  // diagnosis/test/medicine tap). build() ran the whole sheet scan +
+  // village aggregation + scoreDoctor on EVERY setState — even when just
+  // toggling a chip that has nothing to do with them. Now they only
+  // recompute when the inputs they depend on actually change.
+  String? _advSig;
+  // Signature of the advisory at the moment Apply was tapped. Apply is
+  // disabled while `_appliedAdvSig == _advSig` — i.e. nothing about the
+  // case has changed since the last apply, so tapping again would just
+  // repeat the same protocol (user 2026-08-26). Any input change
+  // (symptoms/observation/village/…) rebuilds `_advSig`, which flips
+  // the button back to active and the next Apply refreshes tests/rx.
+  String? _appliedAdvSig;
+  Map<String, int>? _cachedVillageDx;
+  ScoredCondition? _cachedSheetTop;
+  TermEntry? _cachedSheetEntry;
+  List<String> _cachedSheetFlagHits = const [];
+  List<ScoredDisease> _cachedScored = const [];
+  DPlan? _cachedPlan;
+  bool _cachedTermLoaded = false;
 
   @override
   Widget build(BuildContext context) {
@@ -252,9 +606,76 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // Watch connectivity — the AI advisory panel is only shown when the doctor
     // is online (user rule: no AI/ML surfaces when offline).
     final online = context.watch<ConnectivityService>().isOnline;
-    final scored = scoreDoctor(symptoms, p.block);
+    final terminology = context.watch<TerminologyStore>();
+    final obsText = _obs.text;
+    final sig = [
+      symptoms.join('|'),
+      obsText,
+      p.village,
+      p.block ?? '',
+      terminology.isLoaded ? 't' : 'f',
+      (_advTrending ?? const []).length.toString(),
+      s.patients.length.toString(),
+    ].join('');
+    if (sig != _advSig) {
+      final _t0 = DateTime.now().microsecondsSinceEpoch;
+      _advSig = sig;
+      final vill = p.village.trim().toLowerCase();
+      final villageDx = <String, int>{};
+      if (vill.isNotEmpty) {
+        for (final q in s.patients) {
+          final d = q.disease.trim();
+          if (q.id != p.id && d.isNotEmpty &&
+              q.village.trim().toLowerCase() == vill) {
+            villageDx[d] = (villageDx[d] ?? 0) + 1;
+          }
+        }
+      }
+      _cachedVillageDx = villageDx;
+      _cachedTermLoaded = terminology.isLoaded;
+      _cachedSheetTop = null;
+      _cachedSheetEntry = null;
+      _cachedSheetFlagHits = const [];
+      if (terminology.isLoaded) {
+        final consolidated = [
+          ...symptoms,
+          if (obsText.trim().isNotEmpty) obsText.trim(),
+        ];
+        final conds = terminology.likelyConditions(consolidated,
+            trending: _advTrending ?? const []);
+        if (conds.isNotEmpty) {
+          _cachedSheetTop = conds.first;
+          _cachedSheetEntry = terminology.entryByTerm(_cachedSheetTop!.name);
+          if (_cachedSheetEntry != null) {
+            _cachedSheetFlagHits =
+                terminology.redFlagHits(consolidated, _cachedSheetEntry!);
+          }
+        }
+      }
+      _cachedScored = scoreDoctor(symptoms, p.block,
+          observation: obsText, villageDx: villageDx);
+      _cachedPlan = _cachedScored.isNotEmpty
+          ? doctorDb[_cachedScored.first.name]
+          : null;
+      print('[JC] advisory rebuild took '
+          '${DateTime.now().microsecondsSinceEpoch - _t0} µs '
+          '(symptoms=${symptoms.length}, obs=${obsText.length}, '
+          'patients=${s.patients.length}, termLoaded=${terminology.isLoaded})');
+    } else {
+      // Cache HIT — no heavy work.
+    }
+    final villageDx = _cachedVillageDx ?? const <String, int>{};
+    // Avoid unused-variable warnings on the reused caches.
+    // ignore: unused_local_variable
+    final termLoaded = _cachedTermLoaded;
+    // ignore: unused_local_variable
+    final _villageDxRef = villageDx;
+    final sheetTop = _cachedSheetTop;
+    final sheetEntry = _cachedSheetEntry;
+    final sheetFlagHits = _cachedSheetFlagHits;
+    final scored = _cachedScored;
     final top = scored.isNotEmpty ? scored.first : null;
-    final plan = top == null ? null : kDoctorDb[top.name];
+    final plan = _cachedPlan;
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
       child: Scaffold(
@@ -276,7 +697,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(p.name, style: ct(16, FontWeight.w700, C2.text)),
               Text('${p.gender}, ${p.age}y · ${p.contact}', style: ct(12, FontWeight.w400, C2.text2)),
-              Text('${p.village.isEmpty ? "—" : p.village}${p.uniqueCode.isNotEmpty ? " · ${p.uniqueCode}" : ""}', style: ct(11.5, FontWeight.w400, C2.text2)),
+              // unique_code stays internal (user rule 2026-08-14).
+              Text(p.village.isEmpty ? '—' : p.village, style: ct(11.5, FontWeight.w400, C2.text2)),
             ])),
           ])),
           // registration details (read-only, filled by counsellor)
@@ -314,34 +736,36 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // observation box (voice transcript) — between Registration & Symptoms
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const SecBar('Observation'),
-            VoiceTranscriptBox(controller: _obs, hint: 'Tap to record, or type observations'),
+            SmartTranscriptBox(controller: _obs, hint: 'Tap to record, or type observations'),
           ])),
-          // past medical history
-          CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Past Medical History'),
-            Text('Chronic illness, past surgeries, ongoing treatment.', style: ct(11, FontWeight.w400, C2.text2)),
-            const SizedBox(height: 6),
-            TextField(controller: _pastHistory, minLines: 2, maxLines: 5, decoration: cInput('e.g. Hypertension, diabetes, prior surgery, current meds')),
-          ])),
+          // Past Medical History input HIDDEN on this page (user
+          // 2026-08-14: "dont remove just comment out"). The controller
+          // stays seeded from p.pastHistory, so the submit path still
+          // carries the counsellor's value forward unchanged and the Dx
+          // history dialog still shows it. Uncomment to bring it back:
+          // CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          //   const SecBar('Past Medical History'),
+          //   Text('Chronic illness, past surgeries, ongoing treatment.', style: ct(11, FontWeight.w400, C2.text2)),
+          //   const SizedBox(height: 6),
+          //   TextField(controller: _pastHistory, minLines: 2, maxLines: 5, decoration: cInput('e.g. Hypertension, diabetes, prior surgery, current meds')),
+          // ])),
           // Prescription and Reports — two chip-buttons (Px + Rx) that open
           // a tabular history dialog (rule 2026-08-05). Doctor sees a
           // structured view of past consultations and past prescriptions
           // instead of two long stacked lists inline.
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Prescription and Reports'),
-            Text('Tap Px for past consultations, Rx for past prescriptions.',
-              style: ct(11.5, FontWeight.w400, C2.text2)),
-            const SizedBox(height: 8),
+            const SecBar('Past Medical History and Prescription'),
+            const SizedBox(height: 4),
             Row(children: [
               Expanded(child: _historyChip(
-                label: 'Px', subtitle: 'Past Consultations',
+                label: 'Dx',
                 icon: Icons.history_edu_outlined,
                 count: _pxCount(),
                 onTap: () => _openPxHistory(),
               )),
               const SizedBox(width: 8),
               Expanded(child: _historyChip(
-                label: 'Rx', subtitle: 'Past Prescriptions',
+                label: 'Rx',
                 icon: Icons.medication_outlined,
                 count: p.previousRx.length,
                 onTap: () => _openRxHistory(),
@@ -355,10 +779,116 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // symptoms & diagnosis
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const SecBar('Symptoms & Diagnosis'),
-            CField('Symptoms', SymptomField(selected: symptoms, block: p.block, onChanged: (v) => setState(() { symptoms..clear()..addAll(v); _advisoryDismissed = false; }))),
-            if (online && plan != null && !_advisoryDismissed) _advisory(top!.name, top.pct, plan),
+            CField('Symptoms', required: true, SymptomField(
+              selected: symptoms,
+              block: p.block,
+              // Real village name + trends from the advisory API; the
+              // village on the patient row is the offline fallback label.
+              placeName: _advPlaceName ??
+                  (p.village.isNotEmpty ? p.village : p.block),
+              trending: _advTrending,
+              // Server-computed related symptoms (from the same
+              // advisory API). SymptomField will prefer this over its
+              // local co-occurrence guess; the client-side compute stays
+              // as the offline fallback.
+              serverRelated: _advRelated,
+              serverLikely: _advLikely,
+              loading: _advisoryLoading,
+              error: _advisoryError,
+              onRetry: () {
+                setState(() {
+                  _advisoryError = false;
+                  _advisoryLoading = true;
+                });
+                _loadAdvisory();
+              },
+              // The dictated Observation feeds symptom hints too — the
+              // obs listener already rebuilds on every keystroke.
+              freeText: _obs.text,
+              onChanged: (v) {
+                setState(() { symptoms..clear()..addAll(v); _advisoryDismissed = false; });
+                // Re-pull advisory so "Common in <village>" tracks the
+                // current chip list (2026-08-27).
+                _maybeRefetchAdvisory();
+              })),
+            // Advisory shows the SAME top condition + % as the Likely
+            // Conditions card (user 2026-08-22 "percentage showing wrong")
+            // — sheet scoring leads; plan looked up by STANDARD TERM in
+            // the clinical JSON; ICD rides on the Likely line.
+            // AI Advisory only when there's a case to advise on — when
+            // the doctor clears all chips there's nothing to interpret
+            // (user 2026-08-27: card was lingering after all symptoms
+            // were removed).
+            if (online && !_advisoryDismissed && symptoms.isNotEmpty
+                && _advisoryLoading)
+              Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                    gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]),
+                    borderRadius: BorderRadius.circular(12)),
+                child: Row(children: [
+                  const SizedBox(width: 14, height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)),
+                  const SizedBox(width: 10),
+                  Text('AI Clinical Advisory — analyzing…',
+                      style: ct(12.5, FontWeight.w700, Colors.white)),
+                ]),
+              ),
+            if (online && !_advisoryDismissed && symptoms.isNotEmpty
+                && !_advisoryLoading)
+              Builder(builder: (_) {
+                // Prefer the SERVER's top ranked condition — same list
+                // the Likely Conditions card shows (user 2026-08-27:
+                // Likely showed Fever top 81% while the Advisory below
+                // still read Gout 85% from the client's diverging
+                // compute). Fall back to the sheet/client compute only
+                // when the server list is empty (offline / cache miss).
+                final serverTop = (_advLikely != null && _advLikely!.isNotEmpty)
+                    ? _advLikely!.first : null;
+                final srvName = serverTop == null ? null
+                    : (serverTop['condition'] ?? serverTop['name'] ?? '')
+                        .toString();
+                final srvPct = serverTop == null ? 0
+                    : ((serverTop['score'] ?? serverTop['pct'] ?? 0) as num)
+                        .toInt();
+                final srvIcd = serverTop == null ? null
+                    : (serverTop['icd11_code'] ?? serverTop['icd11'] ?? '')
+                        .toString();
+                final advName = srvName?.isNotEmpty == true
+                    ? srvName : (sheetTop?.name ?? top?.name);
+                final advPct = (srvName?.isNotEmpty == true) ? srvPct
+                    : (sheetTop?.pct ?? top?.pct ?? 0);
+                final advIcd = (srvIcd?.isNotEmpty == true)
+                    ? srvIcd! : (sheetEntry?.icd11Code ?? '');
+                // Case-insensitive multi-key lookup (loader indexes
+                // standardTerm / condition / icd + lowercased variants).
+                // NO longer falls back to `plan` — that was silently
+                // showing Viral Fever's Tests/Rx/Red Flags under an
+                // "Acute sinusitis" header (user 2026-08-26). If
+                // doctorDb has no match, we render the terminology
+                // sheet's own tests/red-flags/reference instead.
+                DPlan? _lookup(String? name) {
+                  if (name == null || name.trim().isEmpty) return null;
+                  final n = name.trim();
+                  return doctorDb[n] ?? doctorDb[n.toLowerCase()];
+                }
+                final advPlan = _lookup(advName)
+                    ?? (sheetEntry != null
+                        ? (_lookup(sheetEntry.standardTerm)
+                            ?? _lookup(sheetEntry.subCategory)
+                            ?? _lookup(sheetEntry.icd11Code))
+                        : null);
+                if (advName != null && advPlan != null) {
+                  return _advisory(advName, advPct, advPlan, icd: advIcd);
+                }
+                if (sheetEntry != null && sheetTop != null) {
+                  return _advisoryFromSheet(sheetTop, sheetEntry, sheetFlagHits);
+                }
+                return const SizedBox.shrink();
+              }),
             CField('Diagnosis (ICD-11)', _diagnosisField()),
-            CField('Tests to Order', _testsField()),
+            CField('Investigations', _testsField()),
           ])),
           // prescription
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -371,12 +901,116 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // doctor remarks (with speech-to-text)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const SecBar('Doctor Remarks'),
-            TextField(controller: _remarks, minLines: 2, maxLines: 4, decoration: cInput('Advice / follow-up').copyWith(
-              suffixIcon: VoiceMicButton(controller: _remarks))),
+            TextField(controller: _remarks, minLines: 2, maxLines: null, decoration: cInput('Advice / follow-up').copyWith(
+              suffixIcon: RemarksMicButton(controller: _remarks))),
+          ])),
+          // Next follow-up: Yes -> pick the date (user 2026-08-21). Rides
+          // to the server as follow_up_date, which doctor_submit already
+          // stores on the prescription.
+          CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const SecBar('Next Follow-Up'),
+            Row(children: [
+              for (final yes in [true, false]) ...[
+                InkWell(
+                  onTap: () => setState(() {
+                    _nextFollowUp = yes;
+                    if (!yes) _followUpDate = null;
+                  }),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(
+                      _nextFollowUp == yes
+                          ? Icons.radio_button_checked
+                          : Icons.radio_button_off,
+                      size: 18,
+                      color: _nextFollowUp == yes ? C2.cyan : C2.text3,
+                    ),
+                    const SizedBox(width: 5),
+                    Text(yes ? 'Yes' : 'No', style: ct(13, FontWeight.w600, C2.text)),
+                  ]),
+                ),
+                const SizedBox(width: 24),
+              ],
+            ]),
+            if (_nextFollowUp == true) ...[
+              const SizedBox(height: 8),
+              InkWell(
+                onTap: () async {
+                  final now = DateTime.now();
+                  final picked = await showDatePicker(
+                    context: context,
+                    initialDate: _followUpDate ?? now.add(const Duration(days: 7)),
+                    firstDate: now.add(const Duration(days: 1)),
+                    lastDate: now.add(const Duration(days: 365)),
+                  );
+                  if (picked != null) setState(() => _followUpDate = picked);
+                },
+                child: InputDecorator(
+                  decoration: cInput('Select follow-up date').copyWith(
+                    suffixIcon: const Icon(Icons.calendar_month, size: 18)),
+                  child: Text(
+                    _followUpDate == null
+                        ? 'Select follow-up date'
+                        : fmtDate(_followUpDate!),
+                    style: ct(13, FontWeight.w500,
+                        _followUpDate == null ? C2.text3 : C2.text),
+                  ),
+                ),
+              ),
+            ],
           ])),
           const SizedBox(height: 4),
-          CPrimaryButton('Submit Case', icon: Icons.check_circle_outline, onTap: () {
-            if (diagnoses.isEmpty) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Add at least one diagnosis'), backgroundColor: C2.danger)); return; }
+          CPrimaryButton('Submit Case', icon: Icons.check_circle_outline, onTap: () async {
+            // [JC] debug trail (user 2026-08-21) — visible in logcat.
+            print('[JC] submit tapped: dx=${diagnoses.length} rx=${rx.length} '
+                'followUp=$_nextFollowUp date=$_followUpDate '
+                'apptId=${p.backendAppointmentId}');
+            void err(String m) {
+              print('[JC] submit BLOCKED: ' + m);
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
+            }
+            if (symptoms.isEmpty) { return err('Add at least one symptom'); }
+            if (diagnoses.isEmpty) { return err('Add at least one diagnosis'); }
+            if (_nextFollowUp == null) { return err('Answer "Next Follow-Up" (Yes/No)'); }
+            if (_nextFollowUp == true && _followUpDate == null) { return err('Select the follow-up date'); }
+            // Vitals must be clinically plausible (user 2026-08-22).
+            for (final v in _kVitalSpecs) {
+              final rangeErr = _vitalRangeErr(v.key);
+              if (rangeErr != null) return err('${v.label}: $rangeErr');
+            }
+            // Prescription validation: any row added must be complete.
+            // Doctor's prescription is the audit trail — half-filled rows
+            // block dispense downstream (user rule 2026-08-16).
+            for (final m in rx) {
+              final bad = m.dosage.trim().isEmpty ||
+                  !kFrequencies.contains(m.interval) ||
+                  _durationError(m.days) != null;
+              // Light up the inline "Required" boxes from here on — they
+              // stay hidden until the first failed Submit (user 2026-08-21).
+              if (bad) setState(() => _showRxErrors = true);
+              if (m.dosage.trim().isEmpty) return err('${m.name}: enter dosage');
+              if (!kFrequencies.contains(m.interval)) return err('${m.name}: pick frequency');
+              if (_durationError(m.days) != null) return err('${m.name}: ${_durationError(m.days)!.toLowerCase()} in duration');
+            }
+            // Bilingual columns (user 2026-08-21): the original goes to
+            // `observation` / `doctor_remarks` exactly as dictated; the
+            // *_english twin is translated the same way the counsellor's
+            // remarks are (Google web → ML Kit offline → raw). Hard cap so
+            // Submit never hangs on a slow translator.
+            final obsOriginal = _obs.text.trim();
+            final remOriginal = _remarksWithTests();
+            final devanagari = RegExp(r'[ऀ-ॿ]');
+            Future<String> toEnglish(String t) async {
+              if (t.isEmpty || !devanagari.hasMatch(t)) return t;
+              try {
+                return await TranslationService.hiToEn(t)
+                    .timeout(const Duration(seconds: 12));
+              } catch (_) {
+                return t; // worst case: original rides in both columns
+              }
+            }
+            final obsEnglish = await toEnglish(obsOriginal);
+            final remEnglish = await toEnglish(remOriginal);
+            if (!mounted) return;
             p.pastHistory = _pastHistory.text.trim();
             // Commit any edited vitals so the update rides along with the
             // rest of the case submission.
@@ -384,6 +1018,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             s.doctorSubmit(p, disease: diagnoses.join(', '), rx: rx, tests: tests, observations: _obs.text.trim(), remarks: _remarks.text.trim());
             // Enqueue appointment.doctor_submit (v2 §4). Server decides
             // the next status based on tests vs medicines.
+            print('[JC] submit validations passed — enqueueing doctor_submit');
+            try {
             context.read<SyncService>().enqueue(kind: 'appointment.doctor_submit', payload: {
               // The server resolves the case by appointment_id and rejects the
               // push outright without it ("appointment_id is required", 422 —
@@ -395,9 +1031,22 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               if (p.backendAppointmentId != null)
                 'appointment_id': p.backendAppointmentId,
               'client_appointment_ref': p.id,
-              'observation':            _obs.text.trim(),
-              'doctor_remarks':         _remarksWithTests(),
+              'observation':            obsOriginal,
+              'doctor_remarks':         remOriginal,
+              // English twins → appointments.observation_english /
+              // doctor_remarks_english (real columns, user 2026-08-21).
+              'observation_english':    obsEnglish,
+              'doctor_remarks_english': remEnglish,
+              // Next Follow-Up (user 2026-08-21). ISO date; the server's
+              // doctor_submit stores it on the prescription row.
+              if (_nextFollowUp == true && _followUpDate != null)
+                'follow_up_date': _followUpDate!.toIso8601String().substring(0, 10),
               'past_history':           _pastHistory.text.trim(),
+              // Doctor-side symptom chips (auto-added from the dictation
+              // or hand-picked) ride to the server too — before this only
+              // the counsellor's picks showed on the record (user
+              // 2026-08-22 "details page only showing Sore throat").
+              'symptom_names': [for (final s in symptoms) s],
               // DoctorSubmitIn reads `diagnosis_text`; a bare `text` key was
               // dropped on the floor, losing the diagnosis on every case.
               'diagnoses': [
@@ -427,8 +1076,19 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 for (final e in p.vitals.entries) e.key: e.value,
               },
             });
+            } catch (e, st) {
+              print('[JC] enqueue THREW: ' + e.toString());
+              print(st.toString().split('\n').take(6).join(' | '));
+            }
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(rx.isEmpty ? 'Case completed' : 'Case submitted → Pharmacist'), backgroundColor: C2.green));
-            Navigator.pop(context);
+            print('[JC] submit done — popping case screen, canPop='
+                '${Navigator.of(context).canPop()}');
+            try {
+              Navigator.of(context).pop();
+              print('[JC] pop OK');
+            } catch (e) {
+              print('[JC] pop FAILED: ' + e.toString());
+            }
           }),
           const SizedBox(height: 8),
         ])))),
@@ -436,7 +1096,136 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     );
   }
 
-  Widget _advisory(String name, int pct, DPlan plan) {
+  /// AI Clinical Advisory from the master sheet (spec 2026-08-21):
+  /// highest-probability condition + ICD, its symptom profile, red flags
+  /// (the ones present in THIS case highlighted first), tests/treatment/Rx
+  /// only when the approved local clinical DB carries them, and the
+  /// literature reference. Percentages are AI-estimated confidence, never
+  /// a diagnosis - the doctor reviews and decides.
+  Widget _advisoryFromSheet(
+      ScoredCondition c, TermEntry e, List<String> flagHits) {
+    Widget line(IconData ic, String label, String val,
+            {Color? valueColor}) =>
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Icon(ic, size: 14, color: C2.cyanLight), const SizedBox(width: 8),
+            Expanded(child: RichText(text: TextSpan(children: [
+              TextSpan(text: '$label  ', style: ct(12, FontWeight.w700, C2.cyanLight)),
+              TextSpan(text: val,
+                  style: ct(12.5, FontWeight.w400, valueColor ?? Colors.white)),
+            ]))),
+          ]),
+        );
+    // Approved local clinical content (tests/treatment/Rx) - shown only
+    // when it exists for this condition; never invented. Multi-key +
+    // lowercase lookup matches the loader's index (user 2026-08-26:
+    // Fever's kdoctordb tests/red-flags weren't appearing because the
+    // sheet name missed the map key).
+    final plan = doctorDb[e.standardTerm] ??
+        doctorDb[e.standardTerm.toLowerCase()] ??
+        doctorDb[e.subCategory] ??
+        doctorDb[e.subCategory.toLowerCase()] ??
+        (e.icd11Code != null ? doctorDb[e.icd11Code!] : null);
+    // The terminology sheet's Symptoms/Red-Flags columns mix short
+    // names with full clinical paragraphs — only the short ones belong
+    // on this compact card (user 2026-08-26 "card change kar diya").
+    final shortSymptoms =
+        e.symptoms.where((s) => s.trim().length <= 40).take(6).toList();
+    final shortFlags =
+        e.redFlags.where((s) => s.trim().length <= 60).take(3).toList();
+    final icd = (e.icd11Code ?? '').isEmpty ? '' : ' | ICD ${e.icd11Code}';
+    final flagWord = flagHits.length == 1 ? 'RED FLAG' : 'RED FLAGS';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]), borderRadius: BorderRadius.circular(12)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
+          Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
+        ]),
+        const SizedBox(height: 10),
+        // Red flags present in THIS case - the most important line (spec).
+        if (flagHits.isNotEmpty)
+          Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+                color: C2.danger.withValues(alpha: 0.25),
+                border: Border.all(color: C2.danger),
+                borderRadius: BorderRadius.circular(8)),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.white),
+              const SizedBox(width: 6),
+              Expanded(child: Text(
+                  '$flagWord PRESENT: ${flagHits.join('; ')}',
+                  style: ct(11.5, FontWeight.w700, Colors.white))),
+            ]),
+          ),
+        line(Icons.coronavirus_outlined, 'Likely:',
+            '${e.standardTerm} (${c.pct}%)$icd'),
+        if (shortSymptoms.isNotEmpty)
+          line(Icons.sick_outlined, 'Symptoms:', shortSymptoms.join('; ')),
+        if (plan != null) ...[
+          if (plan.tests.isNotEmpty)
+            line(Icons.science_outlined, 'Tests:',
+                plan.tests.where((t) => t.trim().length <= 60).join(', ')),
+          if (plan.firstLine.trim().isNotEmpty)
+            line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
+          if (plan.rx.isNotEmpty)
+            line(Icons.medication_outlined, 'Rx:',
+                plan.rx.map((r) => '${r.name} (${r.interval} x ${r.days})').join(', ')),
+          if (plan.redFlags.isNotEmpty)
+            line(Icons.warning_amber_rounded, 'Red Flags:',
+                plan.redFlags.where((f) => f.trim().length <= 60)
+                    .take(3).join('; ')),
+        ],
+        if (plan == null && flagHits.isEmpty && shortFlags.isNotEmpty)
+          line(Icons.warning_amber_rounded, 'Red Flags:',
+              shortFlags.join('; ')),
+        if (e.reference.isNotEmpty)
+          line(Icons.menu_book_outlined, 'Ref:', e.reference),
+        const SizedBox(height: 6),
+        Row(children: [
+          _aiBtn(_appliedAdvSig == null ? 'Apply' : 'Re-apply',
+              C2.green, () {
+            final label = (e.icd11Code ?? '').isEmpty
+                ? e.standardTerm
+                : '${e.standardTerm} | ${e.icd11Code}';
+            setState(() {
+              if (!diagnoses.contains(label)) diagnoses.add(label);
+              if (plan != null) {
+                for (final t in plan.tests) {
+                  if (!tests.contains(t)) tests.add(t);
+                }
+                for (final r in plan.rx) {
+                  if (!rx.any((x) => x.name == r.name)) {
+                    rx.add(RxItem(name: r.name,
+                        days: r.days, interval: r.interval, qty: r.qty));
+                  }
+                }
+              }
+              // Track applied signature so the button switches to
+              // Re-apply and Dismiss hides after the first tap
+              // (user 2026-08-27).
+              _appliedAdvSig = _advSig;
+            });
+          }, disabled: _appliedAdvSig != null && _appliedAdvSig == _advSig),
+          // Dismiss hides after the first Apply — once the plan is on
+          // record, dismissing the card no longer makes sense
+          // (user 2026-08-27).
+          if (_appliedAdvSig == null) ...[
+            const SizedBox(width: 6),
+            _aiBtn('Dismiss', Colors.white.withValues(alpha: 0.15),
+                () => setState(() => _advisoryDismissed = true)),
+          ],
+        ]),
+      ]),
+    );
+  }
+
+  Widget _advisory(String name, int pct, DPlan plan, {String? icd}) {
     Widget line(IconData ic, String label, String val) => Padding(
           padding: const EdgeInsets.only(bottom: 8),
           child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -455,32 +1244,45 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
-          Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)), const SizedBox(width: 6),
-          Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1), decoration: BoxDecoration(color: C2.cyan, borderRadius: BorderRadius.circular(4)), child: Text('LOCAL', style: ct(8.5, FontWeight.w700, Colors.white))),
+          Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
         ]),
         const SizedBox(height: 10),
-        line(Icons.coronavirus_outlined, 'Likely:', '$name ($pct%)'),
+        // "Typhoid fever - 1A09 (46%)" (user 2026-08-22).
+        line(Icons.coronavirus_outlined, 'Likely:',
+            '$name${(icd ?? '').isNotEmpty ? ' - $icd' : ''} ($pct%)'),
         line(Icons.science_outlined, 'Tests:', plan.tests.join(', ')),
         line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
         line(Icons.medication_outlined, 'Rx:', rxStr),
         line(Icons.warning_amber_rounded, 'Red Flags:', plan.redFlags.join(', ')),
-        Container(margin: const EdgeInsets.symmetric(vertical: 6), padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(8)),
-          child: Text('From local clinical database — doctor must review.', style: ct(10.5, FontWeight.w400, Colors.white70))),
+        // Disclaimer strip removed (user 2026-08-22).
+        const SizedBox(height: 6),
         Row(children: [
-          _aiBtn('Apply', C2.green, () => _applyAdvisory(name, plan)),
-          const SizedBox(width: 6),
-          _aiBtn('Dismiss', Colors.white.withValues(alpha: 0.15), () => setState(() => _advisoryDismissed = true)),
+          _aiBtn(_appliedAdvSig == null ? 'Apply' : 'Re-apply',
+              C2.green, () => _applyAdvisory(name, plan),
+              disabled: _appliedAdvSig != null && _appliedAdvSig == _advSig),
+          // Dismiss hides after the first Apply (user 2026-08-27).
+          if (_appliedAdvSig == null) ...[
+            const SizedBox(width: 6),
+            _aiBtn('Dismiss', Colors.white.withValues(alpha: 0.15),
+                () => setState(() => _advisoryDismissed = true)),
+          ],
         ]),
       ]),
     );
   }
 
-  Widget _aiBtn(String t, Color bg, VoidCallback onTap) => InkWell(onTap: onTap, child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(6)),
-        child: Text(t, style: ct(12, FontWeight.w600, Colors.white)),
-      ));
+  Widget _aiBtn(String t, Color bg, VoidCallback onTap, {bool disabled = false}) => InkWell(
+        onTap: disabled ? null : onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+              color: disabled ? bg.withValues(alpha: 0.35) : bg,
+              borderRadius: BorderRadius.circular(6)),
+          child: Text(t,
+              style: ct(12, FontWeight.w600,
+                  disabled ? Colors.white.withValues(alpha: 0.55) : Colors.white)),
+        ),
+      );
 
   Widget _diagnosisField() {
     final loaded = DiseaseMaster.isLoaded;
@@ -492,6 +1294,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           deleteIcon: const Icon(Icons.close, size: 13), deleteIconColor: C2.text2, onDeleted: () => setState(() => diagnoses.remove(d)),
         )).toList())),
       COutlineButton(loaded ? 'Add Diagnosis' : 'Loading disease list…', icon: Icons.add, onTap: !loaded ? null : () async {
+        print('[JC] Add Diagnosis TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
         // Park focus on the page-level sink so the modal route's focus
         // restoration can't bring focus back to the Symptoms TextField
         // (which would call Scrollable.ensureVisible and jump the page).
@@ -516,6 +1319,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           deleteIcon: const Icon(Icons.close, size: 13), deleteIconColor: C2.text2, onDeleted: () => setState(() => tests.remove(t)),
         )).toList())),
       COutlineButton('Add Test', icon: Icons.add, onTap: () async {
+        print('[JC] Add Test TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
         _parkFocus();
         final picked = await _pick(context, 'Add Test', kLabTests.where((t) => !tests.contains(t)).toList());
         if (!mounted) return;
@@ -535,11 +1339,24 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           Expanded(child: Text(m.name, style: ct(13, FontWeight.w600, C2.text))),
           InkWell(onTap: () => setState(() => rx.remove(m)), child: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
+        // Pharmacy on-hand for this unit (user 2026-08-21). Only rendered
+        // once /medicines/stock has answered — unknown medicines show 0.
+        if (_stockLoaded)
+          Padding(padding: const EdgeInsets.only(top: 2), child: Builder(builder: (_) {
+            final qty = _stock[_stockKey(m.name)] ?? 0;
+            return Text('Stock: $qty',
+                style: ct(10.5, FontWeight.w600, qty > 0 ? C2.green : C2.danger));
+          })),
         const SizedBox(height: 8),
         Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text('DOSAGE', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
-          SizedBox(height: 38, child: TextFormField(initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
-            decoration: cInput('e.g. 500 mg'), onChanged: (v) => m.dosage = v)),
+          TextFormField(initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
+            decoration: cInput('e.g. 500 mg').copyWith(
+              errorText: (_showRxErrors && m.dosage.trim().isEmpty) ? 'Required' : null,
+              errorStyle: const TextStyle(fontSize: 11),
+              isDense: true,
+            ),
+            onChanged: (v) => setState(() => m.dosage = v)),
         ]),
         const SizedBox(height: 8),
         Row(children: [
@@ -567,41 +1384,62 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           onChanged: (v) => onCh(v ?? val))),
       ]);
 
-  /// Open-ended Duration input. Accepts 1-2 digit days (1-99) OR a 3-letter
-  /// code like SOS / PRN. Input formatters cap length at 3 and strip
-  /// invalid characters as the doctor types.
+  /// Duration input — days only, 1-99 (user rule 2026-08-16: no
+  /// letter codes, plain number). Label spells out the unit so the
+  /// doctor never has to type "Days" as part of the value.
   Widget _miniDuration(RxItem m) {
-    final isInvalid = m.days.isNotEmpty &&
-        !RegExp(r'^(\d{1,2}|[A-Za-z]{3})$').hasMatch(m.days);
+    final err = _showRxErrors ? _durationError(m.days) : null;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Text('DURATION', style: ct(10, FontWeight.w600, C2.text2)),
+      Text('DURATION (DAYS)', style: ct(10, FontWeight.w600, C2.text2)),
       const SizedBox(height: 3),
-      SizedBox(
-        height: 38,
-        child: TextFormField(
-          initialValue: m.days,
-          style: ct(12.5, FontWeight.w500, C2.text),
-          decoration: cInput('5 or SOS').copyWith(
-            errorText: isInvalid ? 'Bad value' : null,
-            errorStyle: const TextStyle(fontSize: 0, height: 0),
-          ),
-          inputFormatters: [
-            LengthLimitingTextInputFormatter(3),
-            FilteringTextInputFormatter.allow(RegExp(r'[0-9A-Za-z]')),
-          ],
-          textCapitalization: TextCapitalization.characters,
-          onChanged: (v) => setState(() {
-            m.days = v.toUpperCase();
-            _recalcQty(m);
-          }),
+      TextFormField(
+        initialValue: m.days,
+        style: ct(12.5, FontWeight.w500, C2.text),
+        keyboardType: TextInputType.number,
+        decoration: cInput('e.g. 5').copyWith(
+          errorText: err,
+          errorStyle: const TextStyle(fontSize: 11),
+          isDense: true,
         ),
+        inputFormatters: [
+          LengthLimitingTextInputFormatter(2),
+          FilteringTextInputFormatter.digitsOnly,
+        ],
+        onChanged: (v) => setState(() {
+          m.days = v;
+          _recalcQty(m);
+        }),
       ),
     ]);
   }
 
+  /// Returns null if the value is a valid duration, else the error to
+  /// block Submit on. Empty is invalid (a med with no duration can't be
+  /// dispensed). Digits only, 1-99.
+  String? _durationError(String v) {
+    final s = v.trim();
+    if (s.isEmpty) return 'Required';
+    if (!RegExp(r'^\d{1,2}$').hasMatch(s)) return 'Digits only';
+    final n = int.parse(s);
+    if (n < 1) return 'Min 1 day';
+    if (n > 99) return 'Max 99';
+    return null;
+  }
+
   Future<void> _addMed() async {
+    print('[JC] Add Medicine TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
+    final _tMed0 = DateTime.now().microsecondsSinceEpoch;
     _parkFocus();
-    final picked = await _pick(context, 'Add Medicine', kMedicineNames.where((m) => !rx.any((x) => x.name == m)).toList());
+    // Server medicine master first — a hardcoded name the master lacks is
+    // silently dropped by the server's prescription mirror (same root as
+    // the requisition "No line matched" bug, 2026-08-21).
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final _opts = medOptions.where((m) => !rx.any((x) => x.name == m)).toList();
+    print('[JC] Add Medicine prep took '
+        '${DateTime.now().microsecondsSinceEpoch - _tMed0} µs '
+        '(options=${_opts.length})');
+    final picked = await _pick(context, 'Add Medicine', _opts);
     if (!mounted) return;
     _parkFocus();
     if (picked != null) setState(() => rx.add(RxItem(name: picked)));
@@ -649,72 +1487,81 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // Prescription & Reports section renders two chip buttons; tapping each
   // opens a modal dialog with a table of historical rows.
 
-  /// Total count for the Px chip badge: past-history + last-diagnosis +
-  /// attached reports/prescriptions. Zero when the patient has no history
-  /// at all, so the empty-state helper text can render.
+  /// Total count for the Dx chip badge: past-history + attached
+  /// reports/prescriptions. The CURRENT visit's provisional diagnosis
+  /// (p.disease) is deliberately NOT counted — it isn't history, and it
+  /// made the dialog show "past" data the counsellor never entered
+  /// (user bug report 2026-08-14). A genuine previous diagnosis reaches
+  /// here via the re-appointment carry-forward tag inside pastHistory.
   int _pxCount() {
     var c = 0;
     if (p.pastHistory.trim().isNotEmpty) c++;
-    if (p.disease.trim().isNotEmpty) c++;
     c += p.attachments.length;
     return c;
   }
 
   Widget _historyChip({
     required String label,
-    required String subtitle,
     required IconData icon,
     required int count,
     required VoidCallback onTap,
   }) {
+    // Outline style (user 2026-08-18): white face, navy border, black
+    // label. Icon sits in a soft tinted square and the count is a solid
+    // navy pill so the tap target reads as a proper control, not a bare
+    // box.
     return InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(12),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
         decoration: BoxDecoration(
-          gradient: const LinearGradient(colors: [C2.navy, C2.cyan]),
-          borderRadius: BorderRadius.circular(10),
+          color: C2.white,
+          border: Border.all(color: C2.navy, width: 1.2),
+          borderRadius: BorderRadius.circular(12),
         ),
         child: Row(children: [
-          Icon(icon, size: 20, color: Colors.white),
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: C2.cyanLight,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 17, color: C2.navy),
+          ),
           const SizedBox(width: 8),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-            Row(children: [
-              Text(label, style: ct(15, FontWeight.w800, Colors.white)),
-              const SizedBox(width: 6),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.22), borderRadius: BorderRadius.circular(4)),
-                child: Text('$count', style: ct(10.5, FontWeight.w700, Colors.white)),
+          Expanded(child: Row(children: [
+            Text(label, style: ct(15, FontWeight.w800, Colors.black)),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+              decoration: BoxDecoration(
+                color: C2.navy,
+                borderRadius: BorderRadius.circular(10),
               ),
-            ]),
-            Text(subtitle, style: ct(10.5, FontWeight.w500, Colors.white70)),
+              child: Text('$count', style: ct(10.5, FontWeight.w700, Colors.white)),
+            ),
           ])),
-          const Icon(Icons.chevron_right, size: 18, color: Colors.white),
+          const Icon(Icons.chevron_right, size: 18, color: C2.navy),
         ]),
       ),
     );
   }
 
   void _openPxHistory() {
-    // Rows for Px = past consultations table. Sourced from:
-    //  - Past Medical History text (one row, no date)
-    //  - The most recent diagnosis on file (p.disease), tagged with regDate
+    // Rows for Dx = past consultations table. Sourced from:
+    //  - Past Medical History text (one row, no date) — includes the
+    //    re-appointment carry-forward "Previous Diagnosis (date): X" tag
     //  - Each counsellor-uploaded attachment (Report / Other) with its
     //    kind + description. Attachment rows are tappable → the previously
     //    captured image opens in an interactive viewer.
-    // Ordering: history first (context), diagnosis, then attachments.
+    // The current visit's provisional diagnosis is NOT listed here — the
+    // doctor already sees it in Symptoms & Diagnosis, and presenting it
+    // as a past consultation fabricated history (user bug 2026-08-14).
     final rows = <_HistoryRow>[];
     if (p.pastHistory.trim().isNotEmpty) {
       rows.add(_HistoryRow(cells: ['—', 'Past History', p.pastHistory.trim()]));
-    }
-    if (p.disease.trim().isNotEmpty) {
-      rows.add(_HistoryRow(cells: [
-        p.regDate.isEmpty ? '—' : p.regDate,
-        'Previous Diagnosis',
-        p.disease.trim(),
-      ]));
     }
     for (final a in p.attachments) {
       rows.add(_HistoryRow(
@@ -727,7 +1574,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       ));
     }
     _openHistoryDialog(
-      title: 'Px — Past Consultations',
+      title: 'Dx',
       icon: Icons.history_edu_outlined,
       headers: const ['Date', 'Type', 'Details'],
       rows: rows,
@@ -745,7 +1592,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       r.duration.isEmpty ? '—' : r.duration,
     ])).toList();
     _openHistoryDialog(
-      title: 'Rx — Past Prescriptions',
+      title: 'Rx',
       icon: Icons.medication_outlined,
       headers: const ['Date', 'Medicine', 'Dosage', 'Frequency', 'Duration'],
       rows: rows,
@@ -823,22 +1670,48 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         ),
       );
 
+  /// Clinical plausibility ranges (user 2026-08-22) — same limits as the
+  /// counsellor register form. Blank stays allowed.
+  static const Map<String, (double, double, String)> _kVitalRanges = {
+    'Systolic BP':       (60, 280, 'Allowed 60–280'),
+    'Diastolic BP':      (40, 150, 'Allowed 40–150'),
+    'Blood Sugar':       (20, 600, 'Allowed 20–600'),
+    'Body Temp (°F)':    (86, 113, 'Allowed 86–113 °F'),
+    'Oxygen Saturation': (50, 100, 'Allowed 50–100%'),
+    'Heart Rate':        (30, 220, 'Allowed 30–220'),
+    'Hemoglobin':        (3, 25, 'Allowed 3–25'),
+  };
+
+  String? _vitalRangeErr(String key) {
+    final t = _vitals[key]?.text.trim() ?? '';
+    if (t.isEmpty) return null;
+    final r = _kVitalRanges[key];
+    if (r == null) return null;
+    final v = double.tryParse(t);
+    if (v == null || v < r.$1 || v > r.$2) return r.$3;
+    return null;
+  }
+
   Widget _vitalField(({String key, String label, String hint}) v) {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(v.label.toUpperCase(), style: ct(9.5, FontWeight.w700, C2.text2)),
       const SizedBox(height: 3),
-      SizedBox(height: 36, child: TextField(
+      TextField(
         controller: _vitals[v.key],
         keyboardType: const TextInputType.numberWithOptions(decimal: true),
         inputFormatters: [
           FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
           LengthLimitingTextInputFormatter(6),
         ],
+        onChanged: (_) => setState(() {}),
         style: ct(12.5, FontWeight.w600, C2.text),
         decoration: cInput(v.hint).copyWith(
           contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          isDense: true,
+          errorText: _vitalRangeErr(v.key),
+          errorStyle: const TextStyle(fontSize: 10),
         ),
-      )),
+      ),
     ]);
   }
 }
@@ -855,26 +1728,48 @@ class _PickerSheetState extends State<_PickerSheet> {
   String q = '';
   @override
   Widget build(BuildContext context) {
+    final _tB = DateTime.now().microsecondsSinceEpoch;
     final query = q.trim();
-    final m = widget.options.where((o) => query.isEmpty || o.toLowerCase().contains(query.toLowerCase())).toList();
-    final exact = m.any((o) => o.toLowerCase() == query.toLowerCase());
+    // Lowercase the query ONCE per keystroke, not once per option
+    // (user 2026-08-26: picker lag was O(N × keystroke) since every
+    // option ran query.toLowerCase() again inside the filter callback).
+    final ql = query.toLowerCase();
+    final m = query.isEmpty
+        ? widget.options
+        : widget.options.where((o) => o.toLowerCase().contains(ql)).toList();
+    print('[JC] _PickerSheet build q="$query" matches=${m.length} '
+        'took ${DateTime.now().microsecondsSinceEpoch - _tB} µs');
     return Padding(
       padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text(widget.title, style: ct(15, FontWeight.w700, C2.navy)),
         const SizedBox(height: 10),
-        TextField(autofocus: true, decoration: cInput('Search or type to add…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
+        TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
         const SizedBox(height: 8),
-        // Free-text: add an item that isn't in the master list.
-        if (query.isNotEmpty && !exact)
-          ListTile(dense: true, contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.add_circle_outline, size: 18, color: C2.green),
-            title: Text('Add "$query"', style: ct(13.5, FontWeight.w600, C2.green)),
-            onTap: () => Navigator.pop(context, query)),
-        ConstrainedBox(constraints: const BoxConstraints(maxHeight: 320), child: m.isEmpty
-          ? Padding(padding: const EdgeInsets.all(16), child: Text(query.isEmpty ? 'Type to search' : 'No master match — use "Add" above', style: ct(13, FontWeight.w400, C2.text2)))
-          : ListView(shrinkWrap: true, children: m.map((o) => ListTile(dense: true, title: Text(o, style: ct(13.5, FontWeight.w500, C2.text)),
-              trailing: const Icon(Icons.add, size: 18, color: C2.cyan), onTap: () => Navigator.pop(context, o))).toList())),
+        // Picker-only (user 2026-08-26): free-text add was letting the
+        // doctor save items that don't exist in the master, which the
+        // backend silently drops. If it's not in the list, it can't be
+        // added — the master must be updated first.
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 320),
+          child: m.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                      style: ct(13, FontWeight.w400, C2.text2)))
+              // Lazy — 787-symptom sheet was building every row up front
+              // and made the picker feel frozen (user 2026-08-25).
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: m.length,
+                  itemExtent: 44,
+                  itemBuilder: (_, i) => ListTile(
+                    dense: true,
+                    title: Text(m[i], style: ct(13.5, FontWeight.w500, C2.text)),
+                    trailing: const Icon(Icons.add, size: 18, color: C2.cyan),
+                    onTap: () => Navigator.pop(context, m[i]),
+                  ),
+                )),
       ]),
     );
   }
@@ -892,21 +1787,11 @@ class _DiseasePickerSheetState extends State<_DiseasePickerSheet> {
   String q = '';
   @override
   Widget build(BuildContext context) {
+    final _tB = DateTime.now().microsecondsSinceEpoch;
     final matches = DiseaseMaster.search(q);
     final query = q.trim();
-    final exact = matches.any((d) => d.term.toLowerCase() == query.toLowerCase());
-    final rows = matches.map((d) => InkWell(
-          onTap: () => Navigator.pop(context, d.display),
-          child: Padding(padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
-            child: Row(children: [
-              Expanded(child: Text(d.term, style: ct(13.5, FontWeight.w600, C2.text))),
-              const SizedBox(width: 8),
-              Container(padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                decoration: BoxDecoration(color: C2.navyLight, borderRadius: BorderRadius.circular(5)),
-                child: Text(d.icd.isEmpty ? '—' : d.icd, style: ct(10.5, FontWeight.w700, C2.navy))),
-            ]),
-          ),
-        )).toList();
+    print('[JC] _DiseasePickerSheet build q="$query" matches=${matches.length} '
+        'took ${DateTime.now().microsecondsSinceEpoch - _tB} µs');
     return Padding(
       padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -916,21 +1801,43 @@ class _DiseasePickerSheetState extends State<_DiseasePickerSheet> {
           Text('${matches.length} of ${DiseaseMaster.all.length}', style: ct(11, FontWeight.w500, C2.text2)),
         ]),
         const SizedBox(height: 10),
-        TextField(autofocus: true, decoration: cInput('Search or type a diagnosis…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
+        TextField(autofocus: true, decoration: cInput('Search a diagnosis…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
         const SizedBox(height: 4),
-        // Free-text: add a diagnosis not in the ICD-11 master.
-        if (query.isNotEmpty && !exact)
-          InkWell(
-            onTap: () => Navigator.pop(context, query),
-            child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
-              child: Row(children: [
-                const Icon(Icons.add_circle_outline, size: 16, color: C2.green), const SizedBox(width: 8),
-                Expanded(child: Text('Add "$query"', style: ct(13, FontWeight.w600, C2.green))),
-              ]))),
-        ConstrainedBox(constraints: const BoxConstraints(maxHeight: 360),
-          child: rows.isEmpty
-            ? Padding(padding: const EdgeInsets.all(16), child: Text(query.isEmpty ? 'Type to search' : 'No master match — use "Add" above', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(shrinkWrap: true, children: rows)),
+        // Picker-only (user 2026-08-26): free-text add was letting a
+        // diagnosis that isn't in the ICD-11 master slip through, and
+        // the backend silently drops non-master names on save.
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: matches.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                      style: ct(13, FontWeight.w400, C2.text2)))
+              // Lazy row builds — used to render all 158 diseases up front
+              // on every keystroke; picker felt frozen (user 2026-08-25).
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: matches.length,
+                  itemExtent: 48,
+                  itemBuilder: (_, i) {
+                    final d = matches[i];
+                    return InkWell(
+                      onTap: () => Navigator.pop(context, d.display),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
+                        child: Row(children: [
+                          Expanded(child: Text(d.term, style: ct(13.5, FontWeight.w600, C2.text))),
+                          const SizedBox(width: 8),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                            decoration: BoxDecoration(color: C2.navyLight, borderRadius: BorderRadius.circular(5)),
+                            child: Text(d.icd.isEmpty ? '—' : d.icd, style: ct(10.5, FontWeight.w700, C2.navy)),
+                          ),
+                        ]),
+                      ),
+                    );
+                  },
+                )),
       ]),
     );
   }

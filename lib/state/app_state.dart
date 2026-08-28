@@ -36,16 +36,9 @@ class AppState extends ChangeNotifier {
   String? backendDistrictName;
   String? backendBlockName;
 
-  /// Login — validates the role's fixed username/password (CR29). The optional
-  /// [mmuId] is required for the counsellor role (which vehicle they're on).
-  bool login(Role role, String username, String password, {String? mmuId}) {
-    if (username.trim() != role.credUser || password != role.credPass) return false;
-    currentRole = role;
-    currentUser = role.fullName;
-    currentMmuId = mmuId;
-    notifyListeners();
-    return true;
-  }
+  // The old fixed-credential login(role, user, pass) is gone — sign-in
+  // happens exclusively through /api/auth/login (user rule 2026-08-14:
+  // real API, real users; no demo credentials compiled into the app).
 
   void logout() {
     currentRole = null;
@@ -90,7 +83,10 @@ class AppState extends ChangeNotifier {
     String? backendBlockName,
   }) {
     currentRole = role;
-    currentUser = role.fullName;
+    // The typed username is the only real identity we have until the
+    // cached backend user block (applyBackendUser) overwrites it with
+    // full_name — never a hardcoded person name.
+    currentUser = username.trim().isNotEmpty ? username : role.label;
     currentMmuId = mmuId;
     this.backendUserId = backendUserId;
     this.backendOrgId = backendOrgId;
@@ -144,7 +140,7 @@ class AppState extends ChangeNotifier {
 
     if (mappedRole != null) {
       currentRole = mappedRole;
-      currentUser = (u['full_name'] as String?) ?? mappedRole.fullName;
+      currentUser = (u['full_name'] as String?) ?? mappedRole.label;
     }
     currentMmuId          = mmuId ?? (u['facility_code'] as String?) ?? currentMmuId;
     backendUserId         = (u['id'] as num?)?.toInt() ?? (u['user_id'] as num?)?.toInt();
@@ -170,16 +166,17 @@ class AppState extends ChangeNotifier {
     }
     return null;
   }
-  /// Counsellor's assigned state (from web-admin profile). Falls back to
-  /// empty when not logged in. User rule 2026-07-29 — the Register form
-  /// no longer asks for State + District; it reads them from here.
-  String get currentMmuState    => currentMmu?.state    ?? '';
-  String get currentMmuDistrict => currentMmu?.district ?? '';
+  /// Counsellor's assigned state/district (Register form shows them as
+  /// read-only badges; sync payloads carry them as the geography resolve
+  /// chain). Backend bootstrap facility names are the source of truth —
+  /// the legacy kMmuOptions lookup only serves sessions from before the
+  /// backend login existed (its ids never match a facility code, which
+  /// is what currentMmuId holds now; that mismatch left the form
+  /// showing "— · —" — user bug report 2026-08-14).
+  String get currentMmuState    => backendStateName    ?? currentMmu?.state    ?? '';
+  String get currentMmuDistrict => backendDistrictName ?? currentMmu?.district ?? '';
 
-  // ----- Mock data (placeholder until further instructions) -----
-  final List<Patient> patients = const [
-    Patient(id: '1365201', name: 'Vandana Sharma', gender: 'Female', age: 28, village: 'Naipura', symptoms: 'Cold & cough, mild fever'),
-    Patient(id: '1365202', name: 'Narayan Singh', gender: 'Male', age: 50, village: 'Gajraula', symptoms: 'Body pain, fatigue'),
-    Patient(id: '1365203', name: 'Payal Devi', gender: 'Female', age: 11, village: 'Dhanaura', symptoms: 'Cough, sore throat'),
-  ];
+  // No seed/mock data — every list in the app hydrates from the API
+  // (user rule: blank static arrays).
+  final List<Patient> patients = const [];
 }

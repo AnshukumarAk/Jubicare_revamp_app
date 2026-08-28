@@ -1,4 +1,8 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'api/api_client.dart';
 import 'api/appointments_api.dart';
@@ -17,6 +21,12 @@ import 'api/sync_service.dart';
 import 'api/token_store.dart';
 import 'api/uploads_api.dart';
 import 'models/models.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+
+import 'services/fcm_service.dart';
+import 'services/terminology_store.dart';
+import 'services/notifications_service.dart';
+import 'services/notifications_store.dart';
 import 'state/app_state.dart';
 import 'state/auth_persistence.dart';
 import 'theme/app_theme.dart';
@@ -25,23 +35,30 @@ import 'counsellor/shell.dart';
 import 'doctor/dshell.dart';
 import 'pharmacist/pshell.dart';
 import 'screens/splash.dart';
-import 'screens/role_login.dart';
-import 'screens/role_home.dart';
 import 'services/connectivity_service.dart';
 import 'services/firebase_service.dart';
 import 'services/location_service.dart';
 
-/// Optional deep-link target for capturing screens, e.g.
-///   flutter run --dart-define=DEMO=doctor_login
-const _demo = String.fromEnvironment('DEMO', defaultValue: '');
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // One-time cleanup: the removed on-device ASR experiments (Whisper /
+  // sherpa-Dolphin, 2026-08-18) left ~340 MB of model files in app
+  // storage on test phones. Fire-and-forget delete; no-op once gone.
+  unawaited(_cleanupRemovedAsrModels());
+  // Check-out reminder channel + Android 13 notification consent
+  // (ATTEND task D2). Fire-and-forget — reminders are a courtesy.
+  unawaited(NotificationsService.instance.init());
   // Initialise Firebase once at startup. Non-blocking failure — if
   // google-services.json is missing the LocationService just buffers locally
   // and the app runs otherwise normally.
   final firebase = FirebaseService();
   await firebase.ensureInitialized();
+  // FCM background/killed-state hook (ATTEND task D1) — must be a
+  // top-level function registered before runApp. Notification messages
+  // themselves are displayed by the OS; this keeps data messages alive.
+  try {
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+  } catch (_) {/* Firebase not initialised — push simply stays off */}
 
   // Load the stored login flag (rule 2026-08-05) so the shell can render
   // before we round-trip /auth/me on the network.
@@ -75,12 +92,33 @@ void main() async {
   final mastersStore = MastersStore(bootstrapApi);
   await mastersStore.hydrate();
 
-  final syncService = SyncService(syncApi);
+  // Master medical terminology (disease list sheet) — cached copy loads
+  // instantly for offline matching; a fresh copy downloads in the
+  // background whenever a session exists.
+  final terminologyStore = TerminologyStore(apiClient);
+  await terminologyStore.loadCache();
+  if (session != null) unawaited(terminologyStore.refresh());
+
+  // Pass UploadsApi so drain() can lift local /data/user/…/wm_*.jpg
+  // paths that offline registrations left in the queue (bug 2026-08-20).
+  final syncService = SyncService(syncApi, uploads: uploadsApi);
   await syncService.hydrate();
   // If the app opens online with pending offline actions, drain right
   // away — this is safest even when the user hasn't signed in yet
   // (SyncService will no-op on 401 SIGNED_OUT_REMOTELY).
   if (session != null) syncService.drain();
+  // D1: an already-logged-in user re-registers their FCM token at every
+  // app start (covers token rotation + fresh installs restoring session).
+  if (session != null) unawaited(FcmService.instance.register(apiClient));
+  // Per-user notification history (user 2026-08-19) — key the store to
+  // whoever this stored session belongs to.
+  if (session != null) {
+    final u = session.backendUser;
+    // Persist to prefs too so the background FCM handler (killed-app
+    // state) can still find whose bell history to append to (2026-08-20).
+    await NotificationsStore.setCurrentUser(
+        '${(u?['id'] ?? u?['user_id']) ?? session.username}');
+  }
 
   runApp(JubiCareApp(
     firebase:         firebase,
@@ -99,8 +137,27 @@ void main() async {
     staffApi:         staffApi,
     uploadsApi:       uploadsApi,
     mastersStore:     mastersStore,
+    terminologyStore: terminologyStore,
     syncService:      syncService,
   ));
+}
+
+/// Delete the model directories left behind by the removed on-device ASR
+/// experiments (`<appSupport>/asr/**`: dolphin base+small ≈ 340 MB, and
+/// whisper's ggml-base.bin ≈ 74 MB in `<appSupport>` root). Best-effort:
+/// storage cleanup must never affect startup.
+Future<void> _cleanupRemovedAsrModels() async {
+  try {
+    final support = await getApplicationSupportDirectory();
+    final asrDir = Directory('${support.path}/asr');
+    if (await asrDir.exists()) {
+      await asrDir.delete(recursive: true);
+    }
+    final whisper = File('${support.path}/ggml-base.bin');
+    if (await whisper.exists()) {
+      await whisper.delete();
+    }
+  } catch (_) {/* ignore */}
 }
 
 class JubiCareApp extends StatelessWidget {
@@ -120,6 +177,7 @@ class JubiCareApp extends StatelessWidget {
   final StaffApi staffApi;
   final UploadsApi uploadsApi;
   final MastersStore mastersStore;
+  final TerminologyStore terminologyStore;
   final SyncService syncService;
 
   const JubiCareApp({
@@ -139,6 +197,7 @@ class JubiCareApp extends StatelessWidget {
     required this.staffApi,
     required this.uploadsApi,
     required this.mastersStore,
+    required this.terminologyStore,
     required this.syncService,
     this.session,
   });
@@ -166,10 +225,22 @@ class JubiCareApp extends StatelessWidget {
       await mastersStore.refresh();
       final freshFacility = mastersStore.facility;
       if (freshFacility != null) app.applyBootstrapFacility(freshFacility);
+      // Clinical terminology too — at boot the network refresh only runs
+      // when a session already exists, so a FRESH INSTALL's first login
+      // reached the doctor screen with an empty sheet: legacy likely-list,
+      // advisory falling back to the local scorer with no ICD (user
+      // 2026-08-22 "still showing Malaria (22%) … icd code not coming").
+      unawaited(terminologyStore.refresh());
       syncService.drain();
     });
 
-    final name = s.role.fullName;
+    // Display name priority: cached backend full_name (saved at login) →
+    // the username they typed → role label. No hardcoded person names
+    // anywhere (user rule 2026-08-14: real API users only).
+    final backendName = (s.backendUser?['full_name'] as String?)?.trim();
+    final name = (backendName?.isNotEmpty ?? false)
+        ? backendName!
+        : (s.username.trim().isNotEmpty ? s.username : s.role.label);
     return switch (s.role) {
       Role.counselor  => CounsellorShell(userName: name),
       Role.doctor     => DoctorShell(userName: name),
@@ -203,6 +274,7 @@ class JubiCareApp extends StatelessWidget {
         Provider<StaffApi>.value(value: staffApi),
         Provider<UploadsApi>.value(value: uploadsApi),
         ChangeNotifierProvider<MastersStore>.value(value: mastersStore),
+        ChangeNotifierProvider<TerminologyStore>.value(value: terminologyStore),
         ChangeNotifierProvider<SyncService>.value(value: syncService),
         // Existing services.
         ChangeNotifierProvider(create: (_) => ConnectivityService()),
@@ -214,12 +286,6 @@ class JubiCareApp extends StatelessWidget {
         debugShowCheckedModeBanner: false,
         theme: buildJubiCareTheme(),
         home: Builder(builder: (context) {
-          // Demo-mode deep-links take priority so screenshots stay reachable.
-          switch (_demo) {
-            case 'doctor_login':    return const RoleLoginScreen(role: Role.doctor);
-            case 'counselor_home':  return const RoleHome(role: Role.counselor);
-            case 'pharmacist_home': return const RoleHome(role: Role.pharmacist);
-          }
           if (session != null) return _homeForSession(context);
           return const SplashScreen();
         }),

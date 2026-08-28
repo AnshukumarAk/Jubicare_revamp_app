@@ -1,22 +1,45 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'dart:async';
+import 'dart:io';
+
+import '../api/api_client.dart';
 import '../api/api_errors.dart';
+import '../config/app_config.dart';
 import '../api/appointments_api.dart';
+import '../api/attendance_api.dart';
+import '../api/camps_api.dart';
+import '../api/masters_store.dart';
 import '../api/queues_api.dart';
+import '../api/requisitions_api.dart';
 import '../api/sync_service.dart';
+import '../api/uploads_api.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
-import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList;
+import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList, kUploadsBase;
 import '../doctor/dshell.dart' show DocHeader, DocBottomNav;
 import '../doctor/ddata.dart' show kMedicineNames;
-import '../doctor/voice.dart';
+import '../services/connectivity_service.dart';
+import '../services/deepgram_stt.dart';
+import '../services/attendance_store.dart';
+import '../services/patients_cache_store.dart';
+import '../services/terminology_store.dart';
+import '../services/back_form_registry.dart';
+import '../services/requisitions_store.dart';
+import '../services/fcm_service.dart';
+import '../services/notifications_service.dart';
+import '../state/app_state.dart';
 import '../widgets/attendance_capture.dart';
+import '../widgets/pending_alert.dart';
+import '../widgets/photo_lightbox.dart';
 
 class PharmacistShell extends StatefulWidget {
   final String userName;
@@ -27,33 +50,95 @@ class PharmacistShell extends StatefulWidget {
 
 class _PharmacistShellState extends State<PharmacistShell> {
   int _tab = 0;
+  // Hooked into the app-bar refresh button so a stalled network can be
+  // recovered without a full app restart (user rule 2026-08-16).
+  final GlobalKey<_PharmaDashboardState> _dashKey = GlobalKey<_PharmaDashboardState>();
+  final GlobalKey<_PharmaStockState> _stockKey = GlobalKey<_PharmaStockState>();
+  // Visited-tab history — Android back walks it backwards instead of
+  // closing the app (user bug 2026-08-16).
+  final List<int> _tabHistory = [0];
   static const _nav = [
     (Icons.grid_view_rounded, 'Home'),
     (Icons.inventory_2_outlined, 'Stock'),
     // Report tab removed 2026-07-29 per user rule.
     (Icons.event_available_outlined, 'Attend'),
   ];
-  void _go(int i) => setState(() => _tab = i);
+  void _go(int i) {
+    if (_tab != i) {
+      _tabHistory.remove(i);
+      _tabHistory.add(i);
+    }
+    setState(() => _tab = i);
+  }
+
+  bool _handleBack() {
+    // Open check-in/out form on the Attend tab eats the first back press
+    // (user 2026-08-21 — back must show the attend list, not the last tab).
+    if (_tab == 2 && BackFormRegistry.close('pharma.attend')) return true;
+    if (_tabHistory.length <= 1) return false;
+    _tabHistory.removeLast();
+    setState(() => _tab = _tabHistory.last);
+    return true;
+  }
+
+  final _attendRefresh = ValueNotifier(0);
+
+  /// One refresh path for the app-bar button AND pull-to-refresh: online
+  /// check first, then the visible data — dashboard queue + stock always
+  /// (existing behaviour), plus the Attend tab's rows when it is current.
+  /// The offline sync queue is never touched (user rule 2026-08-21).
+  Future<void> _refreshAll() async {
+    if (!mounted || !context.read<ConnectivityService>().isOnline) return;
+    // Masters + terminology also refresh on the app-bar/pull refresh so
+    // any new medicine, symptom, block/village or clinical-sheet update
+    // reaches the app without a re-login (user 2026-08-25).
+    unawaited(context.read<MastersStore>().refresh());
+    unawaited(context.read<TerminologyStore>().refresh());
+    await Future.wait([
+      if (_dashKey.currentState != null) _dashKey.currentState!.refreshNow(),
+      if (_stockKey.currentState != null) _stockKey.currentState!.refreshNow(),
+    ]);
+    if (_tab == 2) _attendRefresh.value++;
+  }
 
   @override
   Widget build(BuildContext context) {
     final initials = widget.userName.isEmpty ? 'P' : widget.userName[0].toUpperCase();
     final pages = [
-      PharmaDashboard(name: widget.userName),
-      const PharmaStock(),
+      PharmaDashboard(key: _dashKey, name: widget.userName),
+      PharmaStock(key: _stockKey),
       // PharmaReport removed 2026-07-29 per user rule.
-      const PharmaAttendance(),
+      PharmaAttendance(refreshSignal: _attendRefresh),
     ];
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
-      child: Scaffold(
+      child: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) async {
+          if (didPop) return;
+          if (_handleBack()) return;
+          // Root of the app — confirm before closing (user 2026-08-23).
+          if (await confirmExit(context)) SystemNavigator.pop();
+        },
+        child: Scaffold(
         backgroundColor: C2.bg,
         body: Column(children: [
-          DocHeader(initials: initials, userName: widget.userName, role: 'Pharmacist'),
+          DocHeader(initials: initials, userName: widget.userName, role: 'Pharmacist',
+            onRefresh: _refreshAll),
+          // Pull-to-refresh on every tab (user rule 2026-08-16 —
+          // matches the doctor role). Refreshes both the dashboard
+          // queue and the Stock tab's requisitions in one gesture.
           Expanded(child: IndexedStack(index: _tab, children: pages.map((p) =>
-            SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 24), child: p)).toList())),
+            RefreshIndicator(
+              onRefresh: _refreshAll,
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(14, 14, 14, 24),
+                child: p),
+            )).toList())),
         ]),
         bottomNavigationBar: DocBottomNav(items: _nav, current: _tab, onTap: _go),
+      ),
       ),
     );
   }
@@ -72,11 +157,40 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
   String? _lastError;
   SyncService? _sync;
   int _lastDrainSig = -1;
+  StreamSubscription<void>? _fcmDashSub;
+
+  /// Public hook for the shell's app-bar refresh button (user rule
+  /// 2026-08-16).
+  Future<void> refreshNow() => _refreshFromBackend();
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshFromBackend());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _hydratePatientsFromCache();
+      _refreshFromBackend();
+    });
+    // Cross-device wake-up (user 2026-08-22): the doctor's submit fires
+    // an FCM push from the server — re-pull the queue the moment it
+    // arrives, no manual refresh.
+    _fcmDashSub = FcmService.instance.onMessageReceived.listen((_) {
+      if (mounted) _refreshFromBackend();
+    });
+  }
+
+  String get _pharmaCacheKey {
+    final app = context.read<AppState>();
+    return 'pharmacist_${app.backendUserId ?? app.currentUser}';
+  }
+
+  Future<void> _hydratePatientsFromCache() async {
+    try {
+      final store = await PatientsCacheStore.open();
+      final rows = store.load(_pharmaCacheKey);
+      if (rows.isEmpty || !mounted) return;
+      context.read<CounsellorState>()
+          .mergeBackendPatients(rows, statusOverride: 'with_pharma');
+    } catch (_) {}
   }
 
   @override
@@ -91,6 +205,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
 
   @override
   void dispose() {
+    _fcmDashSub?.cancel();
     _sync?.removeListener(_onSyncTick);
     super.dispose();
   }
@@ -108,16 +223,35 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     setState(() { _refreshing = true; _lastError = null; });
     try {
       final api = context.read<QueuesApi>();
-      final queue = await api.pharmaQueue(limit: 200);
+      // Fetch the primary queue. ANY failure here is silent — cached
+      // list is already on screen and the retry button is one tap away
+      // (user 2026-08-26: "server started but red banner not going" —
+      // the banner survived until every conceivable throw path was
+      // treated silent). Once this succeeds we know the server is
+      // reachable, so a stale error is cleared unconditionally.
+      QueueList queue;
+      try {
+        queue = await api.pharmaQueue(limit: 200);
+      } catch (_) {
+        return; // banner already cleared at start; retry will run again
+      }
+      final week = await api.pharmaPast7Days(limit: 200)
+          .catchError((_) => QueueList(items: const [], total: 0, count: 0));
       if (!mounted) return;
       final store = context.read<CounsellorState>();
-      // Merge with status forced to 'with_pharma' so rows land in
-      // pharmaQueue regardless of what the server label happens to be.
-      store.mergeBackendPatients(queue.items, statusOverride: 'with_pharma');
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _lastError = e.message);
-    } catch (e) {
-      if (mounted) setState(() => _lastError = e.toString());
+      final queueIds = {
+        for (final r in queue.items) r['appointment_id'],
+      };
+      final combined = [
+        for (final r in queue.items) {...r, 'status': 'with_pharma'},
+        for (final r in week.items)
+          if (!queueIds.contains(r['appointment_id'])) r,
+      ];
+      store.mergeBackendPatients(combined);
+      try {
+        final cache = await PatientsCacheStore.open();
+        await cache.save(_pharmaCacheKey, combined);
+      } catch (_) {}
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -140,7 +274,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
               child: Row(children: [
                 const Icon(Icons.cloud_off, size: 14, color: C2.danger),
                 const SizedBox(width: 6),
-                Expanded(child: Text('Showing cached list — tap to retry',
+                Expanded(child: Text('Refresh failed — tap to retry',
                   style: ct(11, FontWeight.w500, C2.danger))),
                 const Icon(Icons.refresh, size: 14, color: C2.danger),
               ]),
@@ -290,7 +424,38 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
     );
   }
 
-  void _showDispensedMeds(BuildContext context, CPatient p) => showModalBottomSheet(
+  /// Queue/week rows carry only medicine_count — the lines live behind
+  /// GET /appointments/{id}. Fetch them on first open so the sheet never
+  /// says "No medicines on record" for a genuinely dispensed case
+  /// (user 2026-08-22).
+  Future<void> _showDispensedMeds(BuildContext context, CPatient p) async {
+    if (p.prescription.isEmpty && p.backendAppointmentId != null) {
+      try {
+        final d = await context
+            .read<AppointmentsApi>()
+            .detail(p.backendAppointmentId!);
+        final lines = <RxItem>[
+          for (final r in (d['prescription'] as List? ?? const []))
+            if (r is Map)
+              RxItem(
+                itemId: (r['prescription_item_id'] as num?)?.toInt(),
+                name: '${r['medicine_name'] ?? ''}',
+                dosage: '${r['dosage'] ?? ''}',
+                interval: '${r['frequency'] ?? 'TDS'}',
+                days: '${r['duration_days'] ?? 5} Days',
+                qty: (r['qty'] as num?)?.toInt() ?? 0,
+                dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+                dispensed: (r['dispensed'] as bool?) ?? false,
+              ),
+        ]..removeWhere((m) => m.name.trim().isEmpty);
+        if (lines.isNotEmpty) p.prescription = lines;
+      } catch (_) {/* offline — sheet shows what we have */}
+    }
+    if (!context.mounted) return;
+    _openDispensedSheet(context, p);
+  }
+
+  void _openDispensedSheet(BuildContext context, CPatient p) => showModalBottomSheet(
         context: context, isScrollControlled: true, backgroundColor: Colors.transparent,
         builder: (_) => Container(
           decoration: const BoxDecoration(color: C2.bg, borderRadius: BorderRadius.vertical(top: Radius.circular(18))),
@@ -347,6 +512,12 @@ class PharmaDispense extends StatefulWidget {
 class _PharmaDispenseState extends State<PharmaDispense> {
   CPatient get p => widget.patient;
   final Map<RxItem, TextEditingController> _reason = {};
+  // Dropdown pick per line (user 2026-08-21): Not Available / Buy From
+  // Outside / Other. 'Other' opens the free-text box; the picked label
+  // (or the typed text) still flows through _reasonCtl so the validate +
+  // submit paths stay unchanged.
+  final Map<RxItem, String?> _reasonChoice = {};
+  static const _kReasonOptions = ['Not Available', 'Buy From Outside', 'Other'];
   bool _loadingRx = false;
 
   TextEditingController _reasonCtl(RxItem m) => _reason.putIfAbsent(m, () => TextEditingController());
@@ -385,8 +556,14 @@ class _PharmaDispenseState extends State<PharmaDispense> {
               days:     '${r['duration_days'] ?? 5} Days',
               qty:      (r['qty'] as num?)?.toInt() ?? 0,
               // Falls back to the prescribed qty so the Delivered field opens
-              // pre-filled with the expected amount, as it does for seed rows.
-              dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+              // pre-filled with the expected amount (user 2026-08-22) — the
+              // server sends 0, not null, for still-undispensed lines, which
+              // used to override that fallback and force a "reason" on every
+              // line. The reason dropdown now only appears when the
+              // pharmacist actually changes the quantity.
+              dispensedQty: ((r['dispensed_qty'] as num?)?.toInt() ?? 0) > 0
+                  ? (r['dispensed_qty'] as num).toInt()
+                  : null,
               dispensed: (r['dispensed'] as bool?) ?? false,
             ),
       ]..removeWhere((m) => m.name.trim().isEmpty);
@@ -493,9 +670,24 @@ class _PharmaDispenseState extends State<PharmaDispense> {
               onChanged: (v) => setState(() => m.dispensedQty = int.tryParse(v) ?? 0))),
           ])),
         ]),
-        if (changed)
-          Padding(padding: const EdgeInsets.only(top: 6), child: TextField(controller: _reasonCtl(m),
-            decoration: cInput('Reason for quantity change *'), style: ct(12.5, FontWeight.w400, C2.text), onChanged: (_) => setState(() {}))),
+        if (changed) ...[
+          Padding(padding: const EdgeInsets.only(top: 6), child: DropdownButtonFormField<String>(
+            value: _reasonChoice[m],
+            isExpanded: true,
+            decoration: cInput('Reason for quantity change *'),
+            style: ct(12.5, FontWeight.w400, C2.text),
+            items: [ for (final o in _kReasonOptions) DropdownMenuItem(value: o, child: Text(o)) ],
+            onChanged: (v) => setState(() {
+              _reasonChoice[m] = v;
+              // A named reason is the answer itself; 'Other' waits for the
+              // typed explanation below.
+              _reasonCtl(m).text = (v == null || v == 'Other') ? '' : v;
+            }),
+          )),
+          if (_reasonChoice[m] == 'Other')
+            Padding(padding: const EdgeInsets.only(top: 6), child: TextField(controller: _reasonCtl(m),
+              decoration: cInput('Enter reason *'), style: ct(12.5, FontWeight.w400, C2.text), onChanged: (_) => setState(() {}))),
+        ],
       ]),
     );
   }
@@ -543,6 +735,226 @@ class PharmaStock extends StatefulWidget {
 class _PharmaStockState extends State<PharmaStock> {
   int tab = 0;
   final List<_Req> reqItems = [_Req()];
+  StreamSubscription<void>? _fcmStockSub;
+  SyncService? _sync;
+  int _lastDrainSig = -1;
+
+  @override
+  void initState() {
+    super.initState();
+    // Pull the pharmacist's requisitions from /api/requisitions after
+    // the first frame so cross-device history + Zonal Incharge
+    // decisions land on the phone (user rule 2026-08-16 — screen was
+    // reading pre-seeded local rows before this).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadRequisitions();
+    });
+    // Approval pushes: when the admin approves/rejects on the web portal
+    // the server sends an FCM message — re-pull so the decision shows
+    // without a manual refresh (user 2026-08-21).
+    _fcmStockSub = FcmService.instance.onMessageReceived.listen((_) {
+      if (mounted) _loadRequisitions();
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Confirm Delivery lands on the server through the sync queue — the
+    // moment that drain applies, re-pull so the Overall Status TOTAL
+    // reflects the dispense WITHOUT a manual refresh (user 2026-08-22).
+    final s = context.read<SyncService>();
+    if (!identical(_sync, s)) {
+      _sync?.removeListener(_onSyncTick);
+      _sync = s..addListener(_onSyncTick);
+    }
+  }
+
+  void _onSyncTick() {
+    final s = _sync;
+    if (s == null || s.lastDrainAt == null) return;
+    final sig = s.lastApplied * 100000 + s.lastRejected * 100 + s.lastFailed;
+    if (sig == _lastDrainSig) return;
+    _lastDrainSig = sig;
+    if (mounted) _loadRequisitions();
+  }
+
+  @override
+  void dispose() {
+    _sync?.removeListener(_onSyncTick);
+    _fcmStockSub?.cancel();
+    super.dispose();
+  }
+
+  /// Public hook — the shell app-bar refresh button calls this.
+  Future<void> refreshNow() => _loadRequisitions();
+
+  bool _didPrefill = false;
+
+  /// Pre-fill the Requisition form with the pharmacist's MOST-REQUESTED
+  /// medicines (from history), newest dosage/qty — fully editable, rows
+  /// removable (user 2026-08-21). Runs once, and only while the form is
+  /// still pristine so typing / Re-Order prefills are never clobbered.
+  void _maybePrefillFromHistory() {
+    print('[JC] prefill: didPrefill=$_didPrefill mounted=$mounted '
+        'rows=${reqItems.length} firstName=${reqItems.isNotEmpty ? reqItems.first.name : '-'}');
+    if (_didPrefill || !mounted) return;
+    if (!(reqItems.length == 1 && reqItems.first.name == null)) return;
+    final s = context.read<CounsellorState>();
+    print('[JC] prefill: reqs=${s.requisitions.length} '
+        'items=${[for (final r in s.requisitions) r.items.length]}');
+    final freq = <String, int>{};
+    final latest = <String, ReqLine>{};
+    final approvedOrder = <String>[]; // newest-first, medicines with an approved qty
+    for (final r in s.requisitions) {
+      for (final i in r.items) {
+        if (i.isZonalAdded || i.name.trim().isEmpty) continue;
+        freq[i.name] = (freq[i.name] ?? 0) + 1;
+        latest.putIfAbsent(i.name, () => i); // list is newest-first
+        if (i.approvedQty > 0 && !approvedOrder.contains(i.name)) {
+          approvedOrder.add(i.name);
+        }
+      }
+    }
+    print('[JC] prefill: freq=$freq approved=$approvedOrder');
+    // Most-FREQUENTLY requested first (user 2026-08-21): medicines seen in
+    // 2+ past requisitions lead. Thin history fallback (user 2026-08-21
+    // "show last and 2 approved product"): the most recently requested
+    // medicine plus the 2 most recent APPROVED medicines — not just the
+    // latest three.
+    var top = freq.keys.where((k) => freq[k]! >= 2).toList()
+      ..sort((a, b) => freq[b]!.compareTo(freq[a]!));
+    if (top.isEmpty) {
+      top = [
+        if (freq.isNotEmpty) freq.keys.first, // latest requested
+        ...approvedOrder.take(3), // newest approved; extra in case of overlap
+      ].toSet().take(3).toList();
+    }
+    if (top.isEmpty) return;
+    setState(() {
+      reqItems
+        ..clear()
+        ..addAll(top.take(5).map((n) => _Req(
+              name: n,
+              dosage: latest[n]!.dosage,
+              unit: latest[n]!.unit,
+              qty: latest[n]!.requested > 0 ? '${latest[n]!.requested}' : '10',
+            )));
+      if (reqItems.isEmpty) reqItems.add(_Req());
+      _didPrefill = true;
+    });
+    print('[JC] prefill APPLIED: ${[for (final r in reqItems) r.name]}');
+  }
+
+  String get _reqCacheKey {
+    final app = context.read<AppState>();
+    return 'pharmacist_${app.backendUserId ?? app.currentUser}';
+  }
+
+  /// Live on-hand quantities from GET /medicines/stock — the Overall
+  /// Status TOTAL column reads these, so a dispense moves the number
+  /// (user 2026-08-22 "after submit stock not changing"). Cached for
+  /// offline; the requisition-based RECV sum is the last fallback.
+  Map<String, int> _liveStock = {};
+  // Per-medicine dispensed-to-patients totals (server truth) — the DISP
+  // column reads these when present (user 2026-08-22).
+  Map<String, int> _liveDispensed = {};
+
+  Future<void> _loadLiveStock() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('pharma_stock_v1');
+      if (raw != null && mounted && _liveStock.isEmpty) {
+        final m = (jsonDecode(raw) as Map).cast<String, dynamic>();
+        setState(() => _liveStock =
+            {for (final e in m.entries) e.key: (e.value as num).toInt()});
+      }
+      final rawD = prefs.getString('pharma_dispensed_v1');
+      if (rawD != null && mounted && _liveDispensed.isEmpty) {
+        final m = (jsonDecode(rawD) as Map).cast<String, dynamic>();
+        setState(() => _liveDispensed =
+            {for (final e in m.entries) e.key: (e.value as num).toInt()});
+      }
+    } catch (_) {}
+    try {
+      final res = await context.read<ApiClient>().get('/medicines/stock');
+      if (!mounted || res is! List) return;
+      final next = <String, int>{};
+      final nextDisp = <String, int>{};
+      for (final r in res) {
+        if (r is! Map) continue;
+        final name = (r['medicine_name'] ?? '').toString();
+        if (name.isEmpty) continue;
+        next[name] = (r['quantity'] as num?)?.toInt() ?? 0;
+        nextDisp[name] = (r['dispensed_total'] as num?)?.toInt() ?? 0;
+      }
+      setState(() { _liveStock = next; _liveDispensed = nextDisp; });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('pharma_stock_v1', jsonEncode(next));
+      await prefs.setString('pharma_dispensed_v1', jsonEncode(nextDisp));
+    } catch (_) {/* offline — cache/RECV fallback stays */}
+  }
+
+  Future<void> _loadRequisitions() async {
+    _loadLiveStock();
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final api = context.read<RequisitionsApi>();
+    store.setRequisitionsLoading(true);
+    // Offline-first: hydrate from cache immediately so the list has
+    // rows even before the API call resolves (user rule 2026-08-20
+    // "everything works online and offline").
+    try {
+      final cache = await RequisitionsStore.open();
+      final cached = cache.load(_reqCacheKey);
+      if (cached.isNotEmpty && mounted) {
+        store.applyBackendRequisitions(cached);
+        // Prefill from the cached history too — a failed/slow network
+        // call must not leave the form blank when history exists
+        // (user bug 2026-08-21).
+        _maybePrefillFromHistory();
+      }
+    } catch (_) {/* first launch — nothing cached */}
+    try {
+      final rows = await api.list(dateFrom: AppConfig.dataWindowFrom, limit: 200);
+      if (!mounted) return;
+      store.applyBackendRequisitions(rows);
+      _maybePrefillFromHistory();
+      // Persist fresh copy for the next offline open.
+      try {
+        final cache = await RequisitionsStore.open();
+        await cache.save(_reqCacheKey, rows);
+      } catch (_) {/* best-effort */}
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      // Offline: silent — cached list stays on screen.
+      store.setRequisitionsLoading(false,
+          error: e.code == ApiErrorCode.networkUnreachable ? null : e.message);
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      store.setRequisitionsLoading(false, error: null);
+      return;
+    }
+    store.setRequisitionsLoading(false);
+  }
+
+  /// Lazy-load the full lines for a card the user is opening. The list
+  /// endpoint only carries aggregates (line_count / requested_total);
+  /// lines live on GET /requisitions/{id}. Guard: skip when already loaded.
+  Future<void> _ensureLinesLoaded(Requisition r) async {
+    if (r.backendId == null || r.items.isNotEmpty) return;
+    try {
+      final detail = await context.read<RequisitionsApi>().detail(r.backendId!);
+      if (!mounted) return;
+      final lines = <ReqLine>[
+        for (final l in (detail['lines'] as List? ?? const []))
+          if (l is Map)
+            CounsellorState.reqLineFromBackend(l.cast<String, dynamic>()),
+      ];
+      context.read<CounsellorState>().replaceRequisitionLines(r.backendId!, lines);
+    } catch (_) { /* silent — user can retry via Refresh */ }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -571,12 +983,31 @@ class _PharmaStockState extends State<PharmaStock> {
         child: Row(children: [
           cell('MEDICINE', head: true, flex: 3, align: TextAlign.left),
           cell('REQ', head: true), cell('DISP', head: true), cell('RECV', head: true),
+          // "Total on-hand" — what actually reached the MMU minus what
+          // has been dispensed. For now = RECV (dispense per medicine
+          // isn't rolled into this endpoint yet; user rule 2026-08-16
+          // wanted the column present so pharmacist has one glance
+          // number for available stock).
+          cell('TOTAL', head: true),
         ])),
       ...agg.entries.map((e) => Container(padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 6), decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.border))),
-        child: Row(children: [
-          Expanded(flex: 3, child: Text(e.key, style: ct(11.5, FontWeight.w600, C2.text))),
-          cell('${e.value[0]}'), cell('${e.value[1]}'), cell('${e.value[2]}'),
-        ]))),
+        child: Builder(builder: (_) {
+          final disp = _liveDispensed[e.key] ?? e.value[1];
+          final recv = e.value[2];
+          // TOTAL = what the row itself shows — RECV minus DISP (user
+          // 2026-08-25: 1000 received + 18 dispensed must read 982, not
+          // an unrelated server-stock number). Never negative.
+          final total = recv - disp < 0 ? 0 : recv - disp;
+          return Row(children: [
+            Expanded(flex: 3, child: Text(e.key, style: ct(11.5, FontWeight.w600, C2.text))),
+            cell('${e.value[0]}'),
+            cell('$disp'),
+            cell('$recv'),
+            Expanded(child: Text('$total',
+                textAlign: TextAlign.center,
+                style: ct(11.5, FontWeight.w700, C2.navy))),
+          ]);
+        }))),
     ]));
   }
 
@@ -599,12 +1030,23 @@ class _PharmaStockState extends State<PharmaStock> {
         setState(() {
           reqItems
             ..clear()
-            ..addAll(tpl.items.where((i) => !i.isZonalAdded).map((i) => _Req(
-                  name: i.name,
-                  dosage: i.dosage,
-                  unit: i.unit,
-                  qty: '',
-                )));
+            // Pre-fill ALL past items (user 2026-08-26 — the earlier
+            // `.where(!isZonalAdded)` filter was hiding items the
+            // Zonal Incharge had approved, so a 2-line requisition
+            // showed only 1 on Re-Order). Pharmacist can still remove
+            // any line before submitting.
+            ..addAll(tpl.items.map((i) {
+              // Pre-fill qty with the approved qty (falls back to what
+              // was originally requested) so the pharmacist just taps
+              // Submit for an identical re-order.
+              final prevQty = i.approvedQty > 0 ? i.approvedQty : i.requested;
+              return _Req(
+                name: i.name,
+                dosage: i.dosage,
+                unit: i.unit,
+                qty: prevQty > 0 ? prevQty.toString() : '',
+              );
+            }));
           if (reqItems.isEmpty) reqItems.add(_Req());
         });
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -648,60 +1090,147 @@ class _PharmaStockState extends State<PharmaStock> {
       ]))),
       COutlineButton('Add More', icon: Icons.add_circle_outline, onTap: () => setState(() => reqItems.add(_Req()))),
       const SizedBox(height: 8),
-      CPrimaryButton('Submit Requisition', icon: Icons.send, onTap: () => _submitReq(context)),
+      CPrimaryButton(
+        _submittingReq ? 'Submitting…' : 'Submit Requisition',
+        icon: _submittingReq ? Icons.hourglass_top : Icons.send,
+        onTap: _submittingReq ? null : () => _submitReq(context),
+      ),
     ]));
   }
 
-  void _submitReq(BuildContext context) {
+  bool _submittingReq = false;
+
+  Future<void> _submitReq(BuildContext context) async {
+    if (_submittingReq) return;
     // Parse qty once per row so validation and construction see the same value.
     final parsed = reqItems
         .map((r) => (draft: r, qty: int.tryParse(r.qty.trim()) ?? 0))
         .toList();
     final valid = parsed.where((p) => p.draft.name != null && p.qty > 0).toList();
-    if (valid.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Select at least one medicine + qty'), backgroundColor: C2.danger));
-      return;
-    }
-    if (valid.any((p) => p.draft.dosage.trim().isEmpty)) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter dosage for every medicine'), backgroundColor: C2.danger));
-      return;
-    }
+    void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
+    if (valid.isEmpty) return err('Select at least one medicine + qty');
+    if (valid.any((p) => p.draft.dosage.trim().isEmpty)) return err('Enter dosage for every medicine');
+    setState(() => _submittingReq = true);
     final s = context.read<CounsellorState>();
-    final now = DateTime.now();
-    final id = s.nextRequisitionId(now);
-    s.addRequisition(Requisition(
-      id: id,
-      date: fmtDate(now),
-      status: 'pending_zi',
-      items: valid.map((p) => ReqLine(
-        name: p.draft.name!,
-        dosage: p.draft.dosage.trim(),
-        unit: p.draft.unit,
-        requested: p.qty,
-        status: 'Pending',
-      )).toList(),
-      audit: [
-        AuditEntry(when: now, actor: 'Pharmacist', action: 'Submitted requisition'),
-        AuditEntry(when: now, actor: 'System',     action: 'Email sent to Zonal Incharge'),
-      ],
-    ));
-    setState(() { reqItems..clear()..add(_Req()); tab = 1; });
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('$id submitted · Email sent to Zonal Incharge · Awaiting approval'),
-      backgroundColor: C2.green,
-    ));
+    final api = context.read<RequisitionsApi>();
+    // Try the server first — success = the server-issued id is what
+    // the pharmacist should see; local-only rows are the offline
+    // fallback (user rule 2026-08-16: safe API integration).
+    final lines = [
+      for (final p in valid)
+        {
+          'medicine_name': p.draft.name,
+          'dosage':        p.draft.dosage.trim(),
+          'requested_qty': p.qty,
+        }
+    ];
+    try {
+      await api.create(lines: lines);
+      if (!mounted) return;
+      // Re-pull the whole list so the new row lands with server-assigned
+      // id, status, and audit fields — no local drift.
+      await _loadRequisitions();
+      if (!mounted) return;
+      // Blank the form, then immediately re-arm the history prefill so
+      // coming back from the Past tab shows a filled form again instead
+      // of a single empty row (user 2026-08-21).
+      setState(() { reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
+      _maybePrefillFromHistory();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Requisition submitted · Awaiting approval'),
+        backgroundColor: C2.green,
+      ));
+    } on ApiException catch (e) {
+      if (e.code == ApiErrorCode.networkUnreachable) {
+        // Offline — save locally so the pharmacist isn't blocked, AND
+        // queue the indent so it reaches the server on the next drain
+        // (server kind `requisition.create`, added 2026-08-20; before
+        // this an offline indent lived and died on the handset).
+        context.read<SyncService>().enqueue(
+          kind: 'requisition.create',
+          payload: {'lines': lines},
+        );
+        final now = DateTime.now();
+        final localId = s.nextRequisitionId(now);
+        s.addRequisition(Requisition(
+          id: localId,
+          date: fmtDate(now),
+          status: 'pending_zi',
+          items: valid.map((p) => ReqLine(
+            name: p.draft.name!, dosage: p.draft.dosage.trim(), unit: p.draft.unit,
+            requested: p.qty, status: 'Pending',
+          )).toList(),
+          audit: [AuditEntry(when: now, actor: 'Pharmacist', action: 'Submitted (offline)')],
+        ));
+        if (!mounted) return;
+        setState(() { reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
+        _maybePrefillFromHistory();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Offline — saved locally, will sync when back online'),
+          backgroundColor: C2.navy,
+        ));
+      } else {
+        err('Submit failed: ${e.message}');
+      }
+    } catch (_) {
+      err('Submit failed. Try again.');
+    } finally {
+      if (mounted) setState(() => _submittingReq = false);
+    }
   }
 
   Widget _pastPanel() {
     final s = context.watch<CounsellorState>();
     final reqs = s.requisitions;
-    if (reqs.isEmpty) return CCard(child: Padding(padding: const EdgeInsets.all(10), child: Center(child: Text('No requisitions submitted yet', style: ct(12, FontWeight.w400, C2.text2)))));
-    return Column(children: reqs.map((r) {
-      final st = _reqStatusStyle(r.status);
-      final summary = r.items.map((i) => '${i.name}×${i.requested}').join(', ');
-      return CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      // Loading strip + retry banner (mirrors the Devices tab pattern).
+      if (s.loadingRequisitions)
+        const Padding(padding: EdgeInsets.only(bottom: 6),
+          child: SizedBox(height: 2, child: LinearProgressIndicator(minHeight: 2))),
+      if (s.requisitionsError != null)
+        Padding(padding: const EdgeInsets.only(bottom: 8), child: InkWell(
+          onTap: _loadRequisitions,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: C2.danger.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(children: [
+              const Icon(Icons.cloud_off, size: 16, color: C2.danger),
+              const SizedBox(width: 8),
+              Expanded(child: Text(s.requisitionsError!, style: ct(12.5, FontWeight.w600, C2.danger))),
+              const Icon(Icons.refresh, size: 16, color: C2.danger),
+            ]),
+          ),
+        )),
+      if (reqs.isEmpty && !s.loadingRequisitions)
+        CCard(child: Padding(padding: const EdgeInsets.all(10),
+          child: Center(child: Text('No requisitions submitted yet',
+              style: ct(12, FontWeight.w400, C2.text2)))))
+      else
+        ...reqs.map((r) {
+          final st = _reqStatusStyle(r.status);
+          // If lines aren't loaded yet, show the aggregate summary from
+          // the list endpoint so the card isn't blank.
+          final summary = r.items.isNotEmpty
+              ? r.items.map((i) => '${i.name}×${i.requested}').join(', ')
+              : (r.backendLineCount != null
+                  ? '${r.backendLineCount} medicine${r.backendLineCount == 1 ? '' : 's'} · ${r.backendRequestedTotal ?? 0} qty'
+                  : '');
+          return CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         InkWell(
-          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => _RequisitionDetail(req: r))),
+          onTap: () async {
+            // Lazy-load full lines from GET /requisitions/{id} before
+            // opening the detail screen — list endpoint only carries
+            // aggregates. Silent on failure (detail will just be sparse).
+            await _ensureLinesLoaded(r);
+            if (!mounted) return;
+            // Re-read from state — replaceRequisitionLines rebuilt the row.
+            final fresh = context.read<CounsellorState>().requisitions
+                .firstWhere((x) => identical(x, r) || x.backendId == r.backendId, orElse: () => r);
+            Navigator.push(context, MaterialPageRoute(builder: (_) => _RequisitionDetail(req: fresh)));
+          },
           child: Row(children: [
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text('${r.id}  ·  ${r.date}', style: ct(13, FontWeight.w700, C2.text)),
@@ -720,8 +1249,13 @@ class _PharmaStockState extends State<PharmaStock> {
           Align(
             alignment: Alignment.centerRight,
             child: TextButton.icon(
+              // Re-Order pre-fills the Requisition tab with the past
+              // requisition's medicines and switches to that tab so the
+              // pharmacist can review/edit quantities before submitting
+              // (user 2026-08-26 — reverted from the direct-submit
+              // behavior back to the earlier review-first flow).
               onPressed: () {
-                s.setReorderTemplate(r);
+                context.read<CounsellorState>().setReorderTemplate(r);
                 setState(() => tab = 0);
               },
               icon: const Icon(Icons.replay_outlined, size: 16, color: C2.cyan),
@@ -737,7 +1271,8 @@ class _PharmaStockState extends State<PharmaStock> {
           ),
         ],
       ]));
-    }).toList());
+    }),
+    ]);
   }
 
   Future<String?> _pickMed() => showModalBottomSheet<String>(context: context, isScrollControlled: true, backgroundColor: C2.white,
@@ -803,38 +1338,20 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
             // Approval happens in the web portal (rule 2026-08-05) — the
             // pharmacist can only view and, later, verify what actually
             // arrived. No in-app approval shortcut.
+            // Requested medicines + the ZI decision per line live in THIS
+            // card now — two-card layout (user 2026-08-21): this one and
+            // Received Medicines. Audit trail card removed same day.
+            const SizedBox(height: 12),
+            Text('Requested Medicines', style: ct(12.5, FontWeight.w700, C2.navy)),
+            const SizedBox(height: 2),
+            ...[...req.requestedItems, ...req.zonalAddedItems].map(_mergedRow),
           ])),
-
-          const SizedBox(height: 12),
-          // ── Section: Requested Medicines ─────────────────────────
-          _sectionCard('Requested Medicines',
-              subtitle: 'What the pharmacist asked for.',
-              rows: req.requestedItems.map((i) => _lineRow(i, showApproved: req.status != 'pending_zi')).toList()),
-
-          // ── Section: Approved Medicines (once Zonal Incharge acts) ─────────
-          if (req.status != 'pending_zi') ...[
-            const SizedBox(height: 12),
-            _sectionCard('Zonal Incharge Approvals',
-                subtitle: 'Zonal Incharge decision on each requested medicine.',
-                rows: req.requestedItems.map((i) => _approvedRow(i)).toList()),
-          ],
-
-          // ── Section: Zonal Incharge-added extras ─────────
-          if (req.zonalAddedItems.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            _sectionCard('Medicines Added by Zonal Incharge',
-                subtitle: 'Extra medicines the Zonal Incharge added on top of the request.',
-                rows: req.zonalAddedItems.map(_approvedRow).toList()),
-          ],
 
           // ── Section: Received / verification ─────────
           if (canVerify || req.status == 'verified') ...[
             const SizedBox(height: 12),
             _verificationCard(context, s, editable: canVerify),
           ],
-
-          const SizedBox(height: 12),
-          _auditCard(),
         ]),
       ),
     );
@@ -899,7 +1416,11 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
   }
 
   Widget _verificationCard(BuildContext context, CounsellorState s, {required bool editable}) {
-    final rows = req.items.where((l) => l.approvedQty > 0).toList();
+    // Web-portal approvals may not record per-line quantities; when the
+    // requisition is approved overall but no line carries a qty, fall back
+    // to the requested lines so verification is still possible.
+    var rows = req.items.where((l) => l.approvedQty > 0).toList();
+    if (rows.isEmpty) rows = req.requestedItems;
     return CCard(padding: const EdgeInsets.all(10), child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text('Received Medicines', style: ct(13, FontWeight.w700, C2.navy)),
       const SizedBox(height: 2),
@@ -923,7 +1444,7 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
             if (i.dosage.isNotEmpty)
               Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
           ])),
-          Expanded(flex: 2, child: Text('${i.approvedQty}', textAlign: TextAlign.center, style: ct(11.5, FontWeight.w700, C2.text))),
+          Expanded(flex: 2, child: Text('${i.approvedQty > 0 ? i.approvedQty : i.requested}', textAlign: TextAlign.center, style: ct(11.5, FontWeight.w700, C2.text))),
           Expanded(flex: 3, child: SizedBox(height: 34, child: TextFormField(
             initialValue: '${i.received}',
             keyboardType: TextInputType.number, textAlign: TextAlign.center,
@@ -937,7 +1458,10 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
       )),
       const SizedBox(height: 10),
       // Invoice attachment. The button flips label + colour once a file is
-      // captured so the pharmacist can tell verification is unblocked.
+      // captured so the pharmacist can tell verification is unblocked. On a
+      // read-only (verified) requisition it only appears as the green
+      // "Invoice attached" badge — a dead upload button there is noise.
+      if (editable || req.invoicePath.isNotEmpty)
       Row(children: [
         Expanded(child: OutlinedButton.icon(
           icon: Icon(req.invoicePath.isEmpty ? Icons.upload_file_outlined : Icons.check_circle_outline,
@@ -948,8 +1472,36 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           ),
           onPressed: editable ? () async {
             final path = await _pickInvoice();
-            if (path == null) return;
+            if (path == null || !mounted) return;
             setState(() => req.invoicePath = path);
+            // Push to the server right away (user 2026-08-21). Offline
+            // keeps the local path — Complete Verification's lift still
+            // uploads it later, so nothing is lost either way.
+            final uploads = context.read<UploadsApi>();
+            final messenger = ScaffoldMessenger.of(context);
+            try {
+              final up = await uploads.uploadImage(path);
+              final name = (up['file_name'] ?? '').toString();
+              if (name.isNotEmpty && mounted) {
+                setState(() => req.invoicePath = name);
+              }
+              messenger.showSnackBar(const SnackBar(
+                content: Text('Invoice uploaded'),
+                backgroundColor: C2.green,
+              ));
+            } on ApiException catch (e) {
+              messenger.showSnackBar(SnackBar(
+                content: Text(e.code == ApiErrorCode.networkUnreachable
+                    ? 'Offline — invoice saved, will upload with verification'
+                    : 'Invoice upload failed: ${e.message}'),
+                backgroundColor: C2.navy,
+              ));
+            } catch (_) {
+              messenger.showSnackBar(const SnackBar(
+                content: Text('Invoice saved — will upload with verification'),
+                backgroundColor: C2.navy,
+              ));
+            }
           } : null,
           style: OutlinedButton.styleFrom(
             minimumSize: const Size(double.infinity, 40),
@@ -962,30 +1514,123 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
         CPrimaryButton(
           'Complete Verification',
           icon: Icons.verified_outlined,
-          onTap: () {
-            if (req.invoicePath.isEmpty) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                content: Text('Attach the invoice before completing verification'),
-                backgroundColor: C2.danger,
-              ));
-              return;
-            }
-            if (req.items.every((l) => l.received <= 0)) {
-              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                content: Text('Enter received quantity for at least one medicine'),
-                backgroundColor: C2.danger,
-              ));
-              return;
-            }
-            s.completeVerification(req, invoicePath: req.invoicePath);
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text('Verification complete — requisition closed'),
-              backgroundColor: C2.green,
-            ));
-          },
+          onTap: () => _completeVerification(context, s),
         ),
       ],
     ]));
+  }
+
+  /// PATCH /requisitions/{id}/receive — the received quantities and the
+  /// invoice must reach the server, not just the handset (gap closed
+  /// 2026-08-20: verification used to be local-only, so stock never moved).
+  /// Online: upload invoice → receive. Offline: enqueue `requisition.receive`
+  /// (the drain's photo-lift uploads the invoice before pushing).
+  Future<void> _completeVerification(BuildContext context, CounsellorState s) async {
+    void err(String m) => ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(m), backgroundColor: C2.danger));
+    if (req.invoicePath.isEmpty) {
+      return err('Attach the invoice before completing verification');
+    }
+    if (req.items.every((l) => l.received <= 0)) {
+      return err('Enter received quantity for at least one medicine');
+    }
+    final anyApproved = req.items.any((l) => l.approvedQty > 0);
+    final receipts = [
+      for (final l in req.items)
+        if (l.backendLineId != null &&
+            (l.approvedQty > 0 || (!anyApproved && !l.isZonalAdded)))
+          {'requisition_line_id': l.backendLineId, 'received_qty': l.received},
+    ];
+    final backendId = req.backendId;
+    // Grab providers before the first await — no context use across gaps.
+    final uploadsApi = context.read<UploadsApi>();
+    final reqApi = context.read<RequisitionsApi>();
+    final sync = context.read<SyncService>();
+    var syncedNow = false;
+    if (backendId != null && receipts.isNotEmpty) {
+      try {
+        // Invoice first — the receive payload carries the server-side name.
+        var invoiceKey = req.invoicePath;
+        if (!invoiceKey.startsWith('http') && File(invoiceKey).existsSync()) {
+          final up = await uploadsApi.uploadImage(invoiceKey);
+          final name = (up['file_name'] ?? '').toString();
+          if (name.isNotEmpty) invoiceKey = name;
+        }
+        await reqApi.receive(
+            backendId, receipts: receipts, invoicePath: invoiceKey);
+        syncedNow = true;
+      } on ApiException catch (e) {
+        if (e.code == ApiErrorCode.networkUnreachable) {
+          sync.enqueue(kind: 'requisition.receive', payload: {
+            'requisition_id': backendId,
+            'receipts': receipts,
+            // Local path — lifted to a server name by the drain's photo pass.
+            'invoice_path': req.invoicePath,
+          });
+        } else {
+          return err('Could not record the receipt: ${e.message}');
+        }
+      } catch (_) {
+        return err('Could not record the receipt. Try again.');
+      }
+    }
+    if (!mounted) return;
+    s.completeVerification(req, invoicePath: req.invoicePath);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(syncedNow
+          ? 'Verification complete — stock updated on server'
+          : 'Verification complete — will sync when back online'),
+      backgroundColor: C2.green,
+    ));
+  }
+
+  /// One line of the merged header card: medicine · Req qty · ZI decision.
+  /// approvedQty semantics: -1 = no per-line decision recorded (web-portal
+  /// approvals often skip per-line qtys) -> show '—', NOT "Rejected"
+  /// (display bug fixed 2026-08-21); 0 = rejected; >0 = approved qty.
+  Widget _mergedRow(ReqLine i) {
+    final pending = req.status == 'pending_zi';
+    // Web-portal approvals often record NO per-line quantity (0 / null on
+    // every line). When the requisition as a whole is approved and no line
+    // carries a positive qty, read each line as approved at its requested
+    // qty (user 2026-08-21 — "approved was showing in previous version").
+    final overallApproved = req.status == 'approved' ||
+        req.status == 'partial' || req.status == 'verified';
+    final noLineData = !req.items.any((l) => l.approvedQty > 0);
+    Widget decision;
+    if (pending) {
+      decision = Text('Pending', style: ct(11.5, FontWeight.w600, C2.text3));
+    } else if (i.approvedQty > 0) {
+      decision = Text('Approved ${i.approvedQty}',
+          style: ct(11.5, FontWeight.w700, C2.green));
+    } else if (noLineData && overallApproved && !i.isZonalAdded) {
+      decision = Text('Approved ${i.requested}',
+          style: ct(11.5, FontWeight.w700, C2.green));
+    } else if (i.approvedQty == 0 && !noLineData) {
+      decision = Text('Rejected', style: ct(11.5, FontWeight.w700, C2.danger));
+    } else {
+      decision = Text('—', style: ct(11.5, FontWeight.w600, C2.text3));
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      decoration: const BoxDecoration(
+          border: Border(bottom: BorderSide(color: C2.border))),
+      child: Row(children: [
+        Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(i.name + (i.isZonalAdded ? '  ★' : ''),
+              style: ct(12.5, FontWeight.w700, C2.text)),
+          if (i.dosage.isNotEmpty)
+            Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
+          if (i.zonalRemark.isNotEmpty)
+            Text('Note: ${i.zonalRemark}', style: ct(10.5, FontWeight.w500, C2.text2)),
+        ])),
+        Expanded(flex: 2, child: Text(
+            i.isZonalAdded ? 'Added' : 'Req ${i.requested}',
+            textAlign: TextAlign.center,
+            style: ct(11.5, FontWeight.w600, C2.text))),
+        Expanded(flex: 3, child: Align(alignment: Alignment.centerRight, child: decision)),
+      ]),
+    );
   }
 
   Widget _auditCard() {
@@ -1040,7 +1685,11 @@ class _MedPickerState extends State<_MedPicker> {
   String q = '';
   @override
   Widget build(BuildContext context) {
-    final m = kMedicineNames.where((o) => q.isEmpty || o.toLowerCase().contains(q.toLowerCase())).toList();
+    // Server medicine master first (only names the backend can match);
+    // the hardcoded list is just the first-launch offline fallback.
+    final serverMeds = context.watch<MastersStore>().medicineNames();
+    final options = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final m = options.where((o) => q.isEmpty || o.toLowerCase().contains(q.toLowerCase())).toList();
     return Padding(padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text('Select Medicine', style: ct(15, FontWeight.w700, C2.navy)), const SizedBox(height: 10),
@@ -1300,17 +1949,12 @@ class _PharmaReportState extends State<PharmaReport> {
 
 // ───────────────── My Attendance (history + mark) ─────────────────
 class PharmaAttendance extends StatefulWidget {
-  const PharmaAttendance({super.key});
+  /// Bumped by the shell on refresh while this tab is current.
+  final Listenable? refreshSignal;
+  const PharmaAttendance({super.key, this.refreshSignal});
   @override
   State<PharmaAttendance> createState() => _PharmaAttendanceState();
 }
-
-// Same 3 camp anchors used by the doctor / counsellor auto-location pickers.
-const Map<String, ({double lat, double lng})> _kPharmaCampCoords = {
-  'Gajraula Camp': (lat: 28.845, lng: 78.240),
-  'Amroha Camp':   (lat: 28.910, lng: 78.470),
-  'Hasanpur Camp': (lat: 28.719, lng: 78.302),
-};
 
 class _PharmaAttendanceState extends State<PharmaAttendance> {
   bool showForm = false;
@@ -1330,18 +1974,236 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
   double? _lat;
   double? _lng;
 
+  // Counsellor's mark for the pharmacist today — banner above the form
+  // (user rule 2026-08-16 — cross-role attendance visibility).
+  String? _counsellorMarkedBy;
+
+  // Camp anchors from /camps/anchors — same source as the counsellor +
+  // doctor so the location string matches across roles (ATTEND task B;
+  // replaces the hardcoded 3-camp list). Cached per user for offline.
+  List<Map<String, dynamic>> _anchors = const [];
+  int? _campAnchorId;
+  StreamSubscription<void>? _fcmSub;
+  Timer? _minuteTicker;
+
   @override
   void initState() {
     super.initState();
+    _minuteTicker = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (mounted) setState(() {});
+    });
     _date = fmtDate(DateTime.now());
+    // First back press while the check-in/out form is open closes the
+    // form instead of switching tabs (user 2026-08-21).
+    BackFormRegistry.register('pharma.attend', () {
+      if (!mounted || !showForm) return false;
+      // Clear the draft too — reopening must not resurrect stale
+      // notes/photo/times (user 2026-08-26, same rule as counsellor).
+      _resetAttendForm();
+      return true;
+    });
+    _loadAnchors();
+    _hydrateTodayFromBackend();
+    _checkCounsellorMark();
+    // Live refresh on FCM (user bug 2026-08-18): the counsellor's mark
+    // shows up without a re-login.
+    _fcmSub = FcmService.instance.onMessageReceived.listen((_) {
+      _hydrateTodayFromBackend();
+      _checkCounsellorMark();
+    });
+    widget.refreshSignal?.addListener(_onExternalRefresh);
+  }
+
+  /// Blank every draft field of the check-in/out form and close it
+  /// (user 2026-08-26 — stale drafts resurfacing on Close/Back/Refresh).
+  void _resetAttendForm() {
+    setState(() {
+      showForm = false; _checkIn = ''; _checkOut = '';
+      location = null; _notes.clear();
+      _photoPath = null; _lat = null; _lng = null;
+    });
+  }
+
+  /// Shell-driven refresh (pull / app-bar while this tab is current).
+  void _onExternalRefresh() {
+    if (!mounted) return;
+    if (showForm) _resetAttendForm();
+    _loadAnchors();
+    _hydrateTodayFromBackend();
+    _checkCounsellorMark();
+  }
+
+  /// Per-user cache key (rule 2026-08-16 — no cross-user leakage).
+  String get _userKey {
+    final app = context.read<AppState>();
+    return 'pharma_${app.backendUserId ?? app.currentUser}';
+  }
+
+  Future<void> _loadAnchors() async {
+    try {
+      final rows = await context.read<CampsApi>().anchors();
+      if (!mounted) return;
+      setState(() => _anchors = rows.cast<Map<String, dynamic>>());
+      unawaited(AttendanceStore.open()
+          .then((s) => s.saveAnchors(_userKey, _anchors)));
+    } catch (_) {
+      try {
+        final store = await AttendanceStore.open();
+        final cached = store.loadAnchors(_userKey);
+        if (cached.isNotEmpty && mounted) {
+          setState(() => _anchors = cached);
+        }
+      } catch (_) {/* facility-name fallback in _autofill */}
+    }
+  }
+
+  /// Rebuild today's shift after an app restart — server first, offline
+  /// snapshot as fallback (user rule 2026-08-18). Without this the
+  /// pharmacist's Check-Out stayed locked all day after any relaunch.
+  Future<void> _hydrateTodayFromBackend() async {
+    Map<String, dynamic>? m;
+    var serverAnswered = false;
+    try {
+      final res = await context.read<AttendanceApi>().today();
+      serverAnswered = true;
+      final row = res['attendance'];
+      if (row is Map) {
+        m = row.cast<String, dynamic>();
+        // Server-stamped counsellor auto-mark → banner (same as dshell).
+        final autoBy = (m['auto_marked_by'] ?? '').toString().trim();
+        if (autoBy.isNotEmpty && mounted) {
+          setState(() => _counsellorMarkedBy = autoBy);
+        }
+        unawaited(AttendanceStore.open()
+            .then((st) => st.saveToday(_userKey, m)));
+      }
+    } catch (_) {
+      try {
+        m = (await AttendanceStore.open()).loadToday(_userKey);
+      } catch (_) {/* no cache */}
+    }
+    // Server explicitly said "no attendance today" → drop the local row
+    // so a deleted-from-DB row doesn't linger on the phone (user
+    // 2026-08-25). Silent offline still keeps the cached copy.
+    if (serverAnswered && m == null && mounted) {
+      final today = fmtDate(DateTime.now());
+      context.read<CounsellorState>().removePharmaAttendanceOn(today);
+      setState(() => _counsellorMarkedBy = null);
+      try {
+        final st = await AttendanceStore.open();
+        await st.saveToday(_userKey, null);
+      } catch (_) {}
+      return;
+    }
+    if (m == null || !mounted) return;
+    final date    = _fmtServerDate('${m['attendance_date'] ?? ''}');
+    final checkIn = _fmtServerTime('${m['check_in'] ?? ''}');
+    if (date.isEmpty || checkIn.isEmpty) return;
+    final s = context.read<CounsellorState>();
+    final serverOut = _fmtServerTime('${m['check_out'] ?? ''}');
+    AttendanceRecord? local;
+    for (final r in s.pharmaAttendance) {
+      if (r.date == date) { local = r; break; }
+    }
+    if (local != null) {
+      // Counsellor may have closed the shift server-side (task C) —
+      // mirror it locally without a re-login.
+      if (serverOut.isNotEmpty && local.checkOut.isEmpty) {
+        s.closePharmaShift(local, local.copyWith(checkOut: serverOut));
+      }
+    } else {
+      s.addPharmaAttendance(AttendanceRecord(
+        date:     date,
+        checkIn:  checkIn,
+        checkOut: serverOut,
+        location: '${m['location'] ?? m['anchor_name'] ?? ''}',
+        status:   '${m['status'] ?? 'Present'}',
+        notes:    '${m['notes'] ?? ''}',
+        photoPath: _serverPhotoUrl(m['photo_path']),
+        photo:     _serverPhotoUrl(m['photo_path']).isNotEmpty,
+        photoPathOut: _serverPhotoUrl(m['photo_path_out']),
+        lat:      (m['latitude']  as num?)?.toDouble(),
+        lng:      (m['longitude'] as num?)?.toDouble(),
+      ));
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Server photo_path → public URL (same rule as counsellor/doctor).
+  static String _serverPhotoUrl(dynamic p) {
+    final s = (p ?? '').toString().trim();
+    if (s.isEmpty || s.startsWith('http') || s.startsWith('/')) return s;
+    return '$kUploadsBase/patient_docs/$s';
+  }
+
+  /// '2026-08-13' (or ISO datetime) -> '13-08-2026' (same as doctor).
+  static String _fmtServerDate(String v) {
+    if (v.length < 10) return '';
+    final p = v.substring(0, 10).split('-');
+    if (p.length != 3) return '';
+    return '${p[2]}-${p[1]}-${p[0]}';
+  }
+
+  /// '14:05:00' / ISO datetime -> '2:05 PM'; blank stays blank (open shift).
+  static String _fmtServerTime(String v) {
+    if (v.isEmpty || v == 'null') return '';
+    final t = v.contains('T') ? v.split('T').last : v;
+    final p = t.split(':');
+    if (p.length < 2) return '';
+    final h = int.tryParse(p[0]);
+    final m = int.tryParse(p[1]);
+    if (h == null || m == null || h > 23 || m > 59) return '';
+    return fmtTime12(TimeOfDay(hour: h, minute: m));
   }
 
   @override
-  void dispose() { _notes.dispose(); super.dispose(); }
+  void dispose() {
+    BackFormRegistry.unregister('pharma.attend');
+    _fcmSub?.cancel(); _notes.dispose();
+    _minuteTicker?.cancel();
+    super.dispose();
+  }
+
+  /// Same read as doctor: pull today's attendance rows for this facility,
+  /// find any counsellor row whose notes list "Pharmacist" as staff.
+  Future<void> _checkCounsellorMark() async {
+    try {
+      final today = DateTime.now();
+      final iso = '${today.year.toString().padLeft(4, '0')}-'
+          '${today.month.toString().padLeft(2, '0')}-'
+          '${today.day.toString().padLeft(2, '0')}';
+      final rows = await context.read<AttendanceApi>()
+          .list(dateFrom: iso, dateTo: iso, limit: 20);
+      for (final r in rows) {
+        final rowRole = (r['role'] ?? '').toString().toLowerCase();
+        if (rowRole != 'counsellor' && rowRole != 'counselor') continue;
+        final notes = (r['notes'] ?? '').toString();
+        if (RegExp(r'Staff \((In|Out)\)[^.]*\bPharmacist\b',
+                caseSensitive: false).hasMatch(notes)) {
+          if (!mounted) return;
+          setState(() =>
+              _counsellorMarkedBy = (r['full_name'] ?? 'Counsellor').toString());
+          return;
+        }
+      }
+    } catch (_) { /* silent */ }
+  }
 
   /// Today's open check-in record for the pharmacist (rule 2026-08-05).
   /// Non-null when a check-in without a matching check-out exists — the
   /// only state where Check-Out is allowed.
+
+  /// Any attendance row for today, open OR complete. Distinguishes the
+  /// "already checked out" state from "never checked in today" — otherwise
+  /// the button falls back to "Mark Check-In" even after the counsellor
+  /// closed the shift for you (user bug 2026-08-25).
+  AttendanceRecord? _todayPharmaShift(CounsellorState s) {
+    for (final r in s.pharmaAttendance) {
+      if (r.date == _date && r.checkIn.isNotEmpty) return r;
+    }
+    return null;
+  }
+
   AttendanceRecord? _openPharmaShift(CounsellorState s) {
     for (final r in s.pharmaAttendance) {
       if (r.date == _date && r.checkIn.isNotEmpty && r.checkOut.isEmpty) {
@@ -1366,20 +2228,48 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
       return;
     }
     if (location != null) return;
+    // Same source + fallback ladder as counsellor/doctor (ATTEND task B):
+    // nearest /camps/anchors anchor via GPS, else the facility name.
+    final fac = context.read<MastersStore>().facility;
+    final facilityName =
+        ((fac?['name'] ?? fac?['facility_name']) as String?)?.trim();
+    if (_anchors.isEmpty) {
+      if (facilityName != null && facilityName.isNotEmpty && mounted) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+      return;
+    }
     try {
       var perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
       if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
       if (!await Geolocator.isLocationServiceEnabled()) return;
-      final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
-      String? nearest;
+      final pos = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.medium)
+          .timeout(const Duration(seconds: 6));
+      Map<String, dynamic>? nearest;
       double best = double.infinity;
-      for (final e in _kPharmaCampCoords.entries) {
-        final d = Geolocator.distanceBetween(pos.latitude, pos.longitude, e.value.lat, e.value.lng);
-        if (d < best) { best = d; nearest = e.key; }
+      for (final a in _anchors) {
+        final lat = (a['latitude'] as num?)?.toDouble();
+        final lng = (a['longitude'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        final d = Geolocator.distanceBetween(pos.latitude, pos.longitude, lat, lng);
+        if (d < best) { best = d; nearest = a; }
       }
-      if (nearest != null && mounted) setState(() => location = nearest);
-    } catch (_) { /* fall through */ }
+      if (nearest != null && mounted) {
+        setState(() {
+          location = (nearest!['anchor_name'] ?? '').toString();
+          _campAnchorId = (nearest['camp_anchor_id'] as num?)?.toInt();
+        });
+      } else if (facilityName != null && facilityName.isNotEmpty && mounted) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+    } catch (_) {
+      if (facilityName != null && facilityName.isNotEmpty &&
+          mounted && location == null) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+    }
   }
 
   void _submit(CounsellorState s) {
@@ -1405,13 +2295,32 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
         photo: true, photoPath: _photoPath!, lat: _lat, lng: _lng,
       ));
       context.read<SyncService>().enqueue(kind: 'attendance.check_in', payload: {
-        'attendance_date': _date,
+        // ISO yyyy-MM-dd — _date is the dd-MM-yyyy DISPLAY string; the
+        // server records the payload date, so a queue drained the next
+        // morning must still carry the day the shift actually opened.
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
         'check_in':        _checkIn,
         'location':        location!,
+        'camp_anchor_id':  _campAnchorId,
         'latitude':        _lat,
         'longitude':       _lng,
         'notes':           _notes.text.trim(),
+        // Local path lifted on next drain (bug 2026-08-20).
+        if (_photoPath != null) 'photo_key': _photoPath,
       });
+      // Offline snapshot so a restart with no signal still shows the open
+      // shift (user rule 2026-08-18).
+      unawaited(AttendanceStore.open().then((st) => st.saveToday(_userKey, {
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
+        'check_in': DateTime.now().toIso8601String(),
+        'check_out': null,
+        'location': location,
+        'status': 'Present',
+        'notes': _notes.text.trim(),
+      })));
+      // D2: 3h/6h/9h check-out reminders until the shift closes.
+      unawaited(NotificationsService.instance
+          .scheduleCheckoutReminders(checkInLabel: _checkIn));
     } else {
       final closed = open!.copyWith(
         checkOut: _checkOut,
@@ -1421,12 +2330,28 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
       );
       s.closePharmaShift(open, closed);
       context.read<SyncService>().enqueue(kind: 'attendance.check_out', payload: {
-        'attendance_date': _date,
+        // ISO for the server — see check_in note above.
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
         'check_out':       _checkOut,
         'latitude':        _lat,
         'longitude':       _lng,
         'notes':           _notes.text.trim(),
+        // Local path lifted on next drain (bug 2026-08-20).
+        if (_photoPath != null) 'photo_key': _photoPath,
       });
+      // Fixed 2026-08-20 (mirror of the doctor-shell fix): writing NOW for
+      // both check_in and check_out produced a synthetic "already closed"
+      // row that the backend hydrate then never overwrote. Keep the real
+      // check-in from the open shift and the just-submitted check-out.
+      unawaited(AttendanceStore.open().then((st) => st.saveToday(_userKey, {
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
+        'check_in': open.checkIn,
+        'check_out': _checkOut,
+        'location': open.location,
+        'status': 'Present',
+      })));
+      // D2: shift closed — stop the pending reminders.
+      unawaited(NotificationsService.instance.cancelCheckoutReminders());
     }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('Attendance (${_mode == 'in' ? 'Check-In' : 'Check-Out'}) submitted'),
@@ -1486,6 +2411,31 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
     );
   }
 
+  /// Boundary hour (3, 6, 9, …) when the current wall-clock minute is
+  /// exactly a 3-hour mark past check-in; else -1. Same behaviour as
+  /// counsellor + doctor (user 2026-08-26 "exact time only, no window").
+  int _checkoutBoundaryHourFor(AttendanceRecord? open) {
+    if (open == null || open.checkIn.isEmpty || open.checkOut.isNotEmpty) {
+      return -1;
+    }
+    final now = DateTime.now();
+    DateTime? checkInDt;
+    try {
+      final parts = open.checkIn.trim().split(RegExp(r'\s+'));
+      final hm = parts[0].split(':');
+      var h = int.parse(hm[0]);
+      final m = int.parse(hm[1]);
+      final period = parts.length > 1 ? parts[1].toUpperCase() : '';
+      if (period == 'PM' && h != 12) h += 12;
+      if (period == 'AM' && h == 12) h = 0;
+      checkInDt = DateTime(now.year, now.month, now.day, h, m);
+    } catch (_) { return -1; }
+    final mins = now.difference(checkInDt).inMinutes;
+    if (mins < 180) return -1;
+    if ((mins - 180) % 180 != 0) return -1;
+    return mins ~/ 60;
+  }
+
   @override
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
@@ -1498,22 +2448,72 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
         }
       });
     }
+    final _bh = _checkoutBoundaryHourFor(open);
+    if (_bh > 0 && !showForm) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        PendingAlert.showOnce(
+          context,
+          key: 'pharma-checkout-pending-h$_bh',
+          title: 'Check-out Pending',
+          message: 'You checked in at ${open!.checkIn}. Your check-out '
+              'is still pending. Please complete your check-out.',
+        );
+      });
+    }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('My Attendance',
-        trailing: COutlineButton(showForm ? 'Close' : (open == null ? 'Mark Check-In' : 'Mark Check-Out'),
-          icon: showForm ? Icons.close : (open == null ? Icons.login : Icons.logout),
-          onTap: () {
-            final opening = !showForm;
-            setState(() {
-              showForm = opening;
-              if (opening) _mode = open == null ? 'in' : 'out';
-            });
-            if (opening) {
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (mounted) _autofill(context.read<CounsellorState>());
-              });
-            }
-          }))),
+      // Counsellor-marked banner (user rule 2026-08-16).
+      if (_counsellorMarkedBy != null)
+        Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: C2.green.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(children: [
+            const Icon(Icons.check_circle, size: 16, color: C2.green),
+            const SizedBox(width: 8),
+            Expanded(child: Text(
+              'Counsellor $_counsellorMarkedBy has marked you present today.',
+              style: ct(12.5, FontWeight.w600, C2.green))),
+          ]),
+        ),
+      Padding(padding: const EdgeInsets.only(bottom: 8), child: Builder(builder: (_) {
+        final today = _todayPharmaShift(s);
+        final done = today != null && today.checkOut.isNotEmpty;
+        return SecBar('My Attendance',
+          trailing: done
+              ? Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFEDF7E0),
+                    borderRadius: BorderRadius.circular(6)),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.check_circle, size: 14, color: C2.green),
+                    const SizedBox(width: 4),
+                    Text('Attendance complete',
+                        style: ct(11.5, FontWeight.w700, C2.green)),
+                  ]))
+              : COutlineButton(
+                  showForm ? 'Close' : (open == null ? 'Mark Check-In' : 'Mark Check-Out'),
+                  icon: showForm ? Icons.close : (open == null ? Icons.login : Icons.logout),
+                  onTap: () {
+                    final opening = !showForm;
+                    if (!opening) {
+                      // Close — drop the draft (user 2026-08-26).
+                      _resetAttendForm();
+                      return;
+                    }
+                    setState(() {
+                      showForm = true;
+                      _mode = open == null ? 'in' : 'out';
+                    });
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) _autofill(context.read<CounsellorState>());
+                    });
+                  }));
+      })),
       if (showForm)
         CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const SecBar('Mark Attendance'),
@@ -1546,14 +2546,21 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
             value: location ?? 'Detecting nearest camp via GPS…',
             empty: location == null,
           ), required: true),
-          CField('Notes', TextField(controller: _notes, minLines: 2, maxLines: 3, decoration: cInput('Optional — type or use the mic').copyWith(
-            suffixIcon: VoiceMicButton(controller: _notes)))),
+          CField('Notes', TextField(controller: _notes, minLines: 2, maxLines: null, decoration: cInput('Optional — type or use the mic').copyWith(
+            suffixIcon: RemarksMicButton(controller: _notes)))),
           // Selfie + GPS proof for whichever mode is active (rule
           // 2026-08-05). Same widget the doctor + counsellor use — the
           // captured photo path + lat/lng ride into photoPath /
           // photoPathOut depending on Check-In vs Check-Out.
           CField('Selfie + Location', AttendanceCapture(
             initialPhotoPath: _photoPath, initialLat: _lat, initialLng: _lng,
+            // MMU name on the watermark (user 2026-08-20). Snapped anchor
+            // wins, facility name falls back — same ladder as counsellor.
+            placeLabel: location
+                ?? ((context.read<MastersStore>().facility?['name']
+                       ?? context.read<MastersStore>().facility?['facility_name'])
+                     as String?)?.trim()
+                ?? '',
             onCaptured: (path, lat, lng) => setState(() { _photoPath = path; _lat = lat; _lng = lng; }),
           ), required: true),
           const SizedBox(height: 4),
@@ -1581,18 +2588,53 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
 
   void _showDetail(AttendanceRecord r) => showModalBottomSheet(
         context: context, backgroundColor: Colors.transparent,
+        // Cap the sheet + scroll so the check-out photo isn't off-screen
+        // on small devices (user 2026-08-25).
+        isScrollControlled: true,
         builder: (_) => Container(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.85),
           decoration: const BoxDecoration(color: C2.white, borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-          child: SafeArea(top: false, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          child: SafeArea(top: false, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
             Center(child: Container(width: 40, height: 4, decoration: BoxDecoration(color: C2.border, borderRadius: BorderRadius.circular(2)))),
             const SizedBox(height: 14),
             Text('Attendance — ${r.date}', style: ct(15, FontWeight.w700, C2.navy)),
             const SizedBox(height: 10),
             _drow('Date', r.date), _drow('Check-in', r.checkIn), _drow('Check-out', r.checkOut),
             _drow('Location', r.location), _drow('Status', r.status),
+            if (r.lat != null && r.lng != null)
+              _drow('GPS', '${r.lat!.toStringAsFixed(5)}, ${r.lng!.toStringAsFixed(5)}'),
             if (r.notes.isNotEmpty) _drow('Notes', r.notes),
-          ])),
+            if (r.photoPath.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Check-in photo', style: ct(11.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 4),
+              _attPhoto(r.photoPath, 'Check-in photo'),
+            ],
+            if (r.photoPathOut.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Check-out photo', style: ct(11.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 4),
+              _attPhoto(r.photoPathOut, 'Check-out photo'),
+            ],
+          ]))),
+        ),
+      );
+
+  /// Attendance selfie: server rows carry URLs, own submissions carry
+  /// local file paths (same renderer as the doctor sheet).
+  /// Tap → fullscreen lightbox (user 2026-08-19).
+  Widget _attPhoto(String path, [String? title]) => GestureDetector(
+        onTap: () => showPhotoLightbox(context, path, title: title),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: path.startsWith('http')
+              ? Image.network(path, height: 160, fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(height: 80, color: C2.border,
+                    child: const Center(child: Icon(Icons.broken_image_outlined, color: C2.text3))))
+              : Image.file(File(path), height: 160, fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(height: 80, color: C2.border,
+                    child: const Center(child: Icon(Icons.broken_image_outlined, color: C2.text3)))),
         ),
       );
 

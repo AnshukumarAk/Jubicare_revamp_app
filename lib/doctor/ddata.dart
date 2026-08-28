@@ -101,23 +101,62 @@ const List<String> kMedicineNames = [
   'Multivitamin','Calcium','Nitrofurantoin','B-Complex','Betadine Gargle',
 ];
 
-const List<String> kFrequencies = ['OD','BD','TDS','QID','SOS','HS'];
+// 'HS' (hora somni — at bedtime) removed from the picker per user rule
+// 2026-08-16. The value stays a valid frequency if a legacy row carries
+// it — validation only rejects picks the doctor makes now.
+const List<String> kFrequencies = ['OD','BD','TDS','QID','SOS'];
 const List<String> kDurations = ['3','5','7','10 Days','14','30'];
 
 /// Score likely conditions from chosen symptoms + block geo prior.
-List<ScoredDisease> scoreDoctor(List<String> symptoms, String? block) {
+/// Advisory scoring (user spec 2026-08-14). Three signals per disease:
+///  1. SELECTED symptoms — full weight (explicit clinical input).
+///  2. OBSERVATION keywords — the doctor's dictated/typed observation is
+///     scanned for the disease's symptom terms; matches score at HALF
+///     weight (mentioned, but not formally selected). Terms already
+///     selected aren't double-counted.
+///  3. VILLAGE trend — diagnoses actually reported in THIS patient's
+///     village (from the synced queue rows) boost proportionally, up to
+///     +18 for the village's most common diagnosis. Falls back to the
+///     static block prior only when no real village data is loaded.
+/// Live clinical DB — starts as the small built-in [kDoctorDb] and is
+/// swapped for the full 158-condition assets/kdoctordb.json by
+/// DoctorDbLoader.load() (user 2026-08-22 "use this json for AI Clinical
+/// Advisory card"). Keyed by both condition name and standardTerm.
+Map<String, DPlan> doctorDb = kDoctorDb;
+
+List<ScoredDisease> scoreDoctor(
+  List<String> symptoms,
+  String? block, {
+  String observation = '',
+  Map<String, int> villageDx = const {},
+}) {
   final geo = kGeoDb[block] ?? kGeoDb['Gajraula']!;
+  final obs = observation.toLowerCase();
+  final maxVillage = villageDx.values.fold<int>(0, (m, v) => v > m ? v : m);
   final res = <ScoredDisease>[];
-  kDoctorDb.forEach((name, plan) {
-    var sc = 0, mx = 0;
+  doctorDb.forEach((name, plan) {
+    var sc = 0.0;
+    var mx = 0;
     for (final s in symptoms) {
       sc += plan.symptoms[s] ?? 0;
+    }
+    if (obs.trim().isNotEmpty) {
+      plan.symptoms.forEach((term, w) {
+        if (!symptoms.contains(term) && obs.contains(term.toLowerCase())) {
+          sc += w * 0.5;
+        }
+      });
     }
     for (final v in plan.symptoms.values) {
       mx += v;
     }
     var pct = mx > 0 ? (sc / mx * 100).round() : 0;
-    if (geo.diseases.any((d) => d.name == name)) pct = (pct + 15).clamp(0, 98);
+    if (maxVillage > 0) {
+      final seen = villageDx[name] ?? 0;
+      if (seen > 0) pct = (pct + (18 * seen / maxVillage).round()).clamp(0, 98);
+    } else if (geo.diseases.any((d) => d.name == name)) {
+      pct = (pct + 15).clamp(0, 98);
+    }
     if (pct >= 10) res.add(ScoredDisease(name, pct, pct >= 60 ? 'h' : (pct >= 35 ? 'm' : 'l')));
   });
   res.sort((a, b) => b.pct.compareTo(a.pct));

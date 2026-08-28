@@ -5,14 +5,19 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart' show MediaType;
 
+import '../config/app_config.dart';
 import 'api_errors.dart';
 import 'token_store.dart';
 
-/// HTTP client for the JubiCare backend (v2 API).
+/// HTTP client for the JubiCare backend (Django, JubiCare 2.0).
 ///
 /// Handles:
 ///
-/// * base URL (revamp-back.indevconsultancy.in) + `/api` prefix
+/// * base URL + prefix from [AppConfig] (the ONE place hosts live) — the
+///   Django backend serves this app's whole contract under /api/m (its web
+///   portal owns /api). Only the base URL + prefix changed in the cutover
+///   from the old FastAPI service (2026-08-20); every path below the prefix
+///   is byte-for-byte the same.
 /// * Bearer JWT on every authed request
 /// * proactive refresh (§1.2) — access tokens rotate a few seconds early
 /// * REACTIVE refresh — on 401 TOKEN_EXPIRED, run the refresh flow and
@@ -32,7 +37,7 @@ class ApiClient {
   final Future<void> Function()? onSignedOutRemotely;
 
   ApiClient({
-    this.baseUrl = 'https://revamp-back.indevconsultancy.in',
+    this.baseUrl = AppConfig.apiBase,
     http.Client? httpClient,
     this.onSignedOutRemotely,
   }) : _http = httpClient ?? http.Client();
@@ -44,9 +49,10 @@ class ApiClient {
 
   Uri _uri(String path, [Map<String, dynamic>? query]) {
     // Callers pass /auth/login or /mobile/bootstrap — the client prefixes
-    // /api so requirements docs and endpoints in code both read cleanly.
+    // AppConfig.apiPrefix (the Django mobile mount) so requirements docs
+    // and endpoints in code both read cleanly.
     final rel = path.startsWith('/') ? path : '/$path';
-    final full = '$baseUrl/api$rel';
+    final full = '$baseUrl${AppConfig.apiPrefix}$rel';
     if (query == null || query.isEmpty) return Uri.parse(full);
     final cleaned = <String, String>{
       for (final e in query.entries)
@@ -179,18 +185,26 @@ class ApiClient {
     }
   }
 
+  /// Every request gets a hard deadline (user bug 2026-08-21: a stalled
+  /// connection left "Submitting..." spinning forever). A timeout surfaces
+  /// as networkUnreachable, so every offline fallback (sync queue, cached
+  /// lists) kicks in exactly as if the radio had dropped.
+  static const Duration _requestTimeout = Duration(seconds: 25);
+
   Future<http.Response> _do(String method, String path,
       {Object? body, Map<String, dynamic>? query, String? bearer}) {
     final uri = _uri(path, query);
     final headers = _headers(bearer);
     final encoded = body == null ? null : jsonEncode(body);
-    switch (method) {
-      case 'GET':    return _http.get(uri, headers: headers);
-      case 'POST':   return _http.post(uri, headers: headers, body: encoded);
-      case 'PATCH':  return _http.patch(uri, headers: headers, body: encoded);
-      case 'DELETE': return _http.delete(uri, headers: headers, body: encoded);
-      default:       throw ArgumentError('Unsupported HTTP method: $method');
-    }
+    final Future<http.Response> res = switch (method) {
+      'GET'    => _http.get(uri, headers: headers),
+      'POST'   => _http.post(uri, headers: headers, body: encoded),
+      'PATCH'  => _http.patch(uri, headers: headers, body: encoded),
+      'DELETE' => _http.delete(uri, headers: headers, body: encoded),
+      _        => throw ArgumentError('Unsupported HTTP method: $method'),
+    };
+    return res.timeout(_requestTimeout,
+        onTimeout: () => throw const SocketException('request timed out'));
   }
 
   dynamic _decode(http.Response res) {

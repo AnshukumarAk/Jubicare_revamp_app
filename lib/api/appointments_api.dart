@@ -40,6 +40,32 @@ class AppointmentsApi {
   Future<Map<String, dynamic>> detail(int id) async =>
       ((await client.get('/appointments/$id')) as Map).cast<String, dynamic>();
 
+  /// GET /appointments/{id}/advisory — village name + village-level
+  /// trending terms + server-side likely-conditions for the Case Details
+  /// panels. `symptoms` (comma-joined) previews the chips currently on
+  /// screen, including ones not submitted yet.
+  Future<Map<String, dynamic>> advisory(int id, {String? symptoms}) async =>
+      ((await client.get('/appointments/$id/advisory', query: {
+        if (symptoms != null && symptoms.isNotEmpty) 'symptoms': symptoms,
+      })) as Map).cast<String, dynamic>();
+
+  /// GET /advisory/preview — same shape as `advisory()` but for a case
+  /// that HAS NOT been registered yet. Powers the counsellor Register
+  /// screen so the panels there match what the doctor will see
+  /// (user 2026-08-27 "Register ki ranking Doctor page se sync ho").
+  Future<Map<String, dynamic>> advisoryPreview({
+    required List<String> symptoms,
+    int? villageId,
+  }) async {
+    final joined = symptoms.map((s) => s.trim())
+        .where((s) => s.isNotEmpty).join(',');
+    if (joined.isEmpty) return const {};
+    return ((await client.get('/advisory/preview', query: {
+      'symptoms': joined,
+      if (villageId != null) 'village_id': villageId,
+    })) as Map).cast<String, dynamic>();
+  }
+
   /// GET /appointments/queues/summary — org-wide status counters.
   Future<Map<String, dynamic>> queuesSummary() async =>
       ((await client.get('/appointments/queues/summary')) as Map).cast<String, dynamic>();

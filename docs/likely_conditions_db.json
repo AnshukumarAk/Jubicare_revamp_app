@@ -1,0 +1,77 @@
+{
+  "_source": "lib/counsellor/cdata.dart — kDiseaseDb (line 343) + kGeoDb (line 314), scoring in scoreDiseases() (line 365)",
+  "_used_by": "Counsellor → Register → Symptoms → 'Likely Conditions' card",
+  "_scoring_rules": {
+    "score": "sum of weights of selected symptoms for each disease",
+    "pct": "score / (sum of ALL that disease's weights) * 100, rounded",
+    "geo_boost": "+15 pct (capped 98) if the disease appears in the patient's block priors (kGeoDb)",
+    "threshold": "diseases below 10 pct are not shown",
+    "levels": "h = pct >= 60, m = pct >= 35, l = below 35",
+    "display": "top 6, sorted by pct descending"
+  },
+  "disease_db": {
+    "Dengue Fever":    {"Fever": 3, "Headache": 2, "Retro-orbital pain": 3, "Rash": 2, "Joint pain": 2, "Platelet drop": 3, "Nausea": 1, "Vomiting": 1, "Body ache": 2, "Fatigue": 1},
+    "Malaria":         {"Fever": 3, "Chills": 3, "Sweating": 3, "Headache": 2, "Body ache": 2, "Nausea": 1, "Fatigue": 2, "Jaundice": 2},
+    "Typhoid":         {"Fever": 3, "Headache": 2, "Abdominal pain": 3, "Diarrhoea": 2, "Loss of appetite": 2, "Fatigue": 2, "Nausea": 1, "Body ache": 1},
+    "Viral Fever":     {"Fever": 3, "Headache": 2, "Body ache": 2, "Fatigue": 2, "Runny nose": 1, "Sore throat": 1, "Cough": 1, "Chills": 1, "Weakness": 1},
+    "URTI":            {"Cough": 3, "Sore throat": 3, "Runny nose": 3, "Fever": 2, "Headache": 1, "Body ache": 1, "Fatigue": 1},
+    "Pneumonia":       {"Fever": 3, "Cough": 3, "Shortness of breath": 3, "Chest pain": 2, "Fatigue": 2, "Chills": 2, "Wheezing": 1},
+    "Gastroenteritis": {"Diarrhoea": 3, "Vomiting": 3, "Abdominal pain": 2, "Nausea": 2, "Fever": 1, "Dehydration": 3},
+    "Chikungunya":     {"Fever": 3, "Joint pain": 3, "Rash": 2, "Headache": 2, "Fatigue": 2, "Body ache": 2, "Swelling": 2},
+    "UTI":             {"Burning micturition": 3, "Frequent urination": 3, "Blood in urine": 2, "Fever": 2},
+    "Hypertension":    {"Headache": 2, "Dizziness": 2, "Chest pain": 1, "Palpitations": 2, "Shortness of breath": 1, "Fatigue": 1},
+    "Diabetes Type 2": {"Frequent urination": 2, "Fatigue": 2, "Weight loss": 2, "Weakness": 1, "Numbness": 2}
+  },
+  "geo_priors": {
+    "Gajraula": {
+      "outbreaks": "Dengue (High), Viral Fever (Moderate)",
+      "common_symptoms": ["Fever", "Rash", "Retro-orbital pain", "Nausea", "Platelet drop", "Joint pain", "Vomiting", "Loss of appetite"],
+      "diseases": [
+        {"name": "Dengue Fever", "pct": 78, "level": "h"},
+        {"name": "Viral Fever", "pct": 55, "level": "m"},
+        {"name": "Malaria", "pct": 22, "level": "l"},
+        {"name": "Typhoid", "pct": 15, "level": "l"}
+      ]
+    },
+    "Amroha": {
+      "outbreaks": "Malaria (Moderate), Typhoid (Low)",
+      "common_symptoms": ["Fever", "Chills", "Sweating", "Abdominal pain", "Diarrhoea", "Headache", "Jaundice"],
+      "diseases": [
+        {"name": "Malaria", "pct": 62, "level": "h"},
+        {"name": "Typhoid", "pct": 38, "level": "m"},
+        {"name": "Viral Fever", "pct": 28, "level": "l"},
+        {"name": "Gastroenteritis", "pct": 20, "level": "l"}
+      ]
+    },
+    "Hasanpur": {
+      "outbreaks": "URTI (Moderate), Gastroenteritis (Low)",
+      "common_symptoms": ["Cough", "Runny nose", "Sore throat", "Diarrhoea", "Fever", "Vomiting"],
+      "diseases": [
+        {"name": "URTI", "pct": 52, "level": "h"},
+        {"name": "Gastroenteritis", "pct": 35, "level": "m"},
+        {"name": "Viral Fever", "pct": 22, "level": "l"},
+        {"name": "Dengue Fever", "pct": 10, "level": "l"}
+      ]
+    },
+    "Dankaur": {
+      "outbreaks": "Viral Fever (Moderate), Typhoid (Low)",
+      "common_symptoms": ["Fever", "Headache", "Body ache", "Diarrhoea", "Abdominal pain", "Fatigue"],
+      "diseases": [
+        {"name": "Viral Fever", "pct": 48, "level": "m"},
+        {"name": "Typhoid", "pct": 32, "level": "m"},
+        {"name": "Gastroenteritis", "pct": 25, "level": "l"},
+        {"name": "URTI", "pct": 18, "level": "l"}
+      ]
+    },
+    "Dadri": {
+      "outbreaks": "URTI (Low), Pneumonia (Low)",
+      "common_symptoms": ["Cough", "Shortness of breath", "Chest pain", "Fever", "Fatigue", "Wheezing"],
+      "diseases": [
+        {"name": "URTI", "pct": 40, "level": "m"},
+        {"name": "Pneumonia", "pct": 30, "level": "l"},
+        {"name": "Acute Bronchitis", "pct": 22, "level": "l"},
+        {"name": "Viral Fever", "pct": 15, "level": "l"}
+      ]
+    }
+  }
+}

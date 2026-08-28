@@ -1,10 +1,14 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../services/terminology_store.dart';
 import 'package:provider/provider.dart';
+import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../api/auth_api.dart';
 import '../api/masters_store.dart';
+import '../services/fcm_service.dart';
+import '../services/notifications_store.dart';
 import '../models/models.dart';
 import '../state/app_state.dart';
 import '../state/auth_persistence.dart';
@@ -14,11 +18,11 @@ import '../doctor/dshell.dart';
 import '../pharmacist/pshell.dart';
 
 /// Single login screen. The user enters username + password. The app
-/// hits `/api/auth/login` first; on success it persists tokens + user,
+/// hits `/api/auth/login`; on success it persists tokens + user,
 /// pulls `/mobile/bootstrap`, and routes to the matching role shell.
-/// When the backend is unreachable, the local mock login (matches
-/// role.credUser / role.credPass) kicks in so the demo still works
-/// on a laptop with no server.
+/// Backend-only — the old hardcoded demo-credential fallback was
+/// removed (user rule 2026-08-13): a real deployment must never
+/// accept a login the server did not issue.
 class UnifiedLoginScreen extends StatefulWidget {
   const UnifiedLoginScreen({super.key});
   @override
@@ -31,15 +35,6 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
   bool _obscure = true;
   String? _error;
   bool _busy = false;
-
-  Role? _matchLocalRole() {
-    final u = _user.text.trim();
-    final p = _pass.text;
-    for (final r in Role.values) {
-      if (u == r.credUser && p == r.credPass) return r;
-    }
-    return null;
-  }
 
   Future<void> _submit() async {
     if (_busy) return;
@@ -64,16 +59,14 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
     try {
       result = await auth.login(_user.text.trim(), _pass.text);
     } on ApiException catch (e) {
-      // Fall back to the local mock login when the backend is
-      // unreachable OR temporarily unhealthy (5xx). A legit
-      // credentials rejection (401) still shows its message so we
-      // don't mask real auth errors behind a happy demo path.
+      // Backend-only login (user rule 2026-08-13) — no local fallback.
+      // A network failure / 5xx surfaces as a clear message rather than
+      // silently signing into a demo session.
       final serverDown = e.code == ApiErrorCode.networkUnreachable ||
           (e.statusCode != null && e.statusCode! >= 500);
-      if (serverDown) {
-        return _fallbackLocalLogin(app);
-      }
-      setState(() => _error = e.message);
+      setState(() => _error = serverDown
+          ? 'Cannot reach the server. Check your internet and try again.'
+          : e.message);
       return;
     } catch (_) {
       setState(() => _error = 'Sign-in failed. Please try again.');
@@ -98,6 +91,12 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
     await masters.refresh();
     final facility = masters.facility;
     if (facility != null) app.applyBootstrapFacility(facility);
+    // Clinical terminology (sheet-based Likely/Advisory + ICD codes) —
+    // fires on FIRST login so a fresh install lands on the same screens
+    // as a returning user (user 2026-08-25: same version, two phones,
+    // one showed legacy Likely because the sheet was never downloaded).
+    // Background — no need to block the first paint.
+    unawaited(context.read<TerminologyStore>().refresh());
 
     // AuthPersistence.save stores the flag + the backend user block so
     // a cold start restores enough to render the shell before /me
@@ -109,28 +108,29 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
       backendUser: user,
     );
 
-    _goToShell(role);
-  }
-
-  void _fallbackLocalLogin(AppState app) {
-    final role = _matchLocalRole();
-    if (role == null) {
-      setState(() => _error = 'Cannot reach the server. Please check your internet.');
-      return;
+    // D1: register this device's FCM token against the freshly logged-in
+    // user, so counsellor check-in pushes reach the doctor/pharmacist
+    // (fire-and-forget — login must not wait on Firebase).
+    if (mounted) {
+      unawaited(FcmService.instance.register(context.read<ApiClient>()));
     }
-    final mmuId = role == Role.counselor ? 'MMU001' : null;
-    app.login(role, _user.text, _pass.text, mmuId: mmuId);
-    unawaited(AuthPersistence.save(
-      role: role,
-      username: _user.text.trim(),
-      mmuId: mmuId,
-    ));
-    _goToShell(role);
+    // Per-user notification history (user 2026-08-19). Persist so the
+    // background FCM isolate can still resolve the user (2026-08-20).
+    unawaited(NotificationsStore.setCurrentUser(
+        '${app.backendUserId ?? _user.text.trim()}'));
+
+    // Real name from the backend login response ("full_name"). If the
+    // server sent nothing, fall back to the role label — never a
+    // hardcoded person name (user rule 2026-08-14).
+    final displayName =
+        ((user['full_name'] as String?)?.trim().isNotEmpty ?? false)
+            ? (user['full_name'] as String).trim()
+            : role.label;
+    _goToShell(role, displayName);
   }
 
-  void _goToShell(Role role) {
+  void _goToShell(Role role, String name) {
     if (!mounted) return;
-    final name = role.fullName;
     final Widget dest = switch (role) {
       Role.counselor => CounsellorShell(userName: name),
       Role.doctor => DoctorShell(userName: name),

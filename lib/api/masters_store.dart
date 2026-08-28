@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -16,6 +17,13 @@ class MastersStore extends ChangeNotifier {
   static const _kBootstrap  = 'bootstrap_payload_v2';
   static const _kFetchedAt  = 'bootstrap_fetched_at';
   static const _kMastersVer = 'bootstrap_masters_version';
+  // Geography cascade cache (rule 2026-08-13): the facility's district's
+  // blocks, each carrying its villages. Downloaded right after login /
+  // bootstrap refresh from /masters/blocks + /masters/villages so the
+  // Register + Status dropdowns run off live DB names instead of the
+  // hardcoded kBlockVillages map.
+  static const _kGeoBlocks   = 'geo_blocks_v1';
+  static const _kGeoDistrict = 'geo_district_id';
 
   final BootstrapApi api;
   MastersStore(this.api);
@@ -24,6 +32,10 @@ class MastersStore extends ChangeNotifier {
   DateTime? _fetchedAt;
   int? _mastersVersion;
   bool _loading = false;
+
+  /// [{block_id, block_name, villages: [{village_id, village_name}]}]
+  List<Map<String, dynamic>> _geoBlocks = [];
+  bool _geoLoading = false;
 
   Map<String, dynamic>? get payload => _payload;
   bool get isLoaded => _payload != null;
@@ -49,6 +61,18 @@ class MastersStore extends ChangeNotifier {
     return const [];
   }
 
+  /// Medicine names from the server master (bootstrap). The requisition
+  /// and prescription pickers MUST offer only names the backend can match
+  /// — a hardcoded name the master lacks fails with
+  /// "No line matched a known medicine" (bug found live 2026-08-21).
+  List<String> medicineNames() {
+    return [
+      for (final r in masterRows('medicines'))
+        if ((r['name'] ?? r['medicine_name']) != null)
+          (r['name'] ?? r['medicine_name']).toString()
+    ];
+  }
+
   List<Map<String, dynamic>> masterRows(String key) {
     final v = masters?[key];
     if (v is List) {
@@ -57,12 +81,73 @@ class MastersStore extends ChangeNotifier {
     return const [];
   }
 
+  // ── Geography readers ──
+  bool get hasGeo => _geoBlocks.isNotEmpty;
+
+  /// Block names of the facility's district, sorted by the server.
+  List<String> get geoBlockNames =>
+      [for (final b in _geoBlocks) (b['block_name'] ?? '').toString()];
+
+  /// Villages of one block (by display name). Empty when unknown.
+  List<String> geoVillagesOf(String blockName) {
+    for (final b in _geoBlocks) {
+      if ((b['block_name'] ?? '').toString() == blockName) {
+        final vs = b['villages'];
+        if (vs is List) {
+          return [for (final v in vs) if (v is Map) (v['village_name'] ?? '').toString()];
+        }
+      }
+    }
+    return const [];
+  }
+
+  /// Village id for a (block name, village name) pair — needed by the
+  /// counsellor Register screen to preview village-boosted advisory
+  /// (user 2026-08-27). Returns null when unknown.
+  int? geoVillageId(String? blockName, String? villageName) {
+    if (blockName == null || villageName == null ||
+        blockName.isEmpty || villageName.isEmpty) return null;
+    for (final b in _geoBlocks) {
+      if ((b['block_name'] ?? '').toString() != blockName) continue;
+      final vs = b['villages'];
+      if (vs is! List) return null;
+      for (final v in vs) {
+        if (v is Map && (v['village_name'] ?? '').toString() == villageName) {
+          final id = v['village_id'];
+          if (id is int) return id;
+          if (id is num) return id.toInt();
+          return int.tryParse(id?.toString() ?? '');
+        }
+      }
+    }
+    return null;
+  }
+
+  /// Every village across the district — the Status search dropdown.
+  List<String> get geoAllVillages => [
+        for (final b in _geoBlocks)
+          if (b['villages'] is List)
+            for (final v in (b['villages'] as List))
+              if (v is Map) (v['village_name'] ?? '').toString()
+      ];
+
   /// Load the last cached payload from disk. Call on app start so the
   /// first frame of the shell doesn't wait for the network.
   Future<void> hydrate() async {
     final p = await SharedPreferences.getInstance();
     final raw = p.getString(_kBootstrap);
-    if (raw == null) return;
+    // Geography cache loads independently of the bootstrap payload so a
+    // partially-written cache can't blank both.
+    final geoRaw = p.getString(_kGeoBlocks);
+    if (geoRaw != null) {
+      try {
+        final decoded = jsonDecode(geoRaw);
+        if (decoded is List) {
+          _geoBlocks = [for (final e in decoded) if (e is Map) e.cast<String, dynamic>()];
+        }
+      } catch (_) { /* stale geo cache — next refresh rebuilds it */ }
+    }
+    if (raw == null) { if (_geoBlocks.isNotEmpty) notifyListeners(); return; }
     try {
       final decoded = jsonDecode(raw);
       if (decoded is Map) {
@@ -90,6 +175,11 @@ class MastersStore extends ChangeNotifier {
       await p.setString(_kBootstrap, jsonEncode(fresh));
       await p.setString(_kFetchedAt, _fetchedAt!.toIso8601String());
       if (_mastersVersion != null) await p.setInt(_kMastersVer, _mastersVersion!);
+      // Geography cascade rides on every successful bootstrap refresh —
+      // that includes the one fired right after login, which is where the
+      // district_id first becomes known (user rule 2026-08-13).
+      final districtId = (facility?['district_id'] as num?)?.toInt();
+      if (districtId != null) unawaited(refreshGeo(districtId));
     } catch (_) {
       // Bootstrap is best-effort at startup — a network hiccup should
       // not sign the user out. The cached payload keeps rendering.
@@ -99,14 +189,53 @@ class MastersStore extends ChangeNotifier {
     }
   }
 
+  /// Download the district's blocks + each block's villages and cache
+  /// them. Roughly 1 + N requests (N = blocks in district, typically
+  /// 5-15); villages fetch in parallel so wall-clock is one round trip
+  /// after the block list. Failures keep the previous cache.
+  Future<void> refreshGeo(int districtId) async {
+    if (_geoLoading) return;
+    _geoLoading = true;
+    try {
+      final blocks = await api.blocks(districtId);
+      final withVillages = await Future.wait(blocks.map((b) async {
+        final id = (b['block_id'] as num?)?.toInt();
+        List<Map<String, dynamic>> vs = const [];
+        if (id != null) {
+          try { vs = await api.villages(id); } catch (_) { /* keep empty */ }
+        }
+        return {
+          'block_id':   b['block_id'],
+          'block_name': b['block_name'],
+          'villages':   vs,
+        };
+      }));
+      if (withVillages.isNotEmpty) {
+        _geoBlocks = withVillages;
+        final p = await SharedPreferences.getInstance();
+        await p.setString(_kGeoBlocks, jsonEncode(_geoBlocks));
+        await p.setInt(_kGeoDistrict, districtId);
+        notifyListeners();
+      }
+    } catch (_) {
+      // Offline / server hiccup — cached (or hardcoded fallback) geo
+      // keeps the dropdowns usable.
+    } finally {
+      _geoLoading = false;
+    }
+  }
+
   Future<void> clear() async {
     final p = await SharedPreferences.getInstance();
     await p.remove(_kBootstrap);
     await p.remove(_kFetchedAt);
     await p.remove(_kMastersVer);
+    await p.remove(_kGeoBlocks);
+    await p.remove(_kGeoDistrict);
     _payload = null;
     _fetchedAt = null;
     _mastersVersion = null;
+    _geoBlocks = [];
     notifyListeners();
   }
 }

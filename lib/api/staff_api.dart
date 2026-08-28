@@ -13,12 +13,16 @@ class StaffApi {
     String? role,
     int? facilityId,
     bool? isActive,
+    bool? withLogin,
     int? limit,
   }) async {
     final res = await client.get('/staff', query: {
       if (role       != null) 'role':        role,
       if (facilityId != null) 'facility_id': facilityId,
       if (isActive   != null) 'is_active':   isActive,
+      // true = only staff with an active sign-in (collapses duplicate
+      // seed rows; the doctor-assignment dropdown uses this).
+      if (withLogin  != null) 'with_login':  withLogin,
       if (limit      != null) 'limit':       limit,
     });
     if (res is List) {

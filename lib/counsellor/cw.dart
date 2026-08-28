@@ -171,7 +171,11 @@ class CField extends StatelessWidget {
   final String label;
   final Widget child;
   final bool required;
-  const CField(this.label, this.child, {super.key, this.required = false});
+  // Labels are uppercased by default; pass upper:false to show the
+  // label exactly as written (user 2026-08-26: "Who", not "WHO").
+  final bool upper;
+  const CField(this.label, this.child,
+      {super.key, this.required = false, this.upper = true});
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -180,7 +184,7 @@ class CField extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.only(bottom: 4),
           child: RichText(text: TextSpan(
-            text: label.toUpperCase(),
+            text: upper ? label.toUpperCase() : label,
             style: _t(11.5, FontWeight.w600, C2.text2),
             children: required ? [TextSpan(text: ' *', style: _t(11.5, FontWeight.w700, C2.danger))] : null,
           )),
@@ -373,6 +377,12 @@ class SearchDropdown extends StatelessWidget {
     final disabled = items.isEmpty;
     return InkWell(
       onTap: disabled ? null : () async {
+        // Drop primary focus BEFORE opening the sheet. Without this the
+        // framework hands focus back to the last-focused TextField when
+        // the sheet closes, and the enclosing scroll view auto-scrolls
+        // up to reveal it — the form "jumped to top" whenever the
+        // Doctor / Block / Village picker was used (user bug 2026-08-14).
+        FocusManager.instance.primaryFocus?.unfocus();
         final picked = await showModalBottomSheet<String>(
           context: context,
           isScrollControlled: true,
@@ -530,4 +540,50 @@ class _TimeFieldState extends State<TimeField> {
       ),
     );
   }
+}
+
+/// Root-level back press → exit confirmation (user 2026-08-23 "are you
+/// sure want to exit"). Returns true only when the user picks Exit.
+Future<bool> confirmExit(BuildContext context) async {
+  final yes = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: C2.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      content: Text('Do you want to exit the application?',
+          style: ct(13, FontWeight.w400, C2.text)),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Yes', style: ct(13, FontWeight.w700, C2.danger))),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('No', style: ct(13, FontWeight.w600, C2.text2))),
+      ],
+    ),
+  );
+  return yes ?? false;
+}
+
+/// Logout confirmation (user 2026-08-25 "show confirmation popup on
+/// logout for all roles"). Returns true when the user picks Log out.
+Future<bool> confirmLogout(BuildContext context) async {
+  final yes = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: C2.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      content: Text('Are you sure you want to log out?',
+          style: ct(13, FontWeight.w400, C2.text)),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Yes', style: ct(13, FontWeight.w700, C2.danger))),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('No', style: ct(13, FontWeight.w600, C2.text2))),
+      ],
+    ),
+  );
+  return yes ?? false;
 }

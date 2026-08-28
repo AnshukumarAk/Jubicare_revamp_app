@@ -27,7 +27,7 @@ class DevicesApi {
 
   /// POST /devices/status — submit a bulk status report for a single
   /// date. Each line carries `{device_id, status}` where status is one
-  /// of Working / Not Working / Not Applicable / Purchase Requested.
+  /// of Working / Not Working / Not Applicable.
   Future<Map<String, dynamic>> submitStatus({
     required String date, // yyyy-mm-dd
     required List<Map<String, dynamic>> lines,

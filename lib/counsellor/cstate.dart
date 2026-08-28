@@ -27,7 +27,10 @@ class RxItem {
   int qty;
   int dispensedQty;
   bool dispensed;
-  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '5 Days', this.interval = 'TDS', this.qty = 10, int? dispensedQty, this.dispensed = false})
+  // No default duration (user rule 2026-08-16): the doctor must enter
+  // the day count explicitly — pre-filling "5 Days" left rows silently
+  // wrong and read as a required-field error.
+  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '', this.interval = 'TDS', this.qty = 0, int? dispensedQty, this.dispensed = false})
       : dispensedQty = dispensedQty ?? qty;
 }
 
@@ -100,7 +103,16 @@ class CPatient {
   String status;
   Map<String, String> vitals;
   bool pregnant;
-  String remarks; // counsellor remarks
+  // Pregnancy dates from the server row (ISO yyyy-mm-dd, '' = none) — the
+  // Re-Appointment prefill re-selects LMP/EDD from these (user 2026-08-21
+  // "lmp or edd date is not showing selected").
+  String lmpDate;
+  String eddDate;
+  String remarks; // counsellor remarks (English-first for DISPLAY)
+  /// The remarks exactly as dictated (Hindi when spoken Hindi) — INPUT
+  /// fields prefill from this, never from the English display copy
+  /// (user 2026-08-22 "dont show english version in inputs").
+  String remarksOriginal;
   String pastHistory; // chronic illness / surgeries / ongoing treatment
   String uploadedRx; // prescription file/image uploaded by counsellor (filename)
   List<Attachment> attachments; // multi-attachment (Prescription/Report/Other)
@@ -123,11 +135,18 @@ class CPatient {
   /// use this to lazy-fetch full appointment data (symptoms,
   /// diagnoses, vitals) that the list endpoint doesn't return.
   int? backendAppointmentId;
+  /// Backend patient_id — used by the Re-Appointment submit to tell
+  /// `/mobile/sync/push` "attach a new appointment to THIS patient,
+  /// don't insert a duplicate patient row" (user rule 2026-08-16).
+  int? backendPatientId;
   /// medicine_count from the queue row. The queue payload carries no
   /// prescription lines, only their count, so lists can show "3 meds"
   /// without a per-patient fetch. `prescription` stays authoritative once
   /// the detail screen has loaded it.
   int medicineCount;
+  /// Doctor the last visit was assigned to (staff_name) — filled by the
+  /// detail hydrate; Re-Appointment prefill re-selects them.
+  String? assignedDoctor;
 
   CPatient({
     required this.id,
@@ -148,7 +167,10 @@ class CPatient {
     this.status = 'registered',
     Map<String, String>? vitals,
     this.pregnant = false,
+    this.lmpDate = '',
+    this.eddDate = '',
     this.remarks = '',
+    this.remarksOriginal = '',
     this.pastHistory = '',
     this.uploadedRx = '',
     List<Attachment>? attachments,
@@ -164,6 +186,7 @@ class CPatient {
     this.pin = '',
     this.address = '',
     this.backendAppointmentId,
+    this.backendPatientId,
     this.medicineCount = 0,
   })  : symptoms = symptoms ?? [],
         vitals = vitals ?? {},
@@ -265,6 +288,9 @@ class ReqLine {
   // Set when Zonal Incharge adds a medicine that pharma didn't originally request.
   bool isZonalAdded;
   String status; // 'Pending' | 'Approved' | 'Rejected' | 'Received' | 'Partial'
+  /// Server row id from GET /requisitions/{id} lines — what
+  /// PATCH /requisitions/{id}/receive addresses its receipts to.
+  final int? backendLineId;
   ReqLine({
     required this.name, this.dosage = '', this.unit = 'Strip',
     required this.requested,
@@ -272,6 +298,7 @@ class ReqLine {
     this.approvedQty = -1, this.zonalRemark = '',
     this.isZonalAdded = false,
     this.status = 'Pending',
+    this.backendLineId,
   });
 }
 
@@ -289,18 +316,28 @@ class AuditEntry {
 ///   pending_zi → approved (partial or full) → verified
 /// or pending_zi → rejected (terminal).
 class Requisition {
-  final String id;      // REQ-YYYYMMDD-NNN, unique per submission
+  final String id;      // Display id — either REQ-YYYYMMDD-NNN (legacy) or REQ-<serverId>
   final String date;    // display date (dd-MM-yyyy)
   String status;
   String zonalRemark;     // overall Zonal Incharge note (per-line notes live on ReqLine)
   String invoicePath;   // local path to invoice PDF/image (verification)
   final List<ReqLine> items; // both pharma-requested + Zonal Incharge-added rows
   final List<AuditEntry> audit;
+  /// Server row id, present iff the row came from GET /requisitions.
+  /// Used by lazy detail fetch, review, receive endpoints.
+  final int? backendId;
+  /// Line summary from the list endpoint — shown as "N medicines · X qty"
+  /// until full lines are loaded via detail fetch.
+  final int? backendLineCount;
+  final int? backendRequestedTotal;
   Requisition({
     required this.id, required this.date, required this.status,
     required this.items,
     this.zonalRemark = '', this.invoicePath = '',
     List<AuditEntry>? audit,
+    this.backendId,
+    this.backendLineCount,
+    this.backendRequestedTotal,
   }) : audit = audit ?? [];
 
   // Convenience filters so the UI can render the four required sections
@@ -395,6 +432,42 @@ class CounsellorState extends ChangeNotifier {
     final p = _prefillPatient;
     _prefillPatient = null;
     return p;
+  }
+
+  // Abandoned re-appointment cleanup (user bug report 2026-08-13): the
+  // counsellor opened Re-Appointment (form prefilled), backed out without
+  // submitting, then came to Register for a NEW patient — and found the
+  // old patient's data still in the form. The shell raises this flag on
+  // every NORMAL entry into the Register tab (bottom nav / "Register New
+  // Patient" button, i.e. no fresh prefill pending); the form consumes it
+  // and resets itself ONLY if it is still holding re-appointment residue.
+  // A half-typed normal registration is never wiped.
+  bool _clearAbandonedReAppointment = false;
+  void requestAbandonedReAppointmentClear() {
+    _clearAbandonedReAppointment = true;
+    notifyListeners();
+  }
+  bool consumeAbandonedReAppointmentClear() {
+    final v = _clearAbandonedReAppointment;
+    _clearAbandonedReAppointment = false;
+    return v;
+  }
+
+  /// Full Register form reset flag (user rule 2026-08-16): fired when
+  /// the counsellor navigates AWAY from the Register tab in-app (tab
+  /// switch OR back button). Consumed on the next Register mount to
+  /// blank every field. NOT fired on AppLifecycleState changes — a
+  /// quick trip to WhatsApp / minimising the app must preserve
+  /// half-typed values.
+  bool _clearRegisterOnReturn = false;
+  void requestRegisterFullReset() {
+    _clearRegisterOnReturn = true;
+    notifyListeners();
+  }
+  bool consumeRegisterFullReset() {
+    final v = _clearRegisterOnReturn;
+    _clearRegisterOnReturn = false;
+    return v;
   }
 
   // "Re-Appointment" pending-switch flag (2026-07-31). Written when the
@@ -634,6 +707,23 @@ class CounsellorState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Drop the doctor's local row for [date] — used when a refresh finds
+  /// the server no longer has an attendance record for today (admin
+  /// deleted it), so the phone reflects the server truth instead of
+  /// keeping a stale check-in on screen (user 2026-08-25).
+  void removeDoctorAttendanceOn(String date) {
+    final n = doctorAttendance.length;
+    doctorAttendance.removeWhere((r) => r.date == date);
+    if (doctorAttendance.length != n) notifyListeners();
+  }
+
+  /// Pharmacist counterpart of [removeDoctorAttendanceOn].
+  void removePharmaAttendanceOn(String date) {
+    final n = pharmaAttendance.length;
+    pharmaAttendance.removeWhere((r) => r.date == date);
+    if (pharmaAttendance.length != n) notifyListeners();
+  }
+
   /// Close the doctor's open shift by replacing it with the given closed
   /// record. Used at Check-Out time (rule 2026-08-05) so the check-in +
   /// check-out land on a single row instead of two separate ones.
@@ -653,32 +743,156 @@ class CounsellorState extends ChangeNotifier {
   }
 
   // ----- Pharmacist: requisitions, denials, attendance -----
-  final List<Requisition> requisitions = [
-    Requisition(
-      id: 'REQ-20260606-001',
-      date: '06-06-2026', status: 'verified',
-      zonalRemark: 'Approved as requested. Please verify batches on receipt.',
+  // No seed — populated by GET /api/requisitions on the pharmacist
+  // Stock tab (user rule 2026-08-16). Local Requisition rows persist
+  // alongside backend ones for offline-submitted work not yet drained.
+  final List<Requisition> requisitions = [];
+  bool loadingRequisitions = false;
+  String? requisitionsError;
+
+  void setRequisitionsLoading(bool loading, {String? error}) {
+    loadingRequisitions = loading;
+    if (loading) requisitionsError = null;
+    if (error != null) requisitionsError = error;
+    notifyListeners();
+  }
+
+  /// Replace the requisitions list with rows fetched from
+  /// GET /api/requisitions. Local-only requisitions (backendId == null)
+  /// are preserved — they haven't landed on the server yet.
+  void applyBackendRequisitions(List<Map<String, dynamic>> rows) {
+    final localOnly = requisitions.where((r) => r.backendId == null).toList();
+    requisitions
+      ..clear()
+      ..addAll(rows.map(_reqFromBackendRow))
+      ..addAll(localOnly);
+    // Newest first (dd-MM-yyyy tricky to sort → use backendId when present).
+    requisitions.sort((a, b) {
+      final ai = a.backendId ?? -1;
+      final bi = b.backendId ?? -1;
+      return bi.compareTo(ai);
+    });
+    requisitionsError = null;
+    notifyListeners();
+  }
+
+  /// Wipe every user-scoped list on logout so the next signed-in user
+  /// never sees the previous one's cached rows (user rule 2026-08-16 —
+  /// "Anshu counsellor kaa data Divya ko nahi dikhna chahiye"). Called
+  /// from every logout handler before AppState.logout().
+  void resetForNewUser() {
+    patients.clear();
+    requisitions.clear();
+    pharmaAttendance.clear();
+    deniedDeliveries.clear();
+    attendanceRecords.clear();
+    doctorAttendance.clear();
+    _reorderTemplate = null;
+    refreshing = false;
+    lastRefreshError = null;
+    loadingRequisitions = false;
+    requisitionsError = null;
+    notifyListeners();
+  }
+
+  /// Update ONE requisition after GET /api/requisitions/{id} lands —
+  /// swaps in the full line list without touching other rows.
+  void replaceRequisitionLines(int backendId, List<ReqLine> lines) {
+    final idx = requisitions.indexWhere((r) => r.backendId == backendId);
+    if (idx < 0) return;
+    final r = requisitions[idx];
+    requisitions[idx] = Requisition(
+      id: r.id, date: r.date, status: r.status,
+      items: lines,
+      zonalRemark: r.zonalRemark, invoicePath: r.invoicePath,
+      audit: r.audit,
+      backendId: r.backendId,
+      backendLineCount: r.backendLineCount,
+      backendRequestedTotal: r.backendRequestedTotal,
+    );
+    notifyListeners();
+  }
+
+  Requisition _reqFromBackendRow(Map<String, dynamic> r) {
+    final rid = (r['requisition_id'] as num?)?.toInt() ?? 0;
+    final iso = (r['requisition_date'] ?? '').toString();
+    final dateStr = _fmtIsoDate(iso);
+    final serverStatus = (r['status'] ?? 'Requested').toString();
+    final audit = <AuditEntry>[];
+    final createdRaw = r['created_at']?.toString();
+    if (createdRaw != null) {
+      final t = DateTime.tryParse(createdRaw);
+      if (t != null) {
+        audit.add(AuditEntry(
+          when: t.toLocal(),
+          actor: (r['raised_by_name'] ?? 'Pharmacist').toString(),
+          action: 'Submitted requisition',
+        ));
+      }
+    }
+    final reviewedRaw = r['reviewed_at']?.toString();
+    if (reviewedRaw != null) {
+      final t = DateTime.tryParse(reviewedRaw);
+      if (t != null) {
+        audit.add(AuditEntry(
+          when: t.toLocal(),
+          actor: (r['reviewed_by_name'] ?? 'Zonal Incharge').toString(),
+          action: 'Reviewed ($serverStatus)',
+        ));
+      }
+    }
+    return Requisition(
+      id: 'REQ-$rid',
+      date: dateStr,
+      status: _mapServerReqStatus(serverStatus),
+      zonalRemark: (r['remarks'] ?? '').toString(),
+      // Server-side invoice file name — without it the detail page's invoice
+      // button forgets the upload after every refresh and shows "Upload
+      // Invoice" again on verified requisitions.
+      invoicePath: (r['invoice_path'] ?? '').toString(),
+      // The list endpoint sends full lines — parse them right away so the
+      // Past cards can show medicine names without a detail round-trip
+      // (user 2026-08-21).
       items: [
-        ReqLine(name: 'Paracetamol', dosage: '500', unit: 'Tab', requested: 200, dispatched: 200, received: 200, approvedQty: 200, status: 'Received'),
-        ReqLine(name: 'ORS Sachets', dosage: '', unit: 'Sachet', requested: 100, dispatched: 100, received: 60, approvedQty: 100, status: 'Partial'),
+        for (final l in (r['lines'] as List? ?? const []))
+          if (l is Map) reqLineFromBackend(l.cast<String, dynamic>()),
       ],
-      audit: [
-        AuditEntry(when: DateTime(2026, 6, 6, 9, 30),  actor: 'Pharmacist', action: 'Submitted requisition'),
-        AuditEntry(when: DateTime(2026, 6, 6, 11, 15), actor: 'Zonal Incharge', action: 'Approved (full)'),
-        AuditEntry(when: DateTime(2026, 6, 7, 15, 20), actor: 'Pharmacist', action: 'Verified receipt', note: 'ORS partial: 60/100'),
-      ]),
-    Requisition(
-      id: 'REQ-20260609-001',
-      date: '09-06-2026', status: 'pending_zi',
-      items: [
-        ReqLine(name: 'Cetirizine',   dosage: '10',  unit: 'Tab', requested: 50, status: 'Pending'),
-        ReqLine(name: 'Azithromycin', dosage: '500', unit: 'Tab', requested: 30, status: 'Pending'),
-      ],
-      audit: [
-        AuditEntry(when: DateTime(2026, 6, 9, 10, 0), actor: 'Pharmacist', action: 'Submitted requisition'),
-        AuditEntry(when: DateTime(2026, 6, 9, 10, 0), actor: 'System',     action: 'Email sent to Zonal Incharge'),
-      ]),
-  ];
+      audit: audit,
+      backendId: rid,
+      backendLineCount: (r['line_count'] as num?)?.toInt(),
+      backendRequestedTotal: (r['requested_total'] as num?)?.toInt(),
+    );
+  }
+
+  /// Map server enum → UI-friendly slug the existing chip renderer knows.
+  /// Case-insensitive: after receipt the list endpoint sends the
+  /// mobile_extra stage ("received", lowercase) instead of the
+  /// Requisition.status enum ("Received") — both must land on 'verified',
+  /// otherwise the chip falls through to its default "Pending" label.
+  static String _mapServerReqStatus(String s) => switch (s.trim().toLowerCase()) {
+        'requested' || 'pending'                 => 'pending_zi',
+        'approved'                                => 'approved',
+        'partial'                                 => 'partial',
+        'rejected'                                => 'rejected',
+        'received' || 'delivered' || 'verified'  => 'verified',
+        _ => s.toLowerCase(),
+      };
+
+  /// Map a GET /requisitions/{id} `lines` entry into the local ReqLine
+  /// shape used by the Past + Overall Status panels.
+  static ReqLine reqLineFromBackend(Map<String, dynamic> l) => ReqLine(
+        name: (l['medicine_name'] ?? '').toString(),
+        dosage: (l['dosage'] ?? '').toString(),
+        unit: 'Strip',
+        requested: (l['requested_qty'] as num?)?.toInt() ?? 0,
+        dispatched: (l['dispatched_qty'] as num?)?.toInt() ?? 0,
+        received: (l['received_qty'] as num?)?.toInt() ?? 0,
+        approvedQty: (l['approved_qty'] as num?)?.toInt() ?? -1,
+        zonalRemark: (l['review_note'] ?? '').toString(),
+        isZonalAdded: (l['added_by_cmo'] as bool?) ?? false,
+        status: (l['status'] ?? 'Pending').toString(),
+        backendLineId: (l['requisition_line_id'] as num?)?.toInt(),
+      );
   final List<DeniedDelivery> deniedDeliveries = [];
   final List<AttendanceRecord> pharmaAttendance = [];
 
@@ -822,8 +1036,12 @@ class CounsellorState extends ChangeNotifier {
   static const _doctorDoneStatuses = {
     'with_counsellor', 'with_lab', 'with_pharma', 'completed',
   };
+  /// Latest action first (user 2026-08-22): newest appointment id leads;
+  /// local rows still syncing (no id yet) sit on top.
   List<CPatient> get doctorAttended =>
-      patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList();
+      patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList()
+        ..sort((a, b) => (b.backendAppointmentId ?? 1 << 30)
+            .compareTo(a.backendAppointmentId ?? 1 << 30));
   int get doctorCompleted => doctorAttended.length;
 
   /// Every patient the doctor has interacted with in the last 7 days —
@@ -913,6 +1131,19 @@ class CounsellorState extends ChangeNotifier {
   void mergeBackendPatients(List<Map<String, dynamic>> queueRows, {String? statusOverride}) {
     // Drop the previous backend snapshot — replace, don't accumulate.
     patients.removeWhere((p) => p.id.startsWith('B'));
+    // Also drop locally-added rows ('P…') whose registration has landed on
+    // the server — the incoming backend row is the authoritative copy.
+    // Without this the counsellor sees the same patient twice after a
+    // successful sync: the optimistic local "Waiting" row AND the server
+    // "With Doctor" row (user bug report 2026-08-13). Contact number is
+    // the match key — the form requires it and the server dedups on it.
+    final backendContacts = {
+      for (final row in queueRows)
+        if ((row['contact_number'] as String?)?.isNotEmpty == true)
+          row['contact_number'] as String,
+    };
+    patients.removeWhere(
+        (p) => p.id.startsWith('P') && backendContacts.contains(p.contact));
     for (final row in queueRows.reversed) {
       final patientId = row['patient_id'];
       if (patientId == null) continue;
@@ -951,10 +1182,31 @@ class CounsellorState extends ChangeNotifier {
         // Carry the appointment_id from the queue row so the detail
         // screen can lazy-fetch vitals + remarks + Rx via
         // /api/appointments/{id} (symptoms + primary diagnosis now come
-        // with the list already).
+        // with the list already). patient_id also rides along so the
+        // Re-Appointment submit can tell the backend "attach to this
+        // patient, don't insert a duplicate" (user rule 2026-08-16).
         backendAppointmentId: (row['appointment_id'] as num?)?.toInt(),
+        backendPatientId: (row['patient_id'] as num?)?.toInt(),
         medicineCount: (row['medicine_count'] as num?)?.toInt() ?? 0,
+        // Pregnancy block, when the list row carries it — otherwise the
+        // detail hydrate fills these in before Re-Appointment prefill.
+        pregnant: (row['pregnant'] as bool?) ?? false,
+        lmpDate: (row['lmp_date'] as String?) ?? '',
+        eddDate: (row['edd_date'] as String?) ?? '',
       );
+      // Optimistic shield: a local submit already moved this case forward;
+      // a stale server snapshot must not drag it back into the queue.
+      final apptId = adapted.backendAppointmentId;
+      final optimistic = apptId != null ? _optimisticStatus[apptId] : null;
+      if (optimistic != null) {
+        final serverRank = _statusRank[adapted.status] ?? 0;
+        final localRank = _statusRank[optimistic] ?? 0;
+        if (serverRank >= localRank) {
+          _optimisticStatus.remove(apptId); // server caught up
+        } else {
+          adapted.status = optimistic;
+        }
+      }
       patients.insert(0, adapted);
     }
     notifyListeners();
@@ -983,20 +1235,57 @@ class CounsellorState extends ChangeNotifier {
     return _fmtIsoDate(iso);
   }
 
+  /// Optimistic status shield (user bug 2026-08-22 "submitted but not
+  /// removing from the queue until refresh"): a background refresh that
+  /// races the sync push can pull a snapshot where the case is still
+  /// with_doctor and resurrect the row. Local actions record their status
+  /// here; mergeBackendPatients keeps it until the SERVER status catches
+  /// up (equal or further along the ladder), then forgets it.
+  final Map<int, String> _optimisticStatus = {};
+  static const Map<String, int> _statusRank = {
+    'registered': 0, 'with_doctor': 1, 'payment_pending': 2,
+    'with_counsellor': 2, 'with_lab': 3, 'with_pharma': 4, 'completed': 5,
+  };
+
+  /// The row currently IN the list for this patient. A background refresh
+  /// while a detail/case screen is open REPLACES list rows with fresh
+  /// objects — mutating only the (now stale) object the screen holds left
+  /// the visible row unchanged, so the queue "didn't shift until refresh"
+  /// (user bug 2026-08-22).
+  CPatient _liveRow(CPatient p) => patients.firstWhere(
+        (x) =>
+            identical(x, p) ||
+            (p.backendAppointmentId != null &&
+                x.backendAppointmentId == p.backendAppointmentId) ||
+            x.id == p.id,
+        orElse: () => p,
+      );
+
   void doctorSubmit(CPatient p, {required String disease, required List<RxItem> rx, required List<String> tests, String observations = '', String remarks = ''}) {
-    p.disease = disease;
-    p.prescription = rx;
-    p.tests = tests;
-    p.observations = observations;
-    p.doctorRemarks = remarks;
-    p.status = rx.isNotEmpty ? 'with_pharma' : 'completed';
+    final status = rx.isNotEmpty ? 'with_pharma' : 'completed';
+    for (final t in {p, _liveRow(p)}) {
+      t.disease = disease;
+      t.prescription = rx;
+      t.tests = tests;
+      t.observations = observations;
+      t.doctorRemarks = remarks;
+      t.status = status;
+    }
+    if (p.backendAppointmentId != null) {
+      _optimisticStatus[p.backendAppointmentId!] = status;
+    }
     notifyListeners();
   }
 
   void pharmacistDispense(CPatient p) {
-    p.status = 'completed';
-    for (final m in p.prescription) {
-      m.dispensed = true;
+    for (final t in {p, _liveRow(p)}) {
+      t.status = 'completed';
+      for (final m in t.prescription) {
+        m.dispensed = true;
+      }
+    }
+    if (p.backendAppointmentId != null) {
+      _optimisticStatus[p.backendAppointmentId!] = 'completed';
     }
     notifyListeners();
   }

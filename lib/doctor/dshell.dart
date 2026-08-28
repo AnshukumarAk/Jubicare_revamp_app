@@ -2,25 +2,39 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:geolocator/geolocator.dart';
 import 'package:provider/provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../api/attendance_api.dart';
 import '../api/auth_api.dart';
+import '../api/camps_api.dart';
+import '../api/masters_store.dart';
 import '../api/queues_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
+import '../counsellor/screens_dashboard.dart' show kUploadsBase;
+import '../counsellor/shell.dart' show SyncStatusIcon, ShellRefreshButton, NotificationsBell;
+import '../services/attendance_store.dart';
+import '../services/patients_cache_store.dart';
 import '../services/connectivity_service.dart';
+import '../services/deepgram_stt.dart';
+import '../services/fcm_service.dart';
+import '../services/terminology_store.dart';
+import '../services/notifications_service.dart';
 import '../screens/unified_login.dart';
 import '../state/app_state.dart';
+import '../widgets/pending_alert.dart';
 import '../widgets/attendance_capture.dart';
+import '../services/back_form_registry.dart';
+import '../widgets/photo_lightbox.dart';
 import 'dcase.dart';
 import 'patient_history.dart';
-import 'voice.dart';
 
 /// Doctor module shell — 2.0 white header (official logo + profile) and a
 /// bottom nav (Home / Case / Report / Attend). Uses the shared CounsellorState.
@@ -36,6 +50,10 @@ class _DoctorShellState extends State<DoctorShell> {
   // Lets the shell poke the dashboard when Home is re-selected or pulled
   // down. Same library, so the private State type is reachable here.
   final _dashboardKey = GlobalKey<_DoctorDashboardState>();
+  // Visited-tab history — Android back button walks it backwards so
+  // "back" from Attend lands on Home instead of closing the app
+  // (user bug 2026-08-16: doctor tap → Attend → back = app closes).
+  final List<int> _tabHistory = [0];
   static const _nav = [
     (Icons.grid_view_rounded, 'Home'),
     (Icons.medical_services_outlined, 'Case'),
@@ -43,10 +61,46 @@ class _DoctorShellState extends State<DoctorShell> {
     (Icons.event_available_outlined, 'Attend'),
   ];
   void _go(int i) {
+    if (_tab != i) {
+      _tabHistory.remove(i);
+      _tabHistory.add(i);
+    }
     setState(() => _tab = i);
     // Coming back to Home from Case/Attend is a natural moment to re-check
     // the queue. Throttled inside the dashboard so tab-tapping can't spam it.
     if (i == 0) _dashboardKey.currentState?.refreshOnReturn();
+  }
+
+  /// PopScope handler — rewind through visited tabs instead of closing
+  /// the app (same pattern as counsellor shell). Returns true if the
+  /// back gesture was absorbed.
+  bool _handleBack() {
+    // Open check-in/out form on the Attend tab eats the first back press
+    // (user 2026-08-21 — back must show the attend list, not the last tab).
+    if (_tab == 2 && BackFormRegistry.close('doc.attend')) return true;
+    if (_tabHistory.length <= 1) return false; // let system close the app
+    _tabHistory.removeLast();
+    setState(() => _tab = _tabHistory.last);
+    return true;
+  }
+
+  final _attendRefresh = ValueNotifier(0);
+
+  /// One refresh path for the app-bar button AND pull-to-refresh: online
+  /// check first, then the CURRENT tab's server data. The offline sync
+  /// queue is never touched (user rule 2026-08-21).
+  Future<void> _refreshCurrentTab() async {
+    if (!mounted || !context.read<ConnectivityService>().isOnline) return;
+    // Masters + terminology also refresh on the app-bar/pull refresh so
+    // any new medicine, symptom, block/village or clinical-sheet update
+    // reaches the app without a re-login (user 2026-08-25).
+    unawaited(context.read<MastersStore>().refresh());
+    unawaited(context.read<TerminologyStore>().refresh());
+    if (_tab == 2) {
+      _attendRefresh.value++;
+    } else {
+      await _dashboardKey.currentState?.refreshNow();
+    }
   }
 
   @override
@@ -57,32 +111,43 @@ class _DoctorShellState extends State<DoctorShell> {
           active: _tab == 0, onOpenCase: () => _go(1)),
       const DoctorCaseList(),
       // DoctorReport removed 2026-08-05 per user rule.
-      const DoctorAttendance(),
+      DoctorAttendance(refreshSignal: _attendRefresh),
     ];
     const pad = EdgeInsets.fromLTRB(14, 14, 14, 24);
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
-      child: Scaffold(
+      child: PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, _) async {
+          if (didPop) return;
+          if (_handleBack()) return;
+          // Root of the app — confirm before closing (user 2026-08-23).
+          if (await confirmExit(context)) SystemNavigator.pop();
+        },
+        child: Scaffold(
         backgroundColor: C2.bg,
         body: Column(children: [
-          DocHeader(initials: initials, userName: widget.userName, role: 'Doctor'),
+          DocHeader(initials: initials, userName: widget.userName, role: 'Doctor',
+            // Doctor's data lives on DoctorDashboard's state — expose its
+            // refreshNow via the GlobalKey we already hold.
+            onRefresh: _refreshCurrentTab),
           Expanded(child: IndexedStack(index: _tab, children: [
             // Home gets pull-to-refresh: the counsellor registers on a
             // different handset, so nothing on this device can know a new
             // patient exists until we ask. AlwaysScrollable so the gesture
             // works even when the queue is short enough not to overflow.
-            RefreshIndicator(
-              onRefresh: () async => _dashboardKey.currentState?.refreshNow(),
-              child: SingleChildScrollView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: pad,
-                child: pages[0]),
-            ),
-            for (final p in pages.skip(1))
-              SingleChildScrollView(padding: pad, child: p),
+            for (final p in pages)
+              RefreshIndicator(
+                onRefresh: _refreshCurrentTab,
+                child: SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: pad,
+                  child: p),
+              ),
           ])),
         ]),
         bottomNavigationBar: DocBottomNav(items: _nav, current: _tab, onTap: _go),
+      ),
       ),
     );
   }
@@ -91,7 +156,12 @@ class _DoctorShellState extends State<DoctorShell> {
 /// Shared 2.0 header (logo + bell + profile avatar) reused by doctor/pharmacist.
 class DocHeader extends StatelessWidget {
   final String initials, userName, role;
-  const DocHeader({super.key, required this.initials, required this.userName, required this.role});
+  /// Optional refresh callback — when provided, the app bar shows a
+  /// refresh icon that re-pulls the shell's data. Doctor + pharmacist
+  /// shells wire their own (user rule 2026-08-16: manual refresh in
+  /// every app bar so internet drops don't force an app restart).
+  final Future<void> Function()? onRefresh;
+  const DocHeader({super.key, required this.initials, required this.userName, required this.role, this.onRefresh});
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -109,6 +179,16 @@ class DocHeader extends StatelessWidget {
             child: Row(children: [
               Image.asset('assets/jubicare_logo.png', height: 30, fit: BoxFit.contain),
               const Spacer(),
+              // Sync status icon (same as counsellor shell — user rule
+              // 2026-08-14: sync UI belongs in the app bar, not the body).
+              const SyncStatusIcon(),
+              const SizedBox(width: 10),
+              if (onRefresh != null) ...[
+                ShellRefreshButton(onRefresh: onRefresh!),
+                const SizedBox(width: 10),
+              ],
+              const NotificationsBell(),
+              const SizedBox(width: 12),
               GestureDetector(
                 onTap: () => _menu(context),
                 child: Container(
@@ -135,13 +215,19 @@ class DocHeader extends StatelessWidget {
               onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => SimpleProfile(name: userName, role: role))); }),
             ListTile(leading: const Icon(Icons.logout, color: C2.navy),
               title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
-              onTap: () {
+              onTap: () async {
                 Navigator.pop(context);
+                if (!await confirmLogout(context)) return;
+                if (!context.mounted) return;
                 // Best-effort backend logout (v2 §1.3).
                 unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                // Clear session state and route back to the unified login.
-                // pushAndRemoveUntil is required because pushReplacement chained
-                // the previous routes off the stack — nothing to pop back to.
+                // Kill FCM so pushes stop coming for the old user
+                // (bug 2026-08-20).
+                unawaited(FcmService.instance
+                    .unregister(context.read<ApiClient>())
+                    .catchError((_) {}));
+                // Wipe user-scoped lists (user rule 2026-08-16).
+                context.read<CounsellorState>().resetForNewUser();
                 context.read<AppState>().logout();
                 Navigator.of(context).pushAndRemoveUntil(
                   MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
@@ -217,11 +303,22 @@ class _DoctorDashboardState extends State<DoctorDashboard>
   /// Pull-to-refresh bypasses this — that one is the doctor asking directly.
   static const _minGap = Duration(seconds: 10);
 
+  StreamSubscription<void>? _fcmDashSub;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshFromBackend(immediate: true));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _hydratePatientsFromCache();
+      _refreshFromBackend(immediate: true);
+    });
+    // Cross-device wake-up (user 2026-08-22): the counsellor's register
+    // fires an FCM push from the server — re-pull the queue immediately
+    // instead of waiting for the 30 s poll.
+    _fcmDashSub = FcmService.instance.onMessageReceived.listen((_) {
+      if (mounted) _refreshFromBackend();
+    });
     _poll = Timer.periodic(_pollEvery, (_) {
       // Quiet unless Home is actually showing, the app is foregrounded and
       // there's a network — no point burning field data in someone's pocket.
@@ -261,6 +358,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
   @override
   void dispose() {
     _poll?.cancel();
+    _fcmDashSub?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _sync?.removeListener(_onSyncTick);
     super.dispose();
@@ -277,6 +375,20 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     }
   }
 
+  String get _doctorCacheKey {
+    final app = context.read<AppState>();
+    return 'doctor_${app.backendUserId ?? app.currentUser}';
+  }
+
+  Future<void> _hydratePatientsFromCache() async {
+    try {
+      final store = await PatientsCacheStore.open();
+      final rows = store.load(_doctorCacheKey);
+      if (rows.isEmpty || !mounted) return;
+      context.read<CounsellorState>().mergeBackendPatients(rows);
+    } catch (_) {/* first run — nothing cached yet */}
+  }
+
   Future<void> _refreshFromBackend({bool immediate = false}) async {
     if (_refreshing || !mounted) return;
     final last = _lastFetchAt;
@@ -287,34 +399,34 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     setState(() { _refreshing = true; _lastError = null; });
     try {
       final api = context.read<QueuesApi>();
-      // Pull queue + attended in one shot so the tiles + lists stay
-      // consistent with the same server-side snapshot.
-      final queue = await api.doctorQueue(limit: 200);
-      final attended = await api.doctorAttended(limit: 200);
-      // /queues/doctor covers registered+with_doctor and /queues/doctor/attended
-      // covers with_pharma+completed — nothing returns the two rungs in between.
-      // A case the doctor sent for tests sits at with_counsellor (awaiting test
-      // payment) then with_lab, so without these two calls it disappears from
-      // the dashboard entirely instead of counting as attended. Both are
-      // facility-scoped like the others.
-      final awaitingPayment = await api.pendingPayment(limit: 200);
-      final atLab = await api.labQueue(limit: 200);
+      // Silent-on-failure (user 2026-08-26: banner didn't clear even
+      // after server came back). Cached list stays on screen; retry is
+      // one tap away. Primary queue failure returns early — banner was
+      // already cleared at start.
+      QueueList queue;
+      try {
+        queue = await api.doctorQueue(limit: 200);
+      } catch (_) {
+        return;
+      }
+      Future<QueueList> safe(Future<QueueList> f) =>
+          f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
+      final results = await Future.wait([
+        safe(api.doctorAttended(limit: 200)),
+        safe(api.pendingPayment(limit: 200)),
+        safe(api.labQueue(limit: 200)),
+      ]);
       if (!mounted) return;
       final store = context.read<CounsellorState>();
-      // One merge call carrying every rung of the ladder the doctor can see —
-      // the server's status on each row decides whether it lands in
-      // doctorQueue or doctorAttended.
       final combined = [
         ...queue.items,
-        ...attended.items,
-        ...awaitingPayment.items,
-        ...atLab.items,
+        for (final r in results) ...r.items,
       ];
       store.mergeBackendPatients(combined);
-    } on ApiException catch (e) {
-      if (mounted) setState(() => _lastError = e.message);
-    } catch (e) {
-      if (mounted) setState(() => _lastError = e.toString());
+      try {
+        final cache = await PatientsCacheStore.open();
+        await cache.save(_doctorCacheKey, combined);
+      } catch (_) {/* best-effort */}
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -340,7 +452,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
               child: Row(children: [
                 const Icon(Icons.cloud_off, size: 14, color: C2.danger),
                 const SizedBox(width: 6),
-                Expanded(child: Text('Showing cached list — tap to retry',
+                Expanded(child: Text('Refresh failed — tap to retry',
                   style: ct(11, FontWeight.w500, C2.danger))),
                 const Icon(Icons.refresh, size: 14, color: C2.danger),
               ]),
@@ -394,7 +506,10 @@ class _DoctorDashboardState extends State<DoctorDashboard>
               child: Row(children: [
                 Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                   Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                  Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.length} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                  // Queue rows carry no Rx lines, only their count — local
+                  // p.prescription is always empty for server-merged rows,
+                  // which is why every card said "0 meds" (user 2026-08-22).
+                  Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                 ])),
                 doctorStatusBadge(p.status),
                 const SizedBox(width: 6), const Icon(Icons.lock_outline, size: 15, color: C2.text3),
@@ -562,18 +677,13 @@ class _DoctorCaseListState extends State<DoctorCaseList> {
 
 // ───────────────── Attendance / Report / Profile (shared simple) ─────────────────
 class DoctorAttendance extends StatefulWidget {
-  const DoctorAttendance({super.key});
+  /// Bumped by the shell when the user refreshes (pull / app-bar) while
+  /// this tab is current — re-pulls server data; never touches the queue.
+  final Listenable? refreshSignal;
+  const DoctorAttendance({super.key, this.refreshSignal});
   @override
   State<DoctorAttendance> createState() => _DoctorAttendanceState();
 }
-
-// Reused for both the doctor + pharmacist attendance forms so the location
-// auto-pick uses the same set of camp anchors as the counsellor screen.
-const Map<String, ({double lat, double lng})> _kDocCampCoords = {
-  'Gajraula Camp': (lat: 28.845, lng: 78.240),
-  'Amroha Camp':   (lat: 28.910, lng: 78.470),
-  'Hasanpur Camp': (lat: 28.719, lng: 78.302),
-};
 
 class _DoctorAttendanceState extends State<DoctorAttendance> {
   bool showForm = false;
@@ -588,16 +698,167 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
   String? _photoPath;
   double? _lat;
   double? _lng;
+  // Counsellor's mark for this doctor today — surfaced as a banner so
+  // the doctor knows their presence has already been logged upstream
+  // (user rule 2026-08-16). Set from _checkCounsellorMark().
+  String? _counsellorMarkedBy;
+  // Camp anchors from /camps/anchors — the SAME source the counsellor
+  // uses, so the location string matches across roles (ATTEND task B;
+  // replaces the old hardcoded 3-camp list that showed "Gajraula Camp"
+  // everywhere). Cached per user so GPS snap works offline too.
+  List<Map<String, dynamic>> _anchors = const [];
+  int? _campAnchorId;
+  StreamSubscription<void>? _fcmSub;
+  // 60-second ticker so the checkout-boundary popup can fire on the
+  // exact minute (user 2026-08-26 — same fix as counsellor).
+  Timer? _minuteTicker;
 
   @override
   void initState() {
     super.initState();
+    _minuteTicker = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (mounted) setState(() {});
+    });
     _date = fmtDate(DateTime.now());
+    // First back press while the check-in/out form is open closes the
+    // form instead of switching tabs (user 2026-08-21).
+    BackFormRegistry.register('doc.attend', () {
+      if (!mounted || !showForm) return false;
+      // Clear the draft too — reopening must not resurrect stale
+      // notes/photo/times (user 2026-08-26, same rule as counsellor).
+      _resetAttendForm();
+      return true;
+    });
+    _loadAnchors();
     _hydrateTodayFromBackend();
+    _checkCounsellorMark();
+    // Live refresh: the counsellor's mark pushes an FCM message — pull the
+    // fresh row immediately so the doctor sees it WITHOUT re-login
+    // (user bug 2026-08-18).
+    _fcmSub = FcmService.instance.onMessageReceived.listen((_) {
+      _hydrateTodayFromBackend();
+      _checkCounsellorMark();
+    });
+    widget.refreshSignal?.addListener(_onExternalRefresh);
+  }
+
+  /// Blank every draft field of the check-in/out form and close it.
+  /// Reopening starts pristine (user 2026-08-26 — stale drafts were
+  /// resurfacing on Close/Back/Refresh across all roles).
+  void _resetAttendForm() {
+    setState(() {
+      showForm = false; _checkIn = ''; _checkOut = '';
+      location = null; _notes.clear();
+      _photoPath = null; _lat = null; _lng = null;
+    });
+  }
+
+  /// Shell-driven refresh (pull / app-bar while this tab is current).
+  void _onExternalRefresh() {
+    if (!mounted) return;
+    if (showForm) _resetAttendForm();
+    _loadAnchors();
+    _hydrateTodayFromBackend();
+    _checkCounsellorMark();
+  }
+
+  /// Per-user cache key (rule 2026-08-16 — no cross-user leakage).
+  String get _userKey {
+    final app = context.read<AppState>();
+    return 'doctor_${app.backendUserId ?? app.currentUser}';
+  }
+
+  /// Anchors: server first, offline cache as fallback (user rule
+  /// 2026-08-18 — attendance fully functional offline).
+  Future<void> _loadAnchors() async {
+    try {
+      final rows = await context.read<CampsApi>().anchors();
+      if (!mounted) return;
+      setState(() => _anchors = rows.cast<Map<String, dynamic>>());
+      unawaited(AttendanceStore.open()
+          .then((s) => s.saveAnchors(_userKey, _anchors)));
+    } catch (_) {
+      try {
+        final store = await AttendanceStore.open();
+        final cached = store.loadAnchors(_userKey);
+        if (cached.isNotEmpty && mounted) {
+          setState(() => _anchors = cached);
+        }
+      } catch (_) {/* no cache — facility-name fallback in _autofill */}
+    }
+  }
+
+  /// GET /api/attendance for today at this facility. Parses each row's
+  /// notes field for the counsellor-written "Staff (In): …" string and
+  /// records their name when this role's word ("Doctor") is listed.
+  /// Silent on error — banner just doesn't show.
+  Future<void> _checkCounsellorMark({String role = 'Doctor'}) async {
+    try {
+      final today = DateTime.now();
+      final iso = '${today.year.toString().padLeft(4, '0')}-'
+          '${today.month.toString().padLeft(2, '0')}-'
+          '${today.day.toString().padLeft(2, '0')}';
+      final rows = await context.read<AttendanceApi>()
+          .list(dateFrom: iso, dateTo: iso, limit: 20);
+      for (final r in rows) {
+        final rowRole = (r['role'] ?? '').toString().toLowerCase();
+        if (rowRole != 'counsellor' && rowRole != 'counselor') continue;
+        final notes = (r['notes'] ?? '').toString();
+        if (RegExp(r'Staff \((In|Out)\)[^.]*\b' + role + r'\b',
+                caseSensitive: false).hasMatch(notes)) {
+          if (!mounted) return;
+          setState(() =>
+              _counsellorMarkedBy = (r['full_name'] ?? 'Counsellor').toString());
+          return;
+        }
+      }
+    } catch (_) { /* offline / not deployed — banner stays hidden */ }
   }
 
   @override
-  void dispose() { _notes.dispose(); super.dispose(); }
+  void dispose() {
+    BackFormRegistry.unregister('doc.attend');
+    widget.refreshSignal?.removeListener(_onExternalRefresh);
+    _fcmSub?.cancel(); _notes.dispose();
+    _minuteTicker?.cancel();
+    super.dispose();
+  }
+
+  /// Boundary hour (3, 6, 9, …) when the current wall-clock minute is
+  /// exactly a 3-hour mark past check-in; else -1. Same shape as the
+  /// counsellor's helper (user 2026-08-26).
+  int _checkoutBoundaryHourFor(AttendanceRecord? open) {
+    if (open == null || open.checkIn.isEmpty || open.checkOut.isNotEmpty) {
+      return -1;
+    }
+    // AttendanceRecord.checkIn is a "hh:mm AM/PM" label; combine with
+    // today's date to get an instant.
+    final now = DateTime.now();
+    DateTime? checkInDt;
+    try {
+      final parts = open.checkIn.trim().split(RegExp(r'\s+'));
+      final hm = parts[0].split(':');
+      var h = int.parse(hm[0]);
+      final m = int.parse(hm[1]);
+      final period = parts.length > 1 ? parts[1].toUpperCase() : '';
+      if (period == 'PM' && h != 12) h += 12;
+      if (period == 'AM' && h == 12) h = 0;
+      checkInDt = DateTime(now.year, now.month, now.day, h, m);
+    } catch (_) { return -1; }
+    final mins = now.difference(checkInDt).inMinutes;
+    if (mins < 180) return -1;
+    if ((mins - 180) % 180 != 0) return -1;
+    return mins ~/ 60;
+  }
+
+  /// Server photo_path is a bare filename in the shared uploads folder —
+  /// expand to a public URL (same rule as the counsellor screen). Local
+  /// device paths / full URLs pass through untouched.
+  static String _serverPhotoUrl(dynamic p) {
+    final s = (p ?? '').toString().trim();
+    if (s.isEmpty || s.startsWith('http') || s.startsWith('/')) return s;
+    return '$kUploadsBase/patient_docs/$s';
+  }
 
   /// Rebuild today's shift from the server so Check-Out survives a restart.
   ///
@@ -610,33 +871,88 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
     try {
       final res = await context.read<AttendanceApi>().today();
       final row = res['attendance'];
-      if (row is! Map) return;
+      // Server says "no attendance for today" — reflect that locally.
+      // Before this the app kept a deleted row on screen until re-login
+      // (user 2026-08-25: admin deleted the row, refresh didn't clean).
+      if (row is! Map) {
+        if (mounted) {
+          final today = fmtDate(DateTime.now());
+          context.read<CounsellorState>().removeDoctorAttendanceOn(today);
+          setState(() => _counsellorMarkedBy = null);
+        }
+        try {
+          final st = await AttendanceStore.open();
+          await st.saveToday(_userKey, null);
+        } catch (_) {}
+        return;
+      }
       final m = row.cast<String, dynamic>();
+      // The server stamps who auto-marked this row (counsellor's crew
+      // tick) — authoritative source for the "marked you present" banner.
+      final autoBy = (m['auto_marked_by'] ?? '').toString().trim();
+      if (autoBy.isNotEmpty && mounted) {
+        setState(() => _counsellorMarkedBy = autoBy);
+      }
       final date    = _fmtServerDate('${m['attendance_date'] ?? ''}');
       final checkIn = _fmtServerTime('${m['check_in'] ?? ''}');
       // No usable check-in means there is nothing to reopen.
       if (date.isEmpty || checkIn.isEmpty) return;
       if (!mounted) return;
       final s = context.read<CounsellorState>();
-      // A record marked in this same session already covers the day —
-      // re-adding it would show the shift twice in History.
-      if (s.doctorAttendance.any((r) => r.date == date)) return;
-      s.addDoctorAttendance(AttendanceRecord(
-        date:      date,
-        checkIn:   checkIn,
-        checkOut:  _fmtServerTime('${m['check_out'] ?? ''}'),
-        location:  '${m['location'] ?? m['anchor_name'] ?? ''}',
-        status:    '${m['status'] ?? 'Present'}',
-        notes:     '${m['notes'] ?? ''}',
-        photoPath: '${m['photo_path'] ?? ''}',
-        photo:     '${m['photo_path'] ?? ''}'.isNotEmpty,
-        lat:       (m['latitude']  as num?)?.toDouble(),
-        lng:       (m['longitude'] as num?)?.toDouble(),
-      ));
+      final serverOut = _fmtServerTime('${m['check_out'] ?? ''}');
+      AttendanceRecord? local;
+      for (final r in s.doctorAttendance) {
+        if (r.date == date) { local = r; break; }
+      }
+      if (local != null) {
+        // Already shown — but the counsellor may have CLOSED the shift on
+        // the server (auto check-out, task C). Mirror that locally so the
+        // form flips back to Check-In-done state without a re-login.
+        if (serverOut.isNotEmpty && local.checkOut.isEmpty) {
+          s.closeDoctorShift(local, local.copyWith(checkOut: serverOut));
+        }
+      } else {
+        s.addDoctorAttendance(AttendanceRecord(
+          date:      date,
+          checkIn:   checkIn,
+          checkOut:  serverOut,
+          location:  '${m['location'] ?? m['anchor_name'] ?? ''}',
+          status:    '${m['status'] ?? 'Present'}',
+          notes:     '${m['notes'] ?? ''}',
+          photoPath: _serverPhotoUrl(m['photo_path']),
+          photo:     _serverPhotoUrl(m['photo_path']).isNotEmpty,
+          photoPathOut: _serverPhotoUrl(m['photo_path_out']),
+          lat:       (m['latitude']  as num?)?.toDouble(),
+          lng:       (m['longitude'] as num?)?.toDouble(),
+        ));
+      }
       if (mounted) setState(() {});
+      // Fresh server truth → refresh the offline snapshot.
+      unawaited(AttendanceStore.open()
+          .then((st) => st.saveToday(_userKey, m)));
     } catch (_) {
-      // Offline, or the endpoint isn't deployed — fall back to local state.
-      // Check-In still works; Check-Out stays gated exactly as before.
+      // Offline, or the endpoint isn't deployed — try the cached snapshot
+      // so a restart with no signal still shows the open shift and gates
+      // Check-Out correctly (user rule 2026-08-18).
+      try {
+        final store = await AttendanceStore.open();
+        final m = store.loadToday(_userKey);
+        if (m == null || !mounted) return;
+        final date    = _fmtServerDate('${m['attendance_date'] ?? ''}');
+        final checkIn = _fmtServerTime('${m['check_in'] ?? ''}');
+        if (date.isEmpty || checkIn.isEmpty) return;
+        final s = context.read<CounsellorState>();
+        if (s.doctorAttendance.any((r) => r.date == date)) return;
+        s.addDoctorAttendance(AttendanceRecord(
+          date:     date,
+          checkIn:  checkIn,
+          checkOut: _fmtServerTime('${m['check_out'] ?? ''}'),
+          location: '${m['location'] ?? m['anchor_name'] ?? ''}',
+          status:   '${m['status'] ?? 'Present'}',
+          notes:    '${m['notes'] ?? ''}',
+        ));
+        if (mounted) setState(() {});
+      } catch (_) {/* no cache — local state stands */}
     }
   }
 
@@ -665,6 +981,16 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
   /// Non-null when a check-in without a matching check-out exists — that's
   /// the only shape where Check-Out is allowed. Non-open records (already
   /// closed) or absence of today's check-in return null.
+
+  /// Any attendance row for today, open OR complete (user bug 2026-08-25:
+  /// after counsellor's auto-close the button fell back to Mark Check-In).
+  AttendanceRecord? _todayDoctorShift(CounsellorState s) {
+    for (final r in s.doctorAttendance) {
+      if (r.date == _date && r.checkIn.isNotEmpty) return r;
+    }
+    return null;
+  }
+
   AttendanceRecord? _openDoctorShift(CounsellorState s) {
     for (final r in s.doctorAttendance) {
       if (r.date == _date && r.checkIn.isNotEmpty && r.checkOut.isEmpty) {
@@ -693,20 +1019,49 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
       return;
     }
     if (location != null) return;
+    // Same source + same fallback ladder as the counsellor screen
+    // (ATTEND task B): nearest /camps/anchors anchor via GPS, else the
+    // facility name from bootstrap — never a hardcoded camp.
+    final fac = context.read<MastersStore>().facility;
+    final facilityName =
+        ((fac?['name'] ?? fac?['facility_name']) as String?)?.trim();
+    if (_anchors.isEmpty) {
+      if (facilityName != null && facilityName.isNotEmpty && mounted) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+      return;
+    }
     try {
       var perm = await Geolocator.checkPermission();
       if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
       if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) return;
       if (!await Geolocator.isLocationServiceEnabled()) return;
-      final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.medium);
-      String? nearest;
+      final pos = await Geolocator.getCurrentPosition(
+              desiredAccuracy: LocationAccuracy.medium)
+          .timeout(const Duration(seconds: 6));
+      Map<String, dynamic>? nearest;
       double best = double.infinity;
-      for (final e in _kDocCampCoords.entries) {
-        final d = Geolocator.distanceBetween(pos.latitude, pos.longitude, e.value.lat, e.value.lng);
-        if (d < best) { best = d; nearest = e.key; }
+      for (final a in _anchors) {
+        final lat = (a['latitude'] as num?)?.toDouble();
+        final lng = (a['longitude'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        final d = Geolocator.distanceBetween(pos.latitude, pos.longitude, lat, lng);
+        if (d < best) { best = d; nearest = a; }
       }
-      if (nearest != null && mounted) setState(() => location = nearest);
-    } catch (_) { /* fall through — counsellor can pick manually */ }
+      if (nearest != null && mounted) {
+        setState(() {
+          location = (nearest!['anchor_name'] ?? '').toString();
+          _campAnchorId = (nearest['camp_anchor_id'] as num?)?.toInt();
+        });
+      } else if (facilityName != null && facilityName.isNotEmpty && mounted) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+    } catch (_) {
+      if (facilityName != null && facilityName.isNotEmpty &&
+          mounted && location == null) {
+        setState(() { location = facilityName; _campAnchorId = null; });
+      }
+    }
   }
 
   void _submit(CounsellorState s) {
@@ -734,13 +1089,33 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
         photo: true, photoPath: _photoPath!, lat: _lat, lng: _lng,
       ));
       context.read<SyncService>().enqueue(kind: 'attendance.check_in', payload: {
-        'attendance_date': _date,
+        // ISO yyyy-MM-dd — _date is the dd-MM-yyyy DISPLAY string; the
+        // server records the payload date, so a queue drained the next
+        // morning must still carry the day the shift actually opened.
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
         'check_in':        _checkIn,
         'location':        location!,
+        'camp_anchor_id':  _campAnchorId,
         'latitude':        _lat,
         'longitude':       _lng,
         'notes':           _notes.text.trim(),
+        // Local path lifted on next drain (bug 2026-08-20 — photo was
+        // being dropped from offline check-in payloads).
+        if (_photoPath != null) 'photo_key': _photoPath,
       });
+      // Offline snapshot: a restart with no signal still shows the open
+      // shift (user rule 2026-08-18) — mirror of the counsellor flow.
+      unawaited(AttendanceStore.open().then((st) => st.saveToday(_userKey, {
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
+        'check_in': DateTime.now().toIso8601String(),
+        'check_out': null,
+        'location': location,
+        'status': 'Present',
+        'notes': _notes.text.trim(),
+      })));
+      // D2: 3h/6h/9h check-out reminders until the shift closes.
+      unawaited(NotificationsService.instance
+          .scheduleCheckoutReminders(checkInLabel: _checkIn));
     } else {
       // Close the open shift so today's record ends up complete rather
       // than as two separate rows.
@@ -752,12 +1127,32 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
       );
       s.closeDoctorShift(open, closed);
       context.read<SyncService>().enqueue(kind: 'attendance.check_out', payload: {
-        'attendance_date': _date,
+        // ISO for the server — see check_in note above.
+        'attendance_date': DateTime.now().toIso8601String().substring(0, 10),
         'check_out':       _checkOut,
         'latitude':        _lat,
         'longitude':       _lng,
         'notes':           _notes.text.trim(),
+        // Local path lifted on next drain (bug 2026-08-20).
+        if (_photoPath != null) 'photo_key': _photoPath,
       });
+      // Fixed 2026-08-20: bug was writing NOW twice (check_in = check_out
+      // = same millisecond) which produced a synthetic "already closed"
+      // row that _hydrateTodayFromBackend then never overwrote. Use the
+      // real check-in from the open shift, and the just-submitted _checkOut.
+      unawaited(AttendanceStore.open().then((st) => st.saveToday(_userKey, {
+        'attendance_date': _date,
+        'check_in': open.checkIn,
+        'check_out': _checkOut,
+        'location': open.location,
+        'status': 'Present',
+      })));
+      // D2: shift closed — stop the pending reminders.
+      unawaited(NotificationsService.instance.cancelCheckoutReminders());
+      // Re-fetch server truth so the UI flips to "Day complete" without
+      // waiting for a restart (bug 2026-08-20: "doc is done checkout
+      // showing again check in").
+      unawaited(_hydrateTodayFromBackend());
     }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('Attendance (${_mode == 'in' ? 'Check-In' : 'Check-Out'}) submitted'),
@@ -831,6 +1226,13 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
     final open = _openDoctorShift(s);
+    // Today's shift may already be COMPLETE (both check_in AND check_out
+    // set — either the doctor closed it or the counsellor auto-closed it
+    // via cross-role mark). Hide the action button then; a lingering
+    // "Mark Check-In" made it look like the check-out never happened
+    // (user bug 2026-08-20: "doc is done checkout showing again check in").
+    final todayClosed = s.doctorAttendance.any((r) =>
+        r.date == _date && r.checkIn.isNotEmpty && r.checkOut.isNotEmpty);
     // Enforce Check-In first (rule 2026-08-05): Check-Out is only clickable
     // when an open shift exists. If the doctor previously landed on 'out'
     // without a shift, snap the mode back to 'in' so the button + form
@@ -843,23 +1245,78 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
         }
       });
     }
+    // Check-out pending popup — fires ONLY on the exact 3h / 6h / 9h
+    // minute past check-in (user 2026-08-26 "no window, exact time").
+    // The 60-sec ticker keeps this check running on the current frame.
+    final _bh = _checkoutBoundaryHourFor(open);
+    if (_bh > 0 && !showForm && !todayClosed) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        PendingAlert.showOnce(
+          context,
+          key: 'doc-checkout-pending-h$_bh',
+          title: 'Check-out Pending',
+          message: 'You checked in at ${open!.checkIn}. Your check-out '
+              'is still pending. Please complete your check-out.',
+        );
+      });
+    }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      // Counsellor-marked banner (user rule 2026-08-16): when the
+      // counsellor ticked "Doctor" in Staff (In) on today's shift,
+      // surface it here so the doctor knows their presence is on
+      // record. Doctor's own check-in is still available if they want
+      // their personal shift row saved — this is informational.
+      if (_counsellorMarkedBy != null)
+        Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: C2.green.withValues(alpha: 0.10),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(children: [
+            const Icon(Icons.check_circle, size: 16, color: C2.green),
+            const SizedBox(width: 8),
+            Expanded(child: Text(
+              'Counsellor $_counsellorMarkedBy has marked you present today.',
+              style: ct(12.5, FontWeight.w600, C2.green))),
+          ]),
+        ),
       Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('My Attendance',
-        trailing: COutlineButton(showForm ? 'Close' : (open == null ? 'Mark Check-In' : 'Mark Check-Out'),
+        trailing: (showForm || !todayClosed)
+            ? COutlineButton(showForm ? 'Close' : (open == null ? 'Mark Check-In' : 'Mark Check-Out'),
           icon: showForm ? Icons.close : (open == null ? Icons.login : Icons.logout),
           onTap: () {
             final opening = !showForm;
-            setState(() {
-              showForm = opening;
-              // Auto-select the mode based on whether an open shift exists.
-              if (opening) _mode = open == null ? 'in' : 'out';
-            });
-            if (opening) {
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (mounted) _autofill(context.read<CounsellorState>());
-              });
+            if (!opening) {
+              // Close — drop the draft so reopening starts clean
+              // (user 2026-08-26).
+              _resetAttendForm();
+              return;
             }
-          }))),
+            setState(() {
+              showForm = true;
+              // Auto-select the mode based on whether an open shift exists.
+              _mode = open == null ? 'in' : 'out';
+            });
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _autofill(context.read<CounsellorState>());
+            });
+          })
+            : const SizedBox.shrink())),
+      // Day-complete banner — mirrors the counsellor "attendance complete"
+      // card so the doctor gets clear confirmation without a stale button.
+      if (todayClosed && !showForm)
+        CCard(child: Row(children: [
+          Container(width: 40, height: 40,
+              decoration: BoxDecoration(color: const Color(0xFFEDF7E0),
+                  borderRadius: BorderRadius.circular(10)),
+              child: const Icon(Icons.event_available, color: C2.green)),
+          const SizedBox(width: 12),
+          Expanded(child: Text("Today's attendance is complete",
+              style: ct(13.5, FontWeight.w700, C2.navy))),
+        ])),
       if (showForm)
         CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const SecBar('Mark Attendance'),
@@ -896,10 +1353,17 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             value: location ?? 'Detecting nearest camp via GPS…',
             empty: location == null,
           ), required: true),
-          CField('Notes', TextField(controller: _notes, minLines: 2, maxLines: 3, decoration: cInput('Optional — type or use the mic').copyWith(
-            suffixIcon: VoiceMicButton(controller: _notes)))),
+          CField('Notes', TextField(controller: _notes, minLines: 2, maxLines: null, decoration: cInput('Optional — type or use the mic').copyWith(
+            suffixIcon: RemarksMicButton(controller: _notes)))),
           CField('Selfie + Location', AttendanceCapture(
             initialPhotoPath: _photoPath, initialLat: _lat, initialLng: _lng,
+            // MMU name on the watermark (user 2026-08-20). Snapped anchor
+            // wins, facility name falls back — same ladder as counsellor.
+            placeLabel: location
+                ?? ((context.read<MastersStore>().facility?['name']
+                       ?? context.read<MastersStore>().facility?['facility_name'])
+                     as String?)?.trim()
+                ?? '',
             onCaptured: (path, lat, lng) => setState(() { _photoPath = path; _lat = lat; _lng = lng; }),
           ), required: true),
           const SizedBox(height: 4),
@@ -927,10 +1391,14 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
 
   void _showDetail(AttendanceRecord r) => showModalBottomSheet(
         context: context, backgroundColor: Colors.transparent,
+        // Rows + check-in photo can outgrow the default half-screen sheet
+        // on small devices — cap at 85% and scroll (same fix as counsellor).
+        isScrollControlled: true,
         builder: (_) => Container(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.85),
           decoration: const BoxDecoration(color: C2.white, borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-          child: SafeArea(top: false, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          child: SafeArea(top: false, child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
             Center(child: Container(width: 40, height: 4, decoration: BoxDecoration(color: C2.border, borderRadius: BorderRadius.circular(2)))),
             const SizedBox(height: 14),
             Text('Attendance — ${r.date}', style: ct(15, FontWeight.w700, C2.navy)),
@@ -942,12 +1410,35 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
               _row('GPS', '${r.lat!.toStringAsFixed(5)}, ${r.lng!.toStringAsFixed(5)}'),
             if (r.photoPath.isNotEmpty) ...[
               const SizedBox(height: 8),
-              ClipRRect(borderRadius: BorderRadius.circular(8),
-                child: Image.file(File(r.photoPath), height: 160, fit: BoxFit.cover,
-                  errorBuilder: (_, __, ___) => Container(height: 80, color: C2.border,
-                    child: const Center(child: Icon(Icons.broken_image_outlined, color: C2.text3))))),
+              Text('Check-in photo', style: ct(11.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 4),
+              _attPhoto(r.photoPath, 'Check-in photo'),
             ],
-          ])),
+            if (r.photoPathOut.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text('Check-out photo', style: ct(11.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 4),
+              _attPhoto(r.photoPathOut, 'Check-out photo'),
+            ],
+          ]))),
+        ),
+      );
+
+  /// Render an attendance selfie: server rows carry a URL (counsellor's
+  /// uploaded photo — user bug 2026-08-18 "check in image not showing"),
+  /// own submissions carry a local file path.
+  /// Tap → fullscreen lightbox (user 2026-08-19).
+  Widget _attPhoto(String path, [String? title]) => GestureDetector(
+        onTap: () => showPhotoLightbox(context, path, title: title),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: path.startsWith('http')
+              ? Image.network(path, height: 160, fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(height: 80, color: C2.border,
+                    child: const Center(child: Icon(Icons.broken_image_outlined, color: C2.text3))))
+              : Image.file(File(path), height: 160, fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => Container(height: 80, color: C2.border,
+                    child: const Center(child: Icon(Icons.broken_image_outlined, color: C2.text3)))),
         ),
       );
 }
@@ -1083,42 +1574,143 @@ class _DoctorReportState extends State<DoctorReport> {
   }
 }
 
+/// Doctor + Pharmacist profile — same shape as the counsellor's screen
+/// (user 2026-08-25 "do same for pharmacist, doctor same as counsellor").
+/// Everything comes from the real backend session (bootstrap user +
+/// facility blocks + AppState fields), nothing hard-coded.
 class SimpleProfile extends StatelessWidget {
   final String name, role;
   const SimpleProfile({super.key, required this.name, required this.role});
+
+  static String _cap(String s) =>
+      s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+
   @override
   Widget build(BuildContext context) {
-    final initials = name.replaceAll('Dr. ', '').isEmpty ? '?' : name.replaceAll('Dr. ', '')[0].toUpperCase();
+    final masters = context.watch<MastersStore>();
+    final app = context.watch<AppState>();
+    final u = masters.user;
+    final f = masters.facility;
+
+    final displayName =
+        ((u?['full_name'] as String?)?.trim().isNotEmpty ?? false)
+            ? (u!['full_name'] as String).trim()
+            : name;
+    final roleLabel = _cap((u?['role'] ?? role).toString());
+    final username = (u?['username'] ?? '').toString();
+    final facilityName =
+        (f?['name'] ?? u?['facility_name'] ?? app.backendFacilityName ?? '—')
+            .toString();
+    final facilityCode =
+        (f?['code'] ?? u?['facility_code'] ?? app.backendFacilityCode ?? '')
+            .toString();
+    final blockName =
+        (f?['block_name'] ?? app.backendBlockName ?? '').toString();
+    final districtName =
+        (f?['district_name'] ?? app.backendDistrictName ?? '').toString();
+    final vehicleNo = (f?['vehicle_no'] ?? '').toString();
+    final status = _cap((f?['status'] ?? 'active').toString());
+    final location = [
+      if (blockName.isNotEmpty) blockName,
+      if (districtName.isNotEmpty) districtName,
+    ].join(', ');
+    final initials =
+        displayName.isEmpty ? role[0] : displayName[0].toUpperCase();
+
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
       child: Scaffold(
         backgroundColor: C2.bg,
-        appBar: AppBar(backgroundColor: C2.white, foregroundColor: C2.navy, elevation: 0,
-          shape: const Border(bottom: BorderSide(color: C2.cyan, width: 3)), title: Text('My Profile', style: ct(16, FontWeight.w700, C2.navy))),
-        body: SingleChildScrollView(padding: const EdgeInsets.all(14), child: Column(children: [
-          CCard(child: Column(children: [
-            Container(width: 64, height: 64, alignment: Alignment.center, decoration: const BoxDecoration(gradient: C2.headerGrad, shape: BoxShape.circle),
-              child: Text(initials, style: ct(26, FontWeight.w700, Colors.white))),
-            const SizedBox(height: 10),
-            Text(name, style: ct(17, FontWeight.w700, C2.text)),
-            Text(role, style: ct(12.5, FontWeight.w400, C2.text2)),
-          ])),
-          CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Details'),
-            _kv('Role', role), _kv('Phone', '9876500011'), _kv('Facility', 'MMU-01 · Gajraula Block, Amroha'), _kv('Status', 'Active'),
-          ])),
-          SizedBox(width: double.infinity, child: OutlinedButton.icon(
-            onPressed: () => Navigator.of(context).popUntil((r) => r.isFirst),
-            icon: const Icon(Icons.logout, color: C2.danger),
-            label: Text('Log out', style: ct(14, FontWeight.w600, C2.danger)),
-            style: OutlinedButton.styleFrom(side: const BorderSide(color: C2.danger), padding: const EdgeInsets.symmetric(vertical: 13), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))))),
-        ])),
+        appBar: AppBar(
+          backgroundColor: C2.white, foregroundColor: C2.navy, elevation: 0,
+          shape: const Border(bottom: BorderSide(color: C2.cyan, width: 3)),
+          title: Text('My Profile', style: ct(16, FontWeight.w700, C2.navy)),
+        ),
+        body: SingleChildScrollView(
+          padding: const EdgeInsets.all(14),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              padding: const EdgeInsets.symmetric(vertical: 22),
+              decoration: BoxDecoration(
+                gradient: C2.headerGrad,
+                borderRadius: BorderRadius.circular(14),
+                boxShadow: C2.shadow,
+              ),
+              child: Column(children: [
+                Container(
+                  width: 72, height: 72, alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.18),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white70, width: 2),
+                  ),
+                  child: Text(initials, style: ct(28, FontWeight.w700, Colors.white)),
+                ),
+                const SizedBox(height: 10),
+                Text(displayName, style: ct(18, FontWeight.w700, Colors.white)),
+                const SizedBox(height: 3),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(roleLabel, style: ct(11.5, FontWeight.w600, Colors.white)),
+                ),
+              ]),
+            ),
+            CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const SecBar('Details'),
+              _kv('Role', roleLabel),
+              if (username.isNotEmpty) _kv('Username', username),
+              _kv('Facility', facilityCode.isEmpty
+                  ? facilityName
+                  : '$facilityName ($facilityCode)'),
+              if (location.isNotEmpty) _kv('Location', location),
+              if (vehicleNo.isNotEmpty) _kv('Vehicle No', vehicleNo),
+              _kv('Status', status),
+            ])),
+            SizedBox(width: double.infinity, child: OutlinedButton.icon(
+              onPressed: () async {
+                if (!await confirmLogout(context)) return;
+                if (!context.mounted) return;
+                // REAL logout (user 2026-08-26: Yes was just popping back
+                // to Home while the session stayed alive). Same lines as
+                // the shell menu's logout — end the server session, stop
+                // pushes, wipe user-scoped state, land on Login with no
+                // back stack. Serves BOTH doctor and pharmacist (the
+                // pharmacist shell reuses this SimpleProfile).
+                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
+                unawaited(FcmService.instance
+                    .unregister(context.read<ApiClient>())
+                    .catchError((_) {}));
+                context.read<CounsellorState>().resetForNewUser();
+                context.read<AppState>().logout();
+                Navigator.of(context).pushAndRemoveUntil(
+                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
+                  (route) => false,
+                );
+              },
+              icon: const Icon(Icons.logout, color: C2.danger),
+              label: Text('Log out', style: ct(14, FontWeight.w600, C2.danger)),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: C2.danger),
+                padding: const EdgeInsets.symmetric(vertical: 13),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            )),
+          ]),
+        ),
       ),
     );
   }
 
-  Widget _kv(String k, String v) => Padding(padding: const EdgeInsets.symmetric(vertical: 5), child: Row(children: [
-        SizedBox(width: 96, child: Text(k, style: ct(12, FontWeight.w400, C2.text2))),
-        Expanded(child: Text(v, style: ct(13, FontWeight.w600, C2.text))),
-      ]));
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Row(children: [
+          SizedBox(width: 96, child: Text(k, style: ct(12, FontWeight.w400, C2.text2))),
+          Expanded(child: Text(v, style: ct(13, FontWeight.w600, C2.text))),
+        ]),
+      );
 }

@@ -37,13 +37,16 @@ class PatientsApi {
       if (limit         != null) 'limit':         limit,
       if (offset        != null) 'offset':        offset,
     });
-    final m = (res as Map).cast<String, dynamic>();
-    return PatientList(
-      items: [ for (final r in (m['items'] as List? ?? const []))
-                 if (r is Map) r.cast<String, dynamic>() ],
-      total: (m['total'] as num?)?.toInt() ?? 0,
-      count: (m['count'] as num?)?.toInt() ?? 0,
-    );
+    // GET /patients returns a RAW ARRAY (fetch_all), unlike the /queues/*
+    // endpoints' {items,total,count} envelope. Accept both so a future
+    // backend change to the envelope shape doesn't break search again
+    // (bug 2026-08-13: the Map cast on the array threw and the Status
+    // tab's online search showed "Search failed" on every query).
+    final items = res is List
+        ? [ for (final r in res) if (r is Map) r.cast<String, dynamic>() ]
+        : [ for (final r in (((res as Map)['items']) as List? ?? const []))
+              if (r is Map) r.cast<String, dynamic>() ];
+    return PatientList(items: items, total: items.length, count: items.length);
   }
 
   /// GET /patients/summary/counts — same filters as `list`, returns

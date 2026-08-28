@@ -1,13 +1,21 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:provider/provider.dart';
 import 'cw.dart';
 import 'cdata.dart';
 import 'cstate.dart';
 import 'symptom_field.dart';
+import '../api/appointments_api.dart';
 import '../api/masters_store.dart';
+import '../api/staff_api.dart';
 import '../api/sync_service.dart';
-import '../doctor/voice.dart';
+import '../api/uploads_api.dart';
+import '../services/deepgram_stt.dart';
+import '../services/staff_cache_store.dart';
+import '../services/translation_service.dart';
 import '../state/app_state.dart';
 import '../widgets/attachments_field.dart';
 
@@ -93,16 +101,18 @@ int? _asInt(TextEditingController c) {
   return int.tryParse(s);
 }
 
-/// Allows up to [intDigits] integer digits and 1 optional decimal place
-/// (e.g. 100.1 with intDigits=3, or 14.5 with intDigits=2).
+/// Allows up to [intDigits] integer digits and up to [decimals] decimal
+/// places (vitals rule 2026-08-14: max 3 digits, decimals max 2 — and
+/// max 1 for height/weight).
 class _DecimalFormatter extends TextInputFormatter {
   final int intDigits;
-  _DecimalFormatter(this.intDigits);
+  final int decimals;
+  _DecimalFormatter(this.intDigits, {this.decimals = 2});
   @override
   TextEditingValue formatEditUpdate(TextEditingValue oldValue, TextEditingValue newValue) {
     final t = newValue.text;
     if (t.isEmpty) return newValue;
-    return RegExp('^\\d{0,$intDigits}(\\.\\d?)?\$').hasMatch(t) ? newValue : oldValue;
+    return RegExp('^\\d{0,$intDigits}(\\.\\d{0,$decimals})?\$').hasMatch(t) ? newValue : oldValue;
   }
 }
 
@@ -124,14 +134,22 @@ class _CounRegisterState extends State<CounRegister> {
   /// form. Root cause of "old value showing on user2's remarks field".
   int _voiceMicSeq = 0;
 
+  /// True while _submit is uploading photos + enqueuing. Blocks double-tap
+  /// and swaps the Submit button label so the counsellor sees why the form
+  /// is holding for a moment on photo-heavy registrations.
+  bool _submitting = false;
+
   // basic
   final _name = TextEditingController();
   String gender = 'Female';
   bool pregnant = false;
-  // For pregnant patients, the counsellor enters the LMP (last menstrual
-  // period). EDD (estimated delivery date) is auto-calculated as LMP + 280 days
-  // per Naegele's rule and shown as read-only below the LMP picker.
+  // For pregnant patients the counsellor records whichever date they know
+  // (user 2026-08-14): LMP (last menstrual period — PAST dates only) or
+  // EDD (expected delivery date — FUTURE dates only). In LMP mode the EDD
+  // is auto-derived as LMP + 280 days (Naegele's rule); in EDD mode only
+  // edd_date is sent. `_lmp` holds the picked date for either mode.
   DateTime? _lmp;
+  String _pregMode = 'LMP';
   bool knowAge = true;
   DateTime? _dob;
   final _age = TextEditingController();
@@ -140,6 +158,8 @@ class _CounRegisterState extends State<CounRegister> {
   // the sole patient identifier.
   String? block;
   String? village;
+  static const _kLastBlock = 'coun_last_block';
+  static const _kLastVillage = 'coun_last_village';
   // advance
   final _aadhar = TextEditingController();
   final _height = TextEditingController();
@@ -153,6 +173,16 @@ class _CounRegisterState extends State<CounRegister> {
   // AppState.currentMmu at submit time.
   final _address = TextEditingController();
   final List<String> symptoms = [];
+  // Preview advisory (user 2026-08-27): counsellor's Register screen
+  // now fetches the same village-boosted trending + related list the
+  // doctor would see, so both surfaces stay in sync.
+  Timer? _previewDebounce;
+  List<Map<String, dynamic>>? _previewTrending;
+  List<String>? _previewRelated;
+  List<Map<String, dynamic>>? _previewLikely;
+  bool _previewLoading = false;
+  bool _previewError = false;
+  String _lastPreviewKey = '';
   // collapsible sections (CR25)
   bool showAdvanced = false;
   bool showVitals = false;
@@ -169,6 +199,12 @@ class _CounRegisterState extends State<CounRegister> {
   String payment = 'Free';
   final _amount = TextEditingController();
   String? doctor;
+  // Real doctors of this org from GET /staff?role=doctor (rule
+  // 2026-08-13 — the dropdown was the hardcoded kDoctors demo list).
+  // Rows: {staff_id, staff_name, ...}. Empty until the fetch lands;
+  // the dropdown falls back to kDoctors so the form stays usable
+  // offline / on first launch.
+  List<Map<String, dynamic>> _doctors = const [];
   // Appointment Date defaults to today (rule 2026-07-29). The DateField
   // picks this up via `initial:` and displays it on first render; _reset()
   // reassigns to today so a fresh registration is always pre-filled.
@@ -185,6 +221,169 @@ class _CounRegisterState extends State<CounRegister> {
   // on the new appointment record.
   CPatient? _reAppointmentSource;
 
+  @override
+  void dispose() {
+    _previewDebounce?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // Pull the org's real doctor roster once the provider tree is up.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadDoctors());
+    // Restore the last block/village this counsellor picked (user
+    // 2026-08-25) — logout clears the keys so a different user starts blank.
+    () async {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final b = prefs.getString(_kLastBlock);
+        final v = prefs.getString(_kLastVillage);
+        if (!mounted || (b == null && v == null)) return;
+        setState(() { block = b; village = v; });
+      } catch (_) {}
+    }();
+    // Warm up the hi→en translation models in the background so the
+    // first submit with remarks is instant (skipped entirely if the
+    // remarks field is left blank).
+    TranslationService.warmUp();
+  }
+
+  /// Debounced call to /advisory/preview so the Register screen's
+  /// Related + Likely panels match the Doctor's Case Details (user
+  /// 2026-08-27). Fires 500 ms after the last chip/village change;
+  /// no-op when the same (symptoms, village) has already been fetched.
+  void _schedulePreview() {
+    _previewDebounce?.cancel();
+    // Immediately flip to loading so panels show "analyzing…" instead
+    // of the stale reply from the previous chip set (user 2026-08-27).
+    if (symptoms.isNotEmpty && !_previewLoading) {
+      _previewLoading = true;
+    }
+    _previewDebounce = Timer(const Duration(milliseconds: 500), _fetchPreview);
+  }
+
+  Future<void> _fetchPreview() async {
+    if (!mounted) return;
+    if (symptoms.isEmpty) {
+      if (_previewTrending != null || _previewRelated != null
+          || _previewLikely != null || _previewLoading) {
+        setState(() {
+          _previewTrending = null;
+          _previewRelated = null;
+          _previewLikely = null;
+          _previewLoading = false;
+        });
+      }
+      return;
+    }
+    final vid = context.read<MastersStore>().geoVillageId(block, village);
+    final key = '${symptoms.join("|")}|v=$vid';
+    if (key == _lastPreviewKey) return;
+    _lastPreviewKey = key;
+    try {
+      final body = await context.read<AppointmentsApi>()
+          .advisoryPreview(symptoms: symptoms, villageId: vid);
+      if (!mounted) return;
+      final common = (body['common_in_village'] as Map?)?.cast<String, dynamic>();
+      setState(() {
+        _previewTrending = [
+          for (final t in (common?['trending'] as List? ?? const []))
+            if (t is Map) t.cast<String, dynamic>(),
+        ];
+        _previewRelated = [
+          for (final r in (body['related_symptoms'] as List? ?? const []))
+            if (r is Map && (r['symptom'] ?? '').toString().trim().isNotEmpty)
+              (r['symptom'] as Object).toString(),
+        ];
+        _previewLikely = [
+          for (final c in (body['likely_conditions'] as List? ?? const []))
+            if (c is Map) c.cast<String, dynamic>(),
+        ];
+        _previewLoading = false;
+        _previewError = false;
+      });
+    } catch (_) {
+      // Offline / server unavailable — friendly error strip with Retry
+      // (user 2026-08-28). Reset the key so Retry actually re-fetches.
+      _lastPreviewKey = '';
+      if (mounted) {
+        setState(() { _previewLoading = false; _previewError = true; });
+      }
+    }
+  }
+
+  Future<void> _loadDoctors() async {
+    if (!mounted) return;
+    final facilityId = context.read<AppState>().backendFacilityId;
+    // Hydrate from OFFLINE CACHE first (user bug 2026-08-20 "offline
+    // doctor not downloading, empty dropdown blocks submit"). The
+    // freshly-fetched list overwrites this later if online succeeds.
+    if (facilityId != null) {
+      try {
+        final store = await StaffCacheStore.open();
+        final cached = store.load('doctor', facilityId);
+        if (cached.isNotEmpty && mounted) {
+          _applyDoctors(cached);
+        }
+      } catch (_) {/* first launch — nothing cached */}
+    }
+    try {
+      final rows = await context.read<StaffApi>()
+          .list(role: 'doctor', facilityId: facilityId, withLogin: true);
+      if (!mounted || rows.isEmpty) return;
+      _applyDoctors(rows);
+      // Persist for the next offline open.
+      if (facilityId != null) {
+        try {
+          final store = await StaffCacheStore.open();
+          await store.save('doctor', facilityId, rows);
+        } catch (_) {/* best-effort */}
+      }
+    } catch (_) {
+      // Offline / server hiccup — cache hydrate already ran, so the
+      // dropdown has whatever the last successful fetch stored.
+    }
+  }
+
+  void _applyDoctors(List<Map<String, dynamic>> rows) {
+    // Safety on messy data: drop inactive rows, then collapse exact
+    // duplicate names (first row wins → its staff_id is what submits).
+    final seen = <String>{};
+    final cleaned = <Map<String, dynamic>>[
+      for (final r in rows)
+        if ((r['is_active'] as bool? ?? true) &&
+            seen.add((r['staff_name'] ?? '').toString().trim()))
+          r,
+    ];
+    if (cleaned.isEmpty) return;
+    setState(() {
+      _doctors = cleaned;
+      // One doctor per MMU is the normal case (user rule 2026-08-14):
+      // pre-select them so the counsellor never has to touch the field.
+      if (cleaned.length == 1) {
+        doctor = (cleaned.first['staff_name'] ?? '').toString();
+      }
+    });
+  }
+
+  /// Dropdown labels — backend roster ONLY (user rule 2026-08-13: no
+  /// hardcoded demo fallback). Until the fetch lands the dropdown is
+  /// empty and disabled; SearchDropdown handles the empty list.
+  List<String> get _doctorNames =>
+      [for (final d in _doctors) (d['staff_name'] ?? '').toString()];
+
+  /// staff_id of the selected doctor — null when the fallback demo list is
+  /// in use or nothing selected.
+  int? get _selectedDoctorId {
+    for (final d in _doctors) {
+      if ((d['staff_name'] ?? '').toString() == doctor) {
+        return (d['staff_id'] as num?)?.toInt();
+      }
+    }
+    return null;
+  }
+
   String? _contactError(String v) {
     if (v.isEmpty) return null;
     if (v.length != 10) return 'Must be 10 digits';
@@ -200,7 +399,8 @@ class _CounRegisterState extends State<CounRegister> {
     return a < 0 ? 0 : a;
   }
 
-  void _submit(CounsellorState s) {
+  Future<void> _submit(CounsellorState s) async {
+    if (_submitting) return; // double-tap guard while photos upload
     // Drop focus BEFORE any validation or setState. If the symptoms field
     // still holds focus when _reset() rebuilds the form, the enclosing
     // SingleChildScrollView auto-scrolls to reveal that field — which the
@@ -218,16 +418,54 @@ class _CounRegisterState extends State<CounRegister> {
     // profile (rule 2026-07-29); only block + village are picked here.
     if (block == null) return err('Select block');
     if (village == null) return err('Select village');
+    // Symptoms are mandatory (user 2026-08-22) — a visit with no recorded
+    // complaint gives the doctor and the advisory nothing to work from.
+    if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
     if (payment == 'Paid' && _amount.text.trim().isEmpty) return err('Enter paid amount');
     if (onMed && _attachments.isEmpty) return err('Attach at least one prescription or report');
+    if (pregnant && _lmp == null) return err('Pick the $_pregMode date');
+    // Vitals + height/weight are optional, but anything typed must
+    // satisfy the 2–3 digit rule (user 2026-08-14) — the field already
+    // shows the inline error.
+    if ([_sys, _dia, _sugar, _temp, _spo2, _hr, _hb, _height, _weight]
+        .any((c) => _vitalMinErr(c) != null)) {
+      return err('Check the highlighted vital values — out of allowed range');
+    }
+
+    // ── Photo upload happens at SUBMIT, not at capture (user rule
+    // 2026-08-13) — capturing then abandoning the form must not leave
+    // orphan files on the server. Each photo that hasn't been uploaded
+    // yet goes up now; on success the row gains its server name
+    // ("patient_docs/<uuid>.jpg"). Offline / timeout → the local path
+    // stays as fallback and the registration still goes through.
+    setState(() => _submitting = true);
+    try {
+      final uploads = context.read<UploadsApi>();
+      for (var i = 0; i < _attachments.length; i++) {
+        if (_attachments[i].serverPath != null) continue;
+        try {
+          final res = await uploads
+              .uploadImage(_attachments[i].path)
+              .timeout(const Duration(seconds: 25));
+          final name = (res['file_name'] as String?) ?? '';
+          if (name.isNotEmpty) {
+            _attachments[i] = _attachments[i].copyWith(serverPath: name);
+          }
+        } catch (_) {
+          // Offline or server hiccup — keep the phone-local path.
+        }
+      }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+    if (!mounted) return;
 
     final vitals = <String, String>{};
     void v(String k, TextEditingController c) { if (c.text.trim().isNotEmpty) vitals[k] = c.text.trim(); }
     v('Systolic BP', _sys); v('Diastolic BP', _dia); v('Blood Sugar', _sugar);
     v('Body Temp (°F)', _temp); v('Oxygen Saturation', _spo2); v('Heart Rate', _hr); v('Hemoglobin', _hb);
 
-    final scored = scoreDiseases(symptoms, block);
     // Re-Appointment carry-over (rule 2026-07-31). If the counsellor
     // launched this from a Patient Detail, propagate history so the doctor
     // sees Past Medical History, previous Rx and prior diagnosis on the
@@ -276,6 +514,20 @@ class _CounRegisterState extends State<CounRegister> {
         )),
     ];
 
+    // Remarks: OPTIONAL field. Translate ONLY when there is text
+    // (user 2026-08-20 "if no remarks then no need to translate").
+    // SILENT (user 2026-08-22 "dont show this message") — no modal; the
+    // translation runs inline with a hard 8 s cap so Submit never feels
+    // stuck. Worst case the original rides in both columns.
+    final remarksHi = _remarks.text.trim();
+    String remarksEn = remarksHi;
+    if (remarksHi.isNotEmpty) {
+      try {
+        remarksEn = await TranslationService.hiToEn(remarksHi)
+            .timeout(const Duration(seconds: 8));
+      } catch (_) {/* capped — raw text in both columns */}
+    }
+
     final p = CPatient(
       id: s.nextId(),
       name: _name.text.trim(),
@@ -290,18 +542,17 @@ class _CounRegisterState extends State<CounRegister> {
       block: block!,
       village: village!,
       symptoms: List.from(symptoms),
-      // Re-Appointment: prefer the carried previous diagnosis over the
-      // symptom-based ML score so the doctor sees the exact prior dx
-      // pre-selected. Fresh registration falls back to the ML top pick.
-      disease: carryDisease.isNotEmpty
-          ? carryDisease
-          : (scored.isNotEmpty ? scored.first.name : ''),
+      // Re-Appointment carries the PREVIOUS visit's real diagnosis for
+      // display; a fresh registration has NO disease — the ML guess is
+      // no longer stored anywhere (user 2026-08-22), it only lives in
+      // the live Likely-Conditions panel.
+      disease: carryDisease,
       // Re-Appointment: previous medicines pre-loaded on the doctor screen
       // (editable — doctor can add / remove / change dosage before Submit).
       prescription: carryPrescription,
       vitals: vitals,
       pregnant: pregnant,
-      remarks: _remarks.text.trim(),
+      remarks: remarksEn,
       uploadedRx: carryAttachments.isNotEmpty ? carryAttachments.first.path : '',
       attachments: carryAttachments,
       regDate: _apptDate != null ? fmtDate(_apptDate!) : fmtDate(DateTime.now()),
@@ -360,26 +611,12 @@ class _CounRegisterState extends State<CounRegister> {
       masters.masterRows('categories'), category,
       idKey: 'id', nameKey: 'name');
 
-    // Diagnoses — the counsellor form's "Likely Condition" pre-fill goes
-    // here as one appointment_diagnosis row so the doctor sees the
-    // prediction on their case detail. `disease_id` is resolved from the
-    // masters cache when possible; the backend stores diagnosis_text
-    // regardless so free-text diagnoses (not in the master) still land.
-    //
-    // Match against both `term` (canonical name) and `synonyms` (e.g.
-    // "Dengue Fever" → synonym of master "Dengue" id 97). Without the
-    // synonym pass the mobile's ML picker sends "Dengue Fever" and the
-    // backend link stays NULL because there's no exact-name row.
-    final diseaseId = _lookupDiseaseId(
-      masters.masterRows('diseases'), p.disease);
-    final diagnoses = <Map<String, dynamic>>[
-      if (p.disease.trim().isNotEmpty)
-        {
-          'diagnosis_text': p.disease,
-          if (diseaseId != null) 'disease_id': diseaseId,
-          'is_primary': true,
-        },
-    ];
+    // NO diagnoses at registration (user 2026-08-22 "Diagnosis showing
+    // Viral which one I didn't choose"): the app used to save its ML
+    // "likely condition" guess as a REAL appointment_diagnosis row, so
+    // records carried a diagnosis nobody picked. Diagnoses are the
+    // DOCTOR's to make — their Submit Case creates the rows.
+    final diagnoses = const <Map<String, dynamic>>[];
 
     // Attachments — Prescription / Report / Other photos the counsellor
     // picked up at registration. Each photo was uploaded to
@@ -405,9 +642,14 @@ class _CounRegisterState extends State<CounRegister> {
     final dobValue = (!knowAge && _dob != null) ? _isoDate(_dob!) : null;
 
     // Pregnancy dates — only meaningful when `pregnant` is true.
-    final lmpIso = (pregnant && _lmp != null) ? _isoDate(_lmp!) : null;
+    // LMP mode: lmp_date + derived edd_date. EDD mode: edd_date only —
+    // the counsellor picked the delivery date directly.
+    final lmpIso = (pregnant && _pregMode == 'LMP' && _lmp != null)
+        ? _isoDate(_lmp!) : null;
     final eddIso = (pregnant && _lmp != null)
-        ? _isoDate(_lmp!.add(const Duration(days: 280)))
+        ? (_pregMode == 'LMP'
+            ? _isoDate(_lmp!.add(const Duration(days: 280)))
+            : _isoDate(_lmp!))
         : null;
 
     // Aadhaar / pin: send only when they look valid so the backend
@@ -419,7 +661,13 @@ class _CounRegisterState extends State<CounRegister> {
     final pinValue = RegExp(r'^[1-9]\d{5}$').hasMatch(pinDigits)
         ? pinDigits : null;
 
+    // Re-Appointment: hand the existing backend patient_id to the
+    // server so `/mobile/sync/push` (mobile._register) attaches the new
+    // appointment to the same patient row instead of inserting a
+    // duplicate (user rule 2026-08-16).
+    final reappointmentPatientId = _reAppointmentSource?.backendPatientId;
     context.read<SyncService>().enqueue(kind: 'patient.register', payload: {
+      if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
       // Basic identity
       'patient_name':      p.name,
       'gender':            p.gender,
@@ -445,6 +693,10 @@ class _CounRegisterState extends State<CounRegister> {
       // Python `date` format, NOT the dd-MM-yyyy display format that
       // CPatient.regDate uses.
       'appointment_date':  _isoDate(_apptDate ?? DateTime.now()),
+      // staff_id of the assigned doctor (backend roster). Null when the
+      // offline fallback list was used — server stores NULL, same as a
+      // legacy handset.
+      if (_selectedDoctorId != null) 'assigned_doctor_id': _selectedDoctorId,
       'payment_type':      payment,
       'paid_amount':       payment == 'Paid'
           ? (num.tryParse(_amount.text.trim()) ?? 0) : 0,
@@ -452,8 +704,14 @@ class _CounRegisterState extends State<CounRegister> {
       if (lmpIso != null) 'lmp_date': lmpIso,
       if (eddIso != null) 'edd_date': eddIso,
       'taken_prescribed_medicine': onMed,
-      if (_remarks.text.trim().isNotEmpty)
-        'counsellor_remarks': _remarks.text.trim(),
+      // Final design 2026-08-22 (DB owner): ORIGINAL as dictated →
+      // patients.remarks via counsellor_remarks; the app-side translation →
+      // patients.remarks_english. Blank field → neither key is sent, the
+      // server stores ''.
+      if (remarksHi.isNotEmpty)
+        'counsellor_remarks': remarksHi,
+      if (remarksEn.isNotEmpty)
+        'counsellor_remarks_english': remarksEn,
       // Vitals — send only fields the counsellor actually typed so a
       // NULL doesn't get stored as a real reading.
       if (_asInt(_sys)      != null) 'systolic_bp':  _asInt(_sys),
@@ -473,15 +731,32 @@ class _CounRegisterState extends State<CounRegister> {
       if (diagnoses.isNotEmpty)   'diagnoses':   diagnoses,
       if (attachments.isNotEmpty) 'attachments': attachments,
     });
+    // Redirect FIRST, then show the snackbar. Any unexpected throw between
+    // enqueue and this line was leaving the counsellor stranded on the
+    // register form with the patient already saved (user 2026-08-20:
+    // "data is saving but not redirecting anywhere"). Doing the redirect
+    // immediately after the local addPatient makes the tab switch
+    // unconditional; snackbar + reset run on the way out.
+    try {
+      // Remember today's location for the next patient — clears on logout.
+      () async {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          if (block != null && block!.isNotEmpty) {
+            await prefs.setString(_kLastBlock, block!);
+          }
+          if (village != null && village!.isNotEmpty) {
+            await prefs.setString(_kLastVillage, village!);
+          }
+        } catch (_) {}
+      }();
+      widget.onSubmitted?.call();
+    } catch (_) {/* redirect must never block the toast/reset below */}
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),
       backgroundColor: C2.green,
     ));
     _reset();
-    // Bounce back to the Home tab so the counsellor sees the newly-added
-    // patient at the top of the "Registered Patients" list (addPatient
-    // inserts at index 0). onSubmitted is provided by CounsellorShell.
-    widget.onSubmitted?.call();
   }
 
   void _reset() {
@@ -489,11 +764,19 @@ class _CounRegisterState extends State<CounRegister> {
       for (final c in [_name,_age,_contact,_aadhar,_height,_weight,_pin,_address,_sys,_dia,_sugar,_temp,_spo2,_hr,_hb,_amount,_remarks]) {
         c.clear();
       }
-      gender = 'Female'; pregnant = false; _lmp = null; knowAge = true; _dob = null; block = null; village = null;
+      gender = 'Female'; pregnant = false; _lmp = null; _pregMode = 'LMP'; knowAge = true; _dob = null;
+      // Location sticks across submits (user 2026-08-25) — MMU camps one
+      // village at a time; logout wipes the prefs so a different user
+      // starts blank. block + village intentionally NOT cleared here.
       // state + district removed 2026-07-29 — inherited from AppState.
       showAdvanced = false; showVitals = false;
       bloodGroup = null; category = null; pwd = 'No'; onMed = false; payment = 'Free';
-      doctor = null; _apptDate = DateTime.now(); symptoms.clear(); _attachments.clear();
+      // Single-doctor MMU: keep them selected across resets — the field
+      // is locked, there is nothing else to pick (user rule 2026-08-14).
+      doctor = _doctors.length == 1
+          ? (_doctors.first['staff_name'] ?? '').toString()
+          : null;
+      _apptDate = DateTime.now(); symptoms.clear(); _attachments.clear();
       // Drop the re-appointment source so the next fresh registration
       // doesn't accidentally inherit history from the previous submit.
       _reAppointmentSource = null;
@@ -516,21 +799,68 @@ class _CounRegisterState extends State<CounRegister> {
       _name.text = p.name;
       if (const ['Female','Male','Other'].contains(p.gender)) gender = p.gender;
       pregnant = p.pregnant;
+      // Re-select the pregnancy date (user 2026-08-21): an LMP on record
+      // wins (the EDD next to it is just LMP+280); an EDD-only record
+      // re-opens in EDD mode. Nothing on record → picker stays blank.
+      final prevLmp = DateTime.tryParse(p.lmpDate);
+      final prevEdd = DateTime.tryParse(p.eddDate);
+      final today = DateTime.now();
+      if (pregnant && prevLmp != null) {
+        _pregMode = 'LMP'; _lmp = prevLmp;
+      } else if (pregnant && prevEdd != null &&
+          !prevEdd.isBefore(DateTime(today.year, today.month, today.day))) {
+        // EDD mode only allows future dates — an already-passed EDD
+        // (delivered) would break the picker, so it stays blank instead.
+        _pregMode = 'EDD'; _lmp = prevEdd;
+      } else {
+        _pregMode = 'LMP'; _lmp = null;
+      }
       knowAge = true;
       _age.text = p.age > 0 ? p.age.toString() : '';
       _dob = null;
       _contact.text = p.contact;
       block = p.block.isEmpty ? null : p.block;
       village = p.village.isEmpty ? null : p.village;
-      _remarks.text = p.remarks;
+      // INPUT gets the ORIGINAL as dictated, never the English display
+      // copy (user 2026-08-22 "dont show english version in inputs").
+      _remarks.text =
+          p.remarksOriginal.isNotEmpty ? p.remarksOriginal : p.remarks;
       // Carry the previous symptom picks over (rule 2026-07-31) so the
       // counsellor can just tweak them for today's visit instead of
-      // re-selecting from scratch. Vitals still reset — per-visit reading.
+      // re-selecting from scratch.
       symptoms
         ..clear()
         ..addAll(p.symptoms);
+      // Vitals prefill (user rule 2026-08-13): show the LAST visit's
+      // readings so the counsellor sees them selected and just updates
+      // what changed. Keys cover both spellings the app has written —
+      // 'Oxygen' (backend hydrate) and 'Oxygen Saturation' (local form).
+      String vital(List<String> keys) {
+        for (final k in keys) {
+          final v = p.vitals[k];
+          if (v != null && v.trim().isNotEmpty) return v.trim();
+        }
+        return '';
+      }
+      _sys.text   = vital(['Systolic BP']);
+      _dia.text   = vital(['Diastolic BP']);
+      _sugar.text = vital(['Blood Sugar']);
+      _temp.text  = vital(['Body Temp (°F)']);
+      _spo2.text  = vital(['Oxygen', 'Oxygen Saturation']);
+      _hr.text    = vital(['Heart Rate']);
+      _hb.text    = vital(['Hemoglobin']);
+      // Auto-expand the vitals section when anything came through, so the
+      // prefill is visible instead of hiding behind the collapsed toggle.
+      showVitals = [_sys, _dia, _sugar, _temp, _spo2, _hr, _hb]
+          .any((c) => c.text.isNotEmpty);
       _attachments.clear();
-      doctor = null;
+      // Previous visit's doctor pre-selected (rule 2026-08-13) — the
+      // hydrate stored their staff_name; keep it only when it exists in
+      // the loaded roster so the dropdown never shows a stale name.
+      doctor = (p.assignedDoctor != null &&
+              _doctorNames.contains(p.assignedDoctor))
+          ? p.assignedDoctor
+          : null;
       payment = 'Free';
       _amount.clear();
       _apptDate = DateTime.now();
@@ -552,6 +882,26 @@ class _CounRegisterState extends State<CounRegister> {
   @override
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
+    // Abandoned re-appointment residue: the shell raised this flag because
+    // the counsellor entered Register normally. Reset ONLY when the form is
+    // actually still in re-appointment mode — a half-typed fresh
+    // registration is left untouched.
+    if (s.consumeAbandonedReAppointmentClear() &&
+        _reAppointmentSource != null && !s.hasPrefill) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reset();
+      });
+    }
+    // Full tab-leave reset (user rule 2026-08-16): the shell raised
+    // this flag when the counsellor navigated AWAY from Register in-app
+    // (tab switch or back button). Blank everything so the next entry
+    // is a fresh form. Skipped if a Re-Appointment is being staged
+    // (hasPrefill) — that flow wants the prefill preserved.
+    if (s.consumeRegisterFullReset() && !s.hasPrefill) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _reset();
+      });
+    }
     // If Status handed us a patient to re-appoint, consume it after the frame
     // so setState is safe and the notifier doesn't trigger a rebuild loop.
     if (s.hasPrefill) {
@@ -573,18 +923,49 @@ class _CounRegisterState extends State<CounRegister> {
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const SecBar('Basic Details'),
         CField('Name', TextField(controller: _name, decoration: cInput('Patient name')), required: true),
-        CField('Gender', _radios(['Female','Male','Other'], gender, (v) => setState(() { gender = v; if (v != 'Female') pregnant = false; })), required: true),
+        // Switching gender resets the WHOLE pregnancy block — flag, mode
+        // AND picked date. Before, only the flag cleared, so Female → Male
+        // → Female resurrected the stale LMP/EDD date (user 2026-08-21).
+        CField('Gender', _radios(['Female','Male','Other'], gender, (v) => setState(() {
+          if (v != gender) { pregnant = false; _lmp = null; _pregMode = 'LMP'; }
+          gender = v;
+        })), required: true),
         if (gender == 'Female') ...[
           Row(children: [
             Checkbox(value: pregnant, activeColor: C2.cyan, onChanged: (v) => setState(() => pregnant = v ?? false)),
             Text('Is Patient Pregnant?', style: ct(13, FontWeight.w500, C2.text)),
           ]),
           if (pregnant) ...[
-            CField('LMP (last menstrual period)',
-              DateField(hint: 'Pick LMP date', first: DateTime(2025), last: DateTime.now(),
-                initial: _lmp, onPicked: (d) => setState(() => _lmp = d)),
+            // EDD / LMP selector (user 2026-08-14): LMP is a past date,
+            // EDD a future one — the picker's range enforces it.
+            CField('EDD / LMP Date',
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                SizedBox(width: 96, child: DropdownButtonFormField<String>(
+                  value: _pregMode,
+                  isDense: true,
+                  decoration: cInput().copyWith(contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12)),
+                  style: ct(13.5, FontWeight.w600, C2.text),
+                  items: const [
+                    DropdownMenuItem(value: 'LMP', child: Text('LMP')),
+                    DropdownMenuItem(value: 'EDD', child: Text('EDD')),
+                  ],
+                  onChanged: (v) => setState(() {
+                    if (v != null && v != _pregMode) { _pregMode = v; _lmp = null; }
+                  }),
+                )),
+                const SizedBox(width: 8),
+                Expanded(child: DateField(
+                  hint: _pregMode == 'LMP' ? 'Pick LMP date' : 'Pick EDD date',
+                  first: _pregMode == 'LMP' ? DateTime(2025) : DateTime.now(),
+                  last: _pregMode == 'LMP'
+                      ? DateTime.now()
+                      : DateTime.now().add(const Duration(days: 300)),
+                  initial: _lmp,
+                  onPicked: (d) => setState(() => _lmp = d),
+                )),
+              ]),
               required: true),
-            if (_lmp != null)
+            if (_pregMode == 'LMP' && _lmp != null)
               Padding(
                 padding: const EdgeInsets.only(left: 4, bottom: 4),
                 child: Row(children: [
@@ -613,10 +994,20 @@ class _CounRegisterState extends State<CounRegister> {
         // and Village pickers below.
         Builder(builder: (context) {
           final app = context.watch<AppState>();
+          final geo = context.watch<MastersStore>();
           final assignedState    = app.currentMmuState;
           final assignedDistrict = app.currentMmuDistrict;
-          final blocks = (kDistrictBlocks[assignedDistrict] ?? const <String>[]);
+          // Blocks + villages come from the backend geography cascade
+          // (downloaded right after login using the facility's
+          // district_id — user rule 2026-08-13). The hardcoded
+          // kDistrictBlocks / kBlockVillages maps only kick in as a
+          // fallback while the very first download hasn't landed yet.
+          final blocks = geo.hasGeo
+              ? geo.geoBlockNames
+              : (kDistrictBlocks[assignedDistrict] ?? const <String>[]);
           return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            // State + District as the compact read-only line (user
+            // 2026-08-14: back to the old way — locked input fields out).
             Padding(
               padding: const EdgeInsets.only(bottom: 6),
               child: Row(children: [
@@ -629,7 +1020,14 @@ class _CounRegisterState extends State<CounRegister> {
               ]),
             ),
             CField('Block', SearchDropdown(items: blocks, value: block, hint: 'Select Block', onChanged: (v) => setState(() { block = v; village = null; })), required: true),
-            CField('Village', SearchDropdown(items: block == null ? const <String>[] : (kBlockVillages[block!] ?? const ['Other']), value: village, hint: 'Select Village', onChanged: (v) => setState(() => village = v)), required: true),
+            CField('Village', SearchDropdown(
+              items: block == null
+                  ? const <String>[]
+                  : (geo.hasGeo
+                      ? geo.geoVillagesOf(block!)
+                      : (kBlockVillages[block!] ?? const ['Other'])),
+              value: village, hint: 'Select Village',
+              onChanged: (v) => setState(() => village = v)), required: true),
           ]);
         }),
       ])),
@@ -637,7 +1035,30 @@ class _CounRegisterState extends State<CounRegister> {
       // SYMPTOMS (its own section, not part of Advance Details)
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const SecBar('Symptoms of the Patient'),
-        SymptomField(selected: symptoms, block: block, onChanged: (v) => setState(() { symptoms..clear()..addAll(v); })),
+        SymptomField(
+          selected: symptoms,
+          block: block,
+          // Village panel deliberately HIDDEN on Register (user
+          // 2026-08-27) — trending still fetched below so the Likely
+          // Conditions card keeps its village-share bonus; only the
+          // visible "Common in <village>" chip strip is suppressed.
+          hideVillagePanel: true,
+          placeName: village ?? block,
+          trending: _previewTrending,
+          serverRelated: _previewRelated,
+          serverLikely: _previewLikely,
+          loading: _previewLoading,
+          error: _previewError,
+          onRetry: () {
+            setState(() { _previewError = false; _previewLoading = true; });
+            _lastPreviewKey = '';
+            _fetchPreview();
+          },
+          onChanged: (v) => setState(() {
+            symptoms..clear()..addAll(v);
+            _schedulePreview();
+          }),
+        ),
       ])),
 
       // ADVANCE (collapsible)
@@ -646,9 +1067,10 @@ class _CounRegisterState extends State<CounRegister> {
         if (showAdvanced) ...[
           CField('Aadhar Number', TextField(controller: _aadhar, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(12)], decoration: cInput())),
           Row(children: [
-            Expanded(child: CField('Height (cm)', TextField(controller: _height, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            // 2–3 digits, at most 1 decimal place (user 2026-08-14).
+            Expanded(child: CField('Height (cm)', TextField(controller: _height, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3, decimals: 1)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 160.5').copyWith(errorText: _vitalMinErr(_height))))),
             const SizedBox(width: 8),
-            Expanded(child: CField('Weight (kg)', TextField(controller: _weight, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            Expanded(child: CField('Weight (kg)', TextField(controller: _weight, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3, decimals: 1)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 55.2').copyWith(errorText: _vitalMinErr(_weight))))),
           ]),
           Row(children: [
             Expanded(child: CField('Blood Group', _dd(kBloodGroups, bloodGroup, (v) => setState(() => bloodGroup = v), hint: 'Select'))),
@@ -666,22 +1088,24 @@ class _CounRegisterState extends State<CounRegister> {
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         SecBar('Vitals', trailing: _toggle(showVitals, (v) => setState(() => showVitals = v))),
         if (showVitals) ...[
+          // Every field: placeholder + 2–3 digit rule (decimals where the
+          // measurement has them; max 2 decimal places) — user 2026-08-14.
           Row(children: [
-            Expanded(child: CField('Systolic BP (mmHg)', TextField(controller: _sys, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            Expanded(child: CField('Systolic BP (mmHg)', TextField(controller: _sys, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 120').copyWith(errorText: _vitalMinErr(_sys))))),
             const SizedBox(width: 8),
-            Expanded(child: CField('Diastolic BP (mmHg)', TextField(controller: _dia, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            Expanded(child: CField('Diastolic BP (mmHg)', TextField(controller: _dia, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 80').copyWith(errorText: _vitalMinErr(_dia))))),
           ]),
           Row(children: [
-            Expanded(child: CField('Blood Sugar (mg/dl)', TextField(controller: _sugar, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            Expanded(child: CField('Blood Sugar (mg/dl)', TextField(controller: _sugar, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 110').copyWith(errorText: _vitalMinErr(_sugar))))),
             const SizedBox(width: 8),
-            Expanded(child: CField('Body Temp (°F)', TextField(controller: _temp, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3)], decoration: cInput('e.g. 100.1')))),
+            Expanded(child: CField('Body Temp (°F)', TextField(controller: _temp, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 98.6').copyWith(errorText: _vitalMinErr(_temp))))),
           ]),
           Row(children: [
-            Expanded(child: CField('Oxygen Saturation (%)', TextField(controller: _spo2, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(2)], decoration: cInput()))),
+            Expanded(child: CField('Oxygen Saturation (%)', TextField(controller: _spo2, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 98.5').copyWith(errorText: _vitalMinErr(_spo2))))),
             const SizedBox(width: 8),
-            Expanded(child: CField('Heart Rate (BPM)', TextField(controller: _hr, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput()))),
+            Expanded(child: CField('Heart Rate (BPM)', TextField(controller: _hr, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 72').copyWith(errorText: _vitalMinErr(_hr))))),
           ]),
-          CField('Hemoglobin (g/dl)', TextField(controller: _hb, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(2)], decoration: cInput('e.g. 12.5'))),
+          CField('Hemoglobin (g/dl)', TextField(controller: _hb, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 12.5').copyWith(errorText: _vitalMinErr(_hb)))),
         ] else
           Text('Turn on to record BP, sugar, temperature and more.', style: ct(11.5, FontWeight.w400, C2.text2)),
       ])),
@@ -714,15 +1138,36 @@ class _CounRegisterState extends State<CounRegister> {
         CField('Payment', _radios(['Paid','Free'], payment, (v) => setState(() => payment = v)), required: true),
         if (payment == 'Paid')
           CField('Paid Amount (₹)', TextField(controller: _amount, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)], decoration: cInput()), required: true),
-        CField('Doctor Assignment', _dd(kDoctors, doctor, (v) => setState(() => doctor = v), hint: 'Select Doctor'), required: true),
-        CField('Patient Remarks', TextField(controller: _remarks, minLines: 2, maxLines: 4, decoration: cInput('Type or use the mic').copyWith(
-          suffixIcon: VoiceMicButton(
+        // Single-doctor MMU (the normal case): show them locked — no
+        // dropdown to mis-tap. Multiple rows (e.g. until the backend
+        // with_login deploy lands) keep the picker so nothing breaks.
+        CField('Doctor Assignment',
+            _doctorNames.length == 1
+                ? _lockedField(doctor ?? _doctorNames.first)
+                : _dd(_doctorNames, doctor, (v) => setState(() => doctor = v), hint: 'Select Doctor'),
+            required: true),
+        // Patient Remarks — Deepgram STT (nova-2 + language=hi, locked
+        // 2026-08-19 after 10/10 scripted test; nova-3 multi rejected for
+        // English-word injection) with OFFLINE FALLBACK to the Google
+        // SpeechRecognizer (RemarksMicButton decides per connectivity).
+        // Every OTHER mic field keeps Google STT (verdict 2026-08-18).
+        // Box grows with the text.
+        CField('Patient Remarks', TextField(controller: _remarks, minLines: 2, maxLines: null,
+          keyboardType: TextInputType.multiline,
+          decoration: cInput('Type or use the mic').copyWith(
+          suffixIcon: RemarksMicButton(
             key: ValueKey('remarks-mic-$_voiceMicSeq'),
             controller: _remarks)))),
       ])),
 
       const SizedBox(height: 4),
-      CPrimaryButton('Submit', icon: Icons.check_circle_outline, onTap: () => _submit(s)),
+      CPrimaryButton(
+        _submitting ? 'Submitting…' : 'Submit',
+        icon: Icons.check_circle_outline,
+        // Disabled + "Submitting…" while the submit (incl. photo upload)
+        // is in flight — double-tap can't enqueue the registration twice.
+        onTap: _submitting ? null : () => _submit(s),
+      ),
     ]),
     );
   }
@@ -744,4 +1189,73 @@ class _CounRegisterState extends State<CounRegister> {
 
   Widget _dd(List<String> items, String? val, ValueChanged<String?> onCh, {String? hint}) =>
       SearchDropdown(items: items, value: val, hint: hint ?? 'Select', onChanged: onCh);
+
+  /// Vitals rule (user 2026-08-14): whatever is typed must have 2–3
+  /// digits before the decimal (the max is enforced by the input
+  /// formatters). Empty is fine — vitals are optional.
+  /// Clinical plausibility ranges (user 2026-08-22) — replace the old
+  /// "min 2 digits" rule for the seven vitals. Blank stays allowed
+  /// (vitals are optional); height/weight keep the digit floor.
+  late final Map<TextEditingController, (double, double, String)>
+      _vitalRanges = {
+    _sys:   (60, 280, 'Allowed 60–280'),
+    _dia:   (40, 150, 'Allowed 40–150'),
+    _sugar: (20, 600, 'Allowed 20–600'),
+    _temp:  (86, 113, 'Allowed 86–113 °F'),
+    _spo2:  (50, 100, 'Allowed 50–100%'),
+    _hr:    (30, 220, 'Allowed 30–220'),
+    _hb:    (3, 25, 'Allowed 3–25'),
+  };
+
+  String? _vitalMinErr(TextEditingController c) {
+    final t = c.text.trim();
+    if (t.isEmpty) return null;
+    final r = _vitalRanges[c];
+    if (r == null) {
+      // Height / weight — unchanged digit floor.
+      if (t.split('.').first.length < 2) return 'Min 2 digits';
+      return null;
+    }
+    final v = double.tryParse(t);
+    if (v == null || v < r.$1 || v > r.$2) return r.$3;
+    return null;
+  }
+
+  /// Read-only input look-alike for values assigned by the web admin
+  /// (State / District). Renders with the same border/padding as every
+  /// other field, a lock suffix instead of a dropdown arrow, and no tap
+  /// handler — visibly a field, visibly not editable.
+  Widget _lockedField(String v) => InputDecorator(
+        decoration: cInput().copyWith(
+          suffixIcon: const Icon(Icons.lock_outline, size: 16, color: C2.text3),
+        ),
+        child: Text(
+          v.isEmpty ? '—' : v,
+          overflow: TextOverflow.ellipsis,
+          style: ct(13.5, FontWeight.w600, v.isEmpty ? C2.text3 : C2.text),
+        ),
+      );
+}
+
+
+/// Modal shown while remarks are being translated hi→en at submit
+/// (user 2026-08-20 "loader progress bar aisa kuch use kar sakte ho"),
+/// so the counsellor sees why submit takes a moment.
+class _TranslatingDialog extends StatelessWidget {
+  const _TranslatingDialog();
+  @override
+  Widget build(BuildContext context) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        insetPadding: const EdgeInsets.symmetric(horizontal: 40),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const SizedBox(width: 22, height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2.4, color: C2.cyan)),
+            const SizedBox(width: 14),
+            Flexible(child: Text("Translating remarks\u2026",
+                style: ct(13.5, FontWeight.w600, C2.text))),
+          ]),
+        ),
+      );
 }

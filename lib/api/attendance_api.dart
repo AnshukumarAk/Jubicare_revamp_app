@@ -22,6 +22,11 @@ class AttendanceApi {
     double? longitude,
     int? startKm,
     String? notes,
+    // Roles ticked in Staff Present — backend auto-creates their rows
+    // (ATTEND task C, 2026-08-18). Counsellor-only server-side.
+    List<String>? staffPresent,
+    // Name of the "Other" person → attendance.other_staff (2026-08-19).
+    String? staffOtherName,
   }) async {
     final res = await client.post('/attendance/check-in', body: {
       if (campAnchorId != null) 'camp_anchor_id': campAnchorId,
@@ -31,6 +36,10 @@ class AttendanceApi {
       if (longitude   != null) 'longitude':      longitude,
       if (startKm     != null) 'start_km':       startKm,
       if (notes       != null) 'notes':          notes,
+      if (staffPresent != null && staffPresent.isNotEmpty)
+        'staff_present': staffPresent,
+      if (staffOtherName != null && staffOtherName.trim().isNotEmpty)
+        'staff_other_name': staffOtherName.trim(),
     });
     return (res as Map).cast<String, dynamic>();
   }
@@ -42,6 +51,9 @@ class AttendanceApi {
     int? endKm,
     num? collection,
     String? notes,
+    // Roles ticked in Staff Checking Out — backend closes their open
+    // rows (ATTEND task C).
+    List<String>? staffOut,
   }) async {
     final res = await client.post('/attendance/check-out', body: {
       if (photoKey  != null) 'photo_key':  photoKey,
@@ -50,6 +62,7 @@ class AttendanceApi {
       if (endKm     != null) 'end_km':     endKm,
       if (collection!= null) 'collection': collection,
       if (notes     != null) 'notes':      notes,
+      if (staffOut != null && staffOut.isNotEmpty) 'staff_out': staffOut,
     });
     return (res as Map).cast<String, dynamic>();
   }

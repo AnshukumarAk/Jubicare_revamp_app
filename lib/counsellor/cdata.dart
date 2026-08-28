@@ -389,4 +389,8 @@ const List<String> kCategories = ['General','OBC','SC','ST','N/A'];
 const List<String> kDoctors = ['Dr. Aakanksha','Dr. Kedar','Dr. Nitin'];
 const List<String> kCampTypes = ['Community','School','Workplace','Health Awareness'];
 const List<String> kDeviceNames = ['Sphygmomanometer','Glucometer','Haemoglobinometer','Weighing Machine'];
-const List<String> kDeviceStates = ['Working','Not Working','Not Applicable','Purchase Requested'];
+// 'Purchase Requested' removed from the dropdown (user rule 2026-08-16 —
+// only status options a counsellor picks at the MMU; procurement lives
+// on the portal). Kept in the legend renderers so legacy rows still
+// display correctly if the backend ever returns that value.
+const List<String> kDeviceStates = ['Working','Not Working','Not Applicable'];

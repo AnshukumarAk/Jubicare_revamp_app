@@ -23,6 +23,10 @@ class AuthPersistence {
   static const _kUsername    = 'username';
   static const _kMmuId       = 'mmu_id';
   static const _kBackendUser = 'backend_user';
+  // Counsellor-scoped form drafts that must not leak across logins
+  // (user 2026-08-26: another counsellor on the same phone was seeing
+  // the previous user's pre-selected block/village).
+  static const _kFormKeys = ['coun_last_block', 'coun_last_village'];
 
   /// Save the logged-in session after a successful login.
   static Future<void> save({
@@ -54,6 +58,9 @@ class AuthPersistence {
     await p.remove(_kUsername);
     await p.remove(_kMmuId);
     await p.remove(_kBackendUser);
+    for (final k in _kFormKeys) {
+      await p.remove(k);
+    }
   }
 
   /// Read the stored session. Returns null when the flag is unset or the
@@ -79,7 +86,7 @@ class AuthPersistence {
     }
     return StoredSession(
       role:        role,
-      username:    p.getString(_kUsername) ?? role.fullName,
+      username:    p.getString(_kUsername) ?? '',
       mmuId:       p.getString(_kMmuId),
       backendUser: backendUser,
     );

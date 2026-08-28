@@ -29,29 +29,10 @@ extension RoleX on Role {
         Role.pharmacist => const Color(0xFFFBB615),
       };
 
-  /// Demo display name shown after login.
-  String get demoUser => fullName;
-
-  /// Full display name shown after login (CR29).
-  String get fullName => switch (this) {
-        Role.counselor => 'Sanjeev Mahto',
-        Role.doctor => 'Dr. Aakanksha Dua',
-        Role.pharmacist => 'Kedar Dash',
-      };
-
-  /// Login username for this role (CR29).
-  String get credUser => switch (this) {
-        Role.counselor => 'con_test',
-        Role.doctor => 'doc_test',
-        Role.pharmacist => 'pha_test',
-      };
-
-  /// Login password for this role (CR29).
-  String get credPass => switch (this) {
-        Role.counselor => 'con@123',
-        Role.doctor => 'doc@123',
-        Role.pharmacist => 'pha@123',
-      };
+  // Demo identities (fullName / credUser / credPass) are gone. Sign-in is
+  // exclusively /api/auth/login and display names come from the backend
+  // full_name (user rule 2026-08-14: real API, real users — no demo
+  // credentials or person names compiled into the app).
 }
 
 /// MMU vehicle option shown in the counsellor login dropdown. IDs match

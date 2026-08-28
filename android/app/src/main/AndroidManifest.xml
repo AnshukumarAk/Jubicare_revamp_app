@@ -1,6 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- Check-out reminders (ATTEND task D2, 2026-08-18): Android 13+
+         needs explicit consent to show notifications; BOOT_COMPLETED lets
+         the scheduled 3h/6h/9h reminders survive a phone restart. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <!-- MMU location tracking (foreground only — no BACKGROUND_LOCATION). -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
@@ -15,16 +20,23 @@
             <action android:name="android.speech.RecognitionService"/>
         </intent>
     </queries>
+    <!-- allowBackup MUST sit on <application> (on <activity> Android
+         silently ignores it — that was the bug). With backup on, a
+         delete + reinstall restored the old install's SharedPreferences
+         (session + tokens) from Google's device backup, so testers
+         landed on a stale logged-in dashboard with dead tokens instead
+         of the login screen. -->
     <application
         android:label="JubiCare MMU"
         android:name="${applicationName}"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
             android:taskAffinity=""
-            android:allowBackup="false"
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
@@ -47,6 +59,25 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- FCM (task D1): background/killed-state pushes land on this
+             channel — the same one the in-app reminders use, so the user
+             manages a single "Attendance" channel in Android settings. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="attend" />
+        <!-- flutter_local_notifications: deliver scheduled check-out
+             reminders (D2) and re-register them after a reboot. -->
+        <receiver android:exported="false"
+            android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+        <receiver android:exported="false"
+            android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

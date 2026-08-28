@@ -32,29 +32,48 @@ class CampsApi {
     return const [];
   }
 
+  /// GET /camps/anchors — the facility's camp GPS anchors. The check-in
+  /// screen snaps its Location to the nearest one; an empty list means
+  /// the facility has none configured (fall back to facility name).
+  Future<List<Map<String, dynamic>>> anchors() async {
+    final res = await client.get('/camps/anchors');
+    if (res is List) {
+      return [ for (final r in res) if (r is Map) r.cast<String, dynamic>() ];
+    }
+    return const [];
+  }
+
   /// POST /camps — record a new camp. Server pins `facility_id` to the
-  /// caller's own facility when omitted.
+  /// caller's own facility when omitted. Geography can travel either as
+  /// `villageId` or as `villageName`+`blockName` (server resolves the
+  /// pair). `photos` are bare /mobile/uploads filenames (user 2026-08-19).
   Future<Map<String, dynamic>> create({
     required String campName,
     required String campType, // Community / School / Workplace / Health Awareness
-    required int villageId,
     required String campDate, // yyyy-mm-dd
+    int? villageId,
+    String? villageName,
+    String? blockName,
     String venue = '',
     int? attendees,
     String services = '',
     String notes = '',
     int? facilityId,
+    List<String> photos = const [],
   }) async {
     final res = await client.post('/camps', body: {
       'camp_name': campName,
       'camp_type': campType,
-      'village_id': villageId,
       'camp_date':  campDate,
+      if (villageId != null)   'village_id':   villageId,
+      if (villageName != null) 'village_name': villageName,
+      if (blockName != null)   'block_name':   blockName,
       if (venue.isNotEmpty)   'venue':    venue,
       if (attendees != null)  'attendees': attendees,
       if (services.isNotEmpty) 'services': services,
       if (notes.isNotEmpty)   'notes':    notes,
       if (facilityId != null) 'facility_id': facilityId,
+      if (photos.isNotEmpty)  'photos':   photos,
     });
     return (res as Map).cast<String, dynamic>();
   }

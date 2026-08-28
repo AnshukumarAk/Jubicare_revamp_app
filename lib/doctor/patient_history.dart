@@ -160,8 +160,10 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
           Text(p.name, style: ct(16, FontWeight.w700, C2.text)),
           Text('${p.gender}, ${p.age}y${p.contact.isEmpty ? '' : ' · ${p.contact}'}',
               style: ct(12, FontWeight.w400, C2.text2)),
-          Text('${p.village.isEmpty ? '—' : p.village}'
-              '${p.uniqueCode.isEmpty ? '' : ' · ${p.uniqueCode}'}',
+          // Unique code shown on the name card again (user 2026-08-22).
+          Text(
+              '${p.uniqueCode.isEmpty ? '' : '${p.uniqueCode} · '}'
+              '${p.village.isEmpty ? '—' : p.village}',
               style: ct(11.5, FontWeight.w400, C2.text2)),
         ])),
       ]));
@@ -170,7 +172,14 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
     final date = _fmtDate('${v['appointment_date'] ?? ''}');
     final status = '${v['status'] ?? ''}';
     final dx = _diagnoses(v);
-    final (advised, remarks) = _splitAdvisedTests('${v['doctor_remarks'] ?? ''}');
+    // English version leads on this screen (user 2026-08-22); the original
+    // (Hindi as dictated) is the fallback for rows without a translation.
+    String en(String englishKey, String originalKey) {
+      final e = '${v[englishKey] ?? ''}'.trim();
+      return e.isNotEmpty ? e : '${v[originalKey] ?? ''}';
+    }
+    final (advised, remarks) =
+        _splitAdvisedTests(en('doctor_remarks_english', 'doctor_remarks'));
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: CCard(
@@ -186,21 +195,24 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
                   style: ct(13.5, FontWeight.w700, C2.navy))),
               if (status.isNotEmpty) _statusChip(status),
             ]),
-            subtitle: Padding(
-              padding: const EdgeInsets.only(top: 2),
-              child: Text(dx.isEmpty ? 'No diagnosis recorded' : dx.join(', '),
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
-                  style: ct(11.5, FontWeight.w400, C2.text2)),
-            ),
+            // Subtitle diagnosis line removed (user rule 2026-08-16 —
+            // it duplicated the Diagnosis row inside the expanded card
+            // and read like a hardcoded label). Doctor sees the same
+            // text one row down when the card opens.
             children: [
               _kv('Symptoms', _symptoms(v).join(', ')),
               _kv('Diagnosis', dx.join(', ')),
               _vitalsLine(v),
               _testsBlock(v, advised),
               _rxBlock(v),
-              _kv('Observation', '${v['observation'] ?? ''}'),
+              _kv('Observation', en('observation_english', 'observation')),
               _kv('Doctor Remarks', remarks),
-              _kv('Counsellor Remarks', '${v['counsellor_remarks'] ?? ''}'),
+              // Label renamed Counsellor → Patient Remarks (user 2026-08-22).
+              _kv('Patient Remarks',
+                  en('counsellor_remarks_english', 'counsellor_remarks')),
+              // Next Follow-Up the doctor picked at submit (user 2026-08-22).
+              if ('${v['follow_up_date'] ?? ''}'.isNotEmpty)
+                _kv('Next Follow-up', _fmtDate('${v['follow_up_date']}')),
               if ('${v['doctor_name'] ?? ''}'.isNotEmpty)
                 _kv('Seen by', '${v['doctor_name']}'),
               const SizedBox(height: 4),

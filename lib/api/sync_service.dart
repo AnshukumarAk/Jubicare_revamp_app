@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -7,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api_errors.dart';
 import 'sync_api.dart';
+import 'uploads_api.dart';
 
 /// Offline write buffer + drainer for /mobile/sync/push (v2 §4).
 ///
@@ -28,10 +30,12 @@ class SyncService extends ChangeNotifier {
   static const _kQueueKey = 'sync_push_queue';
 
   final SyncApi api;
+  final UploadsApi? uploads;
   final Connectivity _connectivity;
 
-  SyncService(this.api, {Connectivity? connectivity})
-      : _connectivity = connectivity ?? Connectivity() {
+  SyncService(this.api, {UploadsApi? uploads, Connectivity? connectivity})
+      : uploads = uploads,
+        _connectivity = connectivity ?? Connectivity() {
     _connectivity.onConnectivityChanged.listen((r) {
       final online = r.any((c) => c != ConnectivityResult.none);
       if (online) unawaited(drain());
@@ -75,6 +79,7 @@ class SyncService extends ChangeNotifier {
   Future<String> enqueue({required String kind, required Map<String, dynamic> payload}) async {
     await hydrate();
     final id = _newClientActionId();
+    print('[JC] sync.enqueue kind=' + kind + ' id=' + id);
     _queue.add(QueuedAction(clientActionId: id, kind: kind, payload: payload, enqueuedAt: DateTime.now()));
     await _persist();
     notifyListeners();
@@ -86,12 +91,35 @@ class SyncService extends ChangeNotifier {
   /// Drain the queue. Safe to call any number of times — a single
   /// drain runs at a time; overlapping calls no-op.
   Future<void> drain() async {
+    print('[JC] sync.drain start, pending=' + _queue.length.toString());
     await hydrate();
     if (_draining || _queue.isEmpty) return;
     _draining = true;
     notifyListeners();
     try {
       while (_queue.isNotEmpty) {
+        // ── Photo lift (bug fix 2026-08-20: "offline photo path was
+        // going into DB as /data/user/0/.../wm_XXX.jpg"). Any queued
+        // action whose payload carries LOCAL device paths gets its
+        // photos uploaded to /mobile/uploads NOW, and the payload
+        // rewritten with the returned server filenames before push.
+        // Uploads that fail are left as-is so the server drops them
+        // gracefully rather than blocking the whole batch.
+        if (uploads != null) {
+          for (var i = 0; i < _queue.length && i < 200; i++) {
+            final q = _queue[i];
+            final lifted = await _liftPhotos(q.payload);
+            if (lifted != null) {
+              _queue[i] = QueuedAction(
+                clientActionId: q.clientActionId,
+                kind: q.kind,
+                payload: lifted,
+                enqueuedAt: q.enqueuedAt,
+              );
+            }
+          }
+          await _persist();
+        }
         // Server accepts up to 200 actions per push (§4).
         final chunk = _queue.take(200).toList();
         late final PushResponse res;
@@ -102,12 +130,23 @@ class SyncService extends ChangeNotifier {
           ]);
         } on ApiException catch (e) {
           if (e.code == ApiErrorCode.networkUnreachable) {
+            print('[JC] sync.push network unreachable/timeout — will retry');
             // Nothing to do — try again on the next connectivity event.
             break;
           }
+          print('[JC] sync.push error ' + e.code.toString() + ' ' + e.message);
           // Session death or a server-side outage — leave the queue
           // alone and let the caller / next drain try again.
           break;
+        }
+        print('[JC] sync.push result applied=' + res.applied.toString()
+            + ' rejected=' + res.rejected.toString()
+            + ' failed=' + res.failed.toString());
+        for (final r in res.results) {
+          if (r.status != 'applied') {
+            print('[JC]   -> ' + r.clientActionId + ' ' + r.status
+                + ' ' + (r.code ?? '') + ' ' + (r.message ?? ''));
+          }
         }
         _lastApplied  = res.applied;
         _lastRejected = res.rejected;
@@ -136,6 +175,97 @@ class SyncService extends ChangeNotifier {
     _queue.clear();
     await _persist();
     notifyListeners();
+  }
+
+  /// Detect + upload any local file paths in a queued payload. Returns
+  /// a NEW payload with server filenames, or null when nothing changed.
+  /// Handles the four attachment shapes the app queues:
+  ///   • attachments[].file_path — patient.register (prescriptions)
+  ///   • photo_key                — attendance.check_in / check_out
+  ///   • photos[]                 — camp.create (camp gallery)
+  ///   • invoice_path             — requisition.receive (delivery invoice)
+  Future<Map<String, dynamic>?> _liftPhotos(Map<String, dynamic> payload) async {
+    if (uploads == null) return null;
+    var changed = false;
+    final next = Map<String, dynamic>.of(payload);
+
+    Future<String?> lift(String? raw) async {
+      if (raw == null || raw.trim().isEmpty) return raw;
+      // Full URL → already hosted, nothing to do.
+      if (raw.startsWith('http')) return raw;
+      // Bare filename (no separators) → already a server file_name.
+      if (!raw.contains('/') && !raw.contains(r'\')) return raw;
+      // BUG FIX 2026-08-20: the earlier `raw.startsWith('/')` shortcut
+      // swallowed Android local paths (`/data/user/0/…/wm_X.jpg`) so
+      // they were pushed to the server AS-IS. Now the ONLY authority
+      // is `File.existsSync()` — if the string points at a real file
+      // on disk, upload it; otherwise treat it as a server name.
+      if (!File(raw).existsSync()) return raw;
+      try {
+        final res = await uploads!.uploadImage(raw)
+            .timeout(const Duration(seconds: 25));
+        final name = (res['file_name'] as String?)?.trim();
+        return (name != null && name.isNotEmpty) ? name : raw;
+      } catch (_) {
+        return raw; // upload failed — leave for the next drain to retry
+      }
+    }
+
+    // ── attachments[].file_path ──
+    final atts = next['attachments'];
+    if (atts is List) {
+      final newAtts = <dynamic>[];
+      for (final a in atts) {
+        if (a is Map) {
+          final path = (a['file_path'] ?? '').toString();
+          final lifted = await lift(path);
+          if (lifted != null && lifted != path) {
+            newAtts.add({...a, 'file_path': lifted});
+            changed = true;
+          } else {
+            newAtts.add(a);
+          }
+        } else {
+          newAtts.add(a);
+        }
+      }
+      if (changed) next['attachments'] = newAtts;
+    }
+
+    // ── photo_key (attendance selfie) ──
+    final pk = (next['photo_key'] ?? '').toString();
+    final liftedPk = await lift(pk);
+    if (liftedPk != null && liftedPk != pk && liftedPk.isNotEmpty) {
+      next['photo_key'] = liftedPk;
+      changed = true;
+    }
+
+    // ── invoice_path (requisition.receive) ──
+    final inv = (next['invoice_path'] ?? '').toString();
+    final liftedInv = await lift(inv);
+    if (liftedInv != null && liftedInv != inv && liftedInv.isNotEmpty) {
+      next['invoice_path'] = liftedInv;
+      changed = true;
+    }
+
+    // ── photos[] (camp gallery) ──
+    final ph = next['photos'];
+    if (ph is List) {
+      final newPh = <dynamic>[];
+      var any = false;
+      for (final p in ph) {
+        final s = (p ?? '').toString();
+        final lifted = await lift(s);
+        if (lifted != null && lifted != s) any = true;
+        newPh.add(lifted ?? s);
+      }
+      if (any) {
+        next['photos'] = newPh;
+        changed = true;
+      }
+    }
+
+    return changed ? next : null;
   }
 
   Future<void> _persist() async {

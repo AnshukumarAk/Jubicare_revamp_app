@@ -1,12 +1,12 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:provider/provider.dart';
 
-import '../api/uploads_api.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/cw.dart';
+import '../services/photo_watermark.dart';
 
 /// Multi-attachment picker used on the counsellor Register form.
 ///
@@ -32,6 +32,10 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
   // A description controller per attachment, keyed by list index. Kept in
   // parallel with widget.value so the TextField cursor doesn't jump on setState.
   final List<TextEditingController> _descCtrls = [];
+  // True between camera return and the row appearing (GPS + watermark).
+  // Without this the counsellor stared at an unchanged form for seconds
+  // and thought the photo "was not taken" (user bug 2026-08-19).
+  bool _processing = false;
 
   @override
   void initState() {
@@ -72,14 +76,44 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
         imageQuality: 70,
       );
       if (shot == null) return;
-      final next = [...widget.value, Attachment(path: shot.path, kind: AttachmentKind.prescription)];
+      if (mounted) setState(() => _processing = true);
+      // Best-effort GPS for the watermark strip. A rear-camera document
+      // shot doesn't need location as proof, but stamping it makes
+      // downstream photos self-describing (user rule 2026-08-16).
+      // HARD 6 s CAP — an indoor GPS fix can hang for minutes, and the
+      // photo silently never appeared while we waited (user bug
+      // 2026-08-19: "prescription photo not showing or not taking").
+      double? lat, lng;
+      try {
+        var perm = await Geolocator.checkPermission();
+        if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
+        if (perm == LocationPermission.always || perm == LocationPermission.whileInUse) {
+          if (await Geolocator.isLocationServiceEnabled()) {
+            final pos = await Geolocator.getCurrentPosition(
+                    desiredAccuracy: LocationAccuracy.medium)
+                .timeout(const Duration(seconds: 6));
+            lat = pos.latitude;
+            lng = pos.longitude;
+          }
+        }
+      } catch (_) { /* timeout / denied — stamp will show date-time only */ }
+      // Bake watermark BEFORE the file lands in the list — the server
+      // upload happens at SUBMIT, but the strip is on the pixels from
+      // the moment of capture, so a preview or share carries it too.
+      // Prescription photos: no place prefix on the watermark (user
+      // 2026-08-20 "Patient Attachment" is redundant on a paper shot).
+      // Only Location + Date + Time strip.
+      final stamped = await PhotoWatermark.stamp(
+        File(shot.path),
+        place: '',
+        latitude: lat,
+        longitude: lng,
+      );
+      // Local-only at capture time. The server upload happens at SUBMIT
+      // (screens_register._submit) — uploading here would leave orphan
+      // files on the server whenever the counsellor abandons the form.
+      final next = [...widget.value, Attachment(path: stamped.path, kind: AttachmentKind.prescription)];
       widget.onChanged(next);
-      // Fire the server upload immediately — don't block the camera flow.
-      // On success the matching row gains serverPath so the sync payload
-      // sends "patient_docs/<random>.jpg" instead of the phone-local path.
-      // On failure (offline / server hiccup) the row keeps only the local
-      // path; the register still works, just without a server copy.
-      _uploadInBackground(shot.path);
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -87,25 +121,8 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
           backgroundColor: C2.danger,
         ));
       }
-    }
-  }
-
-  Future<void> _uploadInBackground(String localPath) async {
-    try {
-      final api = context.read<UploadsApi>();
-      final res = await api.uploadImage(localPath);
-      final serverName = (res['file_name'] as String?) ?? '';
-      if (serverName.isEmpty || !mounted) return;
-      // Find the row by its local path (the list may have grown/reordered
-      // while the upload was in flight) and stamp the server name on it.
-      final list = [...widget.value];
-      final i = list.indexWhere((a) => a.path == localPath);
-      if (i < 0) return; // row was removed while uploading — drop silently
-      list[i] = list[i].copyWith(serverPath: serverName);
-      widget.onChanged(list);
-    } catch (_) {
-      // Best-effort: offline or server error. Local path stays; nothing
-      // to surface — the counsellor shouldn't be interrupted mid-camera.
+    } finally {
+      if (mounted) setState(() => _processing = false);
     }
   }
 
@@ -146,9 +163,14 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
       // beneath the list (see below) so the UI doesn't stay bulky.
       if (!hasAttachments)
         OutlinedButton.icon(
-          onPressed: _pick,
-          icon: const Icon(Icons.photo_camera_outlined, size: 18, color: C2.navy),
-          label: Text('Take photo of prescription or report', style: ct(13, FontWeight.w600, C2.navy)),
+          onPressed: _processing ? null : _pick,
+          icon: _processing
+              ? const SizedBox(width: 15, height: 15,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: C2.navy))
+              : const Icon(Icons.photo_camera_outlined, size: 18, color: C2.navy),
+          label: Text(
+              _processing ? 'Processing photo…' : 'Take photo of prescription or report',
+              style: ct(13, FontWeight.w600, C2.navy)),
           style: OutlinedButton.styleFrom(
             side: const BorderSide(color: C2.border, width: 1.5),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -215,9 +237,13 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
         Align(
           alignment: Alignment.centerLeft,
           child: TextButton.icon(
-            onPressed: _pick,
-            icon: const Icon(Icons.add_circle_outline, size: 18, color: C2.cyan),
-            label: Text('Add another', style: ct(12.5, FontWeight.w600, C2.cyan)),
+            onPressed: _processing ? null : _pick,
+            icon: _processing
+                ? const SizedBox(width: 14, height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: C2.cyan))
+                : const Icon(Icons.add_circle_outline, size: 18, color: C2.cyan),
+            label: Text(_processing ? 'Processing photo…' : 'Add another',
+                style: ct(12.5, FontWeight.w600, C2.cyan)),
             style: TextButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4)),
           ),
         ),

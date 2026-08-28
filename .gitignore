@@ -56,3 +56,11 @@ app.*.map.json
 .claude/settings.local.json
 .claude/settings.local.json.tmp.*
 
+
+# Local dev / secrets — never commit (user 2026-08-28)
+kdoctordb.backup-*.json
+android/app/google-services.json
+docs/mobile_local_storage.xml
+ATTEND_IMPROVEMENTS.md
+NOTIFICATIONS_NOTE.md
+.claude/run_jubicare_web.cmd

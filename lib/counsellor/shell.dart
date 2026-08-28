@@ -3,18 +3,26 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:provider/provider.dart';
+import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../api/auth_api.dart';
 import '../api/queues_api.dart';
+import '../api/masters_store.dart';
 import '../api/sync_service.dart';
 import '../screens/unified_login.dart';
 import '../services/location_service.dart';
+import '../services/fcm_service.dart';
+import '../services/notifications_store.dart';
+import '../services/patients_cache_store.dart';
+import '../services/terminology_store.dart';
+import '../services/connectivity_service.dart';
 import '../state/app_state.dart';
 import 'cw.dart';
 import 'cstate.dart';
 import 'screens_dashboard.dart';
 import 'screens_register.dart';
 import 'screens_misc.dart';
+import '../services/back_form_registry.dart';
 
 /// Counsellor module shell: 2.0 white header (official logo + profile) and a
 /// bottom navigation bar. Hosts the module's screens in an IndexedStack.
@@ -76,10 +84,14 @@ class _ShellState extends State<_Shell> {
       if (mmuId != null && mmuId.isNotEmpty) {
         tracker.start(mmuId: mmuId, counsellor: widget.userName);
       }
-      // First backend pull — populates the Home tiles + list before the
-      // counsellor taps anything. Fire-and-forget: any error surfaces via
-      // CounsellorState.lastRefreshError which the dashboard renders as a
-      // retry banner.
+      // Hydrate the patient list from the OFFLINE CACHE first so the
+      // dashboard has rows to show even before the server call returns —
+      // and, critically, so an app restart with no signal still shows
+      // yesterday's registrations (user bug 2026-08-20 "close app → go
+      // offline → registered patient not showing").
+      _hydratePatientsFromCache();
+      // Then the online pull — any error surfaces via
+      // CounsellorState.lastRefreshError but the cache stays on screen.
       _refreshFromBackend();
     });
   }
@@ -100,6 +112,7 @@ class _ShellState extends State<_Shell> {
 
   @override
   void dispose() {
+    _registerScroll.dispose();
     _sync?.removeListener(_onSyncTick);
     // If the counsellor closes the app without hitting Logout, still stop the
     // sampler so we don't leak a Timer. Fire-and-forget is fine — the timer is
@@ -126,52 +139,126 @@ class _ShellState extends State<_Shell> {
   /// Pull the counsellor tiles + past-7-days list from /api/queues/*, feed
   /// them into CounsellorState, and reflect success / error via
   /// setRefreshState so the dashboard's loading strip + banner update.
+  String get _patientsCacheKey {
+    final app = context.read<AppState>();
+    return 'counsellor_${app.backendUserId ?? app.currentUser}';
+  }
+
+  Future<void> _hydratePatientsFromCache() async {
+    try {
+      final store = await PatientsCacheStore.open();
+      final rows = store.load(_patientsCacheKey);
+      if (rows.isEmpty || !mounted) return;
+      context.read<CounsellorState>().mergeBackendPatients(rows);
+    } catch (_) {/* first run — nothing cached yet */}
+  }
+
   Future<void> _refreshFromBackend() async {
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final api = context.read<QueuesApi>();
     store.setRefreshState(loading: true);
     try {
-      // Two calls run in parallel so the wall-clock is the slower one, not
-      // the sum. Both are cheap read-only queries against the same server
-      // snapshot so drift between the tile counts and the list is minimal.
-      final results = await Future.wait([
-        api.tiles(),
-        api.counsellorPast7Days(limit: 200),
-      ]);
+      // Silent-on-failure (user 2026-08-26: banner stuck even after
+      // server came back). Both calls independent + swallow errors;
+      // cached values stay on screen; retry is one tap away.
+      final tilesF = api.tiles().then<Map<String, dynamic>?>((v) => v)
+          .catchError((_) => null);
+      final listF = api.counsellorPast7Days(limit: 200)
+          .then<QueueList?>((v) => v)
+          .catchError((_) => null);
+      final results = await Future.wait([tilesF, listF]);
       if (!mounted) return;
-      final tiles = results[0] as Map<String, dynamic>;
-      final list = results[1] as QueueList;
-      store.applyTiles(tiles);
-      // Merge backend rows into the shared patient list. Uses the 'B'-id
-      // prefix in `mergeBackendPatients` so demo seed / locally-added
-      // patients aren't touched. statusOverride left null — each row
-      // carries its own status from the appointment_status_t enum.
-      store.mergeBackendPatients(list.items);
+      final tiles = results[0] as Map<String, dynamic>?;
+      final list = results[1] as QueueList?;
+      if (tiles != null) store.applyTiles(tiles);
+      if (list != null) {
+        store.mergeBackendPatients(list.items);
+        try {
+          final cache = await PatientsCacheStore.open();
+          await cache.save(_patientsCacheKey, list.items);
+        } catch (_) {/* best-effort */}
+      }
       store.setRefreshState(loading: false);
-    } on ApiException catch (e) {
+    } catch (_) {
       if (!mounted) return;
-      store.setRefreshState(loading: false, error: e.message);
-    } catch (e) {
-      if (!mounted) return;
-      store.setRefreshState(loading: false, error: e.toString());
+      store.setRefreshState(loading: false);
     }
   }
 
-  void _go(int i) => setState(() {
-    if (_tab == i) return;
-    _tabHistory.remove(i);
-    _tabHistory.add(i);
-    _tab = i;
-  });
+  final _campsRefresh = ValueNotifier(0);
+  final _devicesRefresh = ValueNotifier(0);
+  final _attendRefresh = ValueNotifier(0);
+  // Register tab's scroll position — jumped to 0 on every entry so a new
+  // registration always opens at the top of the form (user 2026-08-21).
+  final _registerScroll = ScrollController();
+
+  /// One refresh path for the app-bar button AND pull-to-refresh: online
+  /// check first, then the home data (existing behaviour) plus the CURRENT
+  /// tab's own rows. Never touches the offline sync queue (user 2026-08-21).
+  Future<void> _refreshCurrentTab() async {
+    if (!mounted || !context.read<ConnectivityService>().isOnline) return;
+    // Masters + terminology also refresh on the app-bar/pull refresh so
+    // any new medicine, symptom, block/village or clinical-sheet update
+    // reaches the app without a re-login (user 2026-08-25).
+    unawaited(context.read<MastersStore>().refresh());
+    unawaited(context.read<TerminologyStore>().refresh());
+    await _refreshFromBackend();
+    switch (_tab) {
+      case 3: _campsRefresh.value++; break;
+      case 4: _devicesRefresh.value++; break;
+      case 5: _attendRefresh.value++; break;
+    }
+  }
+
+  void _go(int i) {
+    final s = context.read<CounsellorState>();
+    // Leaving Register tab in-app? Signal a full form reset so the
+    // next entry starts blank (user rule 2026-08-16 — tab switch
+    // clears; app-background preserves).
+    if (_tab == 2 && i != 2) s.requestRegisterFullReset();
+    // Normal entry into Register (no fresh Re-Appointment prefill waiting)
+    // → tell the form to drop any ABANDONED re-appointment residue so a
+    // new patient starts on a blank slate (user bug report 2026-08-13).
+    // The re-appointment jump itself sets the prefill BEFORE _go(2), so
+    // hasPrefill is true on that path and the clear is skipped.
+    if (i == 2) {
+      if (!s.hasPrefill) s.requestAbandonedReAppointmentClear();
+      // A fresh registration starts at the TOP of the form — the
+      // IndexedStack keeps the tab alive, so without this the form
+      // reopens wherever it was last scrolled (user 2026-08-21).
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _registerScroll.hasClients) _registerScroll.jumpTo(0);
+      });
+    }
+    setState(() {
+      if (_tab == i) return;
+      _tabHistory.remove(i);
+      _tabHistory.add(i);
+      _tab = i;
+    });
+  }
 
   /// PopScope handler: rewind through visited tabs instead of closing the app.
   /// Returns true if the back gesture was absorbed (we switched tabs); false
   /// to let the system pop the shell (which exits at the root).
   bool _handleBack() {
+    // An open inline form on the ACTIVE tab eats the first back press —
+    // close it and stay on the tab's list (user 2026-08-21 check-out bug).
+    if (_tab == 5 && BackFormRegistry.close('coun.attend')) return true;
+    // Camps form: same close-and-clear rule (user 2026-08-26).
+    if (_tab == 3 && BackFormRegistry.close('coun.camps')) return true;
+    // Devices: closer only discards unsaved dropdown edits and returns
+    // false, so the back press still rewinds tabs as usual.
+    if (_tab == 4) BackFormRegistry.close('coun.devices');
     if (_tabHistory.length <= 1) return false; // let the system close the app
     _tabHistory.removeLast();
-    setState(() => _tab = _tabHistory.last);
+    final nextTab = _tabHistory.last;
+    // Same tab-leave rule as _go — Android back button counts too.
+    if (_tab == 2 && nextTab != 2) {
+      context.read<CounsellorState>().requestRegisterFullReset();
+    }
+    setState(() => _tab = nextTab);
     return true;
   }
 
@@ -202,10 +289,10 @@ class _ShellState extends State<_Shell> {
       // added patient (which insert-at-0'd into CounsellorState.patients) is
       // right at the top of the "Registered Patients" list.
       CounRegister(onSubmitted: () => _go(0)),
-      const CounCamps(),
-      const CounDevices(),
+      CounCamps(refreshSignal: _campsRefresh),
+      CounDevices(refreshSignal: _devicesRefresh),
       // CounReports removed 2026-07-29 per user rule.
-      const CounAttendance(),
+      CounAttendance(refreshSignal: _attendRefresh),
     ];
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
@@ -214,10 +301,11 @@ class _ShellState extends State<_Shell> {
       // shell (which would otherwise close the app on the first press).
       child: PopScope(
         canPop: false,
-        onPopInvokedWithResult: (didPop, _) {
+        onPopInvokedWithResult: (didPop, _) async {
           if (didPop) return;
-          final absorbed = _handleBack();
-          if (!absorbed) SystemNavigator.pop();
+          if (_handleBack()) return;
+          // Root of the app — confirm before closing (user 2026-08-23).
+          if (await confirmExit(context)) SystemNavigator.pop();
         },
       child: Scaffold(
         backgroundColor: C2.bg,
@@ -238,6 +326,19 @@ class _ShellState extends State<_Shell> {
                   child: Row(children: [
                     Image.asset('assets/jubicare_logo.png', height: 30, fit: BoxFit.contain),
                     const Spacer(),
+                    // Sync status lives here as an icon (user 2026-08-14:
+                    // banner out of the Home body) — tap for counts +
+                    // "Sync now". Same data + same drain action as the
+                    // old pill.
+                    const SyncStatusIcon(),
+                    const SizedBox(width: 10),
+                    // Manual refresh — recovers the app when internet
+                    // stalls without needing a restart (user rule
+                    // 2026-08-16).
+                    ShellRefreshButton(onRefresh: _refreshCurrentTab),
+                    const SizedBox(width: 10),
+                    const NotificationsBell(),
+                    const SizedBox(width: 12),
                     GestureDetector(
                       onTap: () => _profileMenu(context, initials),
                       child: Container(
@@ -252,8 +353,23 @@ class _ShellState extends State<_Shell> {
             ),
           ),
           Expanded(
-            child: IndexedStack(index: _tab, children: pages.map((p) =>
-              _KeepAlive(child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 14, 14, 24), child: p))).toList()),
+            // Pull-to-refresh on every tab (user rule 2026-08-16 —
+            // matches the doctor role). AlwaysScrollable so the gesture
+            // works even when the content is short. Same callback as
+            // the app-bar refresh button so behaviour is consistent.
+            child: IndexedStack(index: _tab, children: [
+              for (final e in pages.asMap().entries)
+                _KeepAlive(child: RefreshIndicator(
+                  onRefresh: _refreshCurrentTab,
+                  child: SingleChildScrollView(
+                    // Register keeps a named controller so _go(2) can
+                    // snap a fresh form back to the top.
+                    controller: e.key == 2 ? _registerScroll : null,
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(14, 14, 14, 24),
+                    child: e.value),
+                )),
+            ]),
           ),
         ]),
         bottomNavigationBar: _bottomNav(),
@@ -311,8 +427,10 @@ class _ShellState extends State<_Shell> {
           ListTile(
             leading: const Icon(Icons.logout, color: C2.navy),
             title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
-            onTap: () {
+            onTap: () async {
               Navigator.pop(context);
+              if (!await confirmLogout(context)) return;
+              if (!mounted) return;
               // Stop location tracking BEFORE clearing session — otherwise the
               // sampler keeps firing after logout.
               context.read<LocationService>().stop();
@@ -320,6 +438,13 @@ class _ShellState extends State<_Shell> {
               // for this account on the server). Fire-and-forget; local
               // cleanup happens either way.
               unawaited(context.read<AuthApi>().logout().catchError((_) {}));
+              // Kill the FCM registration so the previous user stops
+              // getting pushes on this handset (user bug 2026-08-20).
+              unawaited(FcmService.instance
+                  .unregister(context.read<ApiClient>())
+                  .catchError((_) {}));
+              // Wipe user-scoped lists (user rule 2026-08-16).
+              context.read<CounsellorState>().resetForNewUser();
               context.read<AppState>().logout();
               // Replace the whole navigation stack with the unified login.
               Navigator.of(context).pushAndRemoveUntil(
@@ -352,3 +477,295 @@ class _KeepAliveState extends State<_KeepAlive> with AutomaticKeepAliveClientMix
   }
 }
 
+
+/// App-bar sync status: icon-only, with a pending-count badge; tapping
+/// opens a sheet with the live counts and a "Sync now" action (user
+/// 2026-08-14 — the old Home banner, relocated; the data and the
+/// force-drain behaviour are unchanged).
+class SyncStatusIcon extends StatelessWidget {
+  const SyncStatusIcon({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final sync = context.watch<SyncService>();
+    final pending = sync.pending;
+    final trouble = sync.lastFailed > 0 || sync.lastRejected > 0;
+    final color = pending == 0 && !trouble
+        ? C2.green
+        : (trouble ? C2.danger : C2.navy);
+    final icon = sync.isDraining
+        ? Icons.sync
+        : (pending == 0 ? Icons.cloud_done_outlined : Icons.cloud_upload_outlined);
+    return GestureDetector(
+      onTap: () => _showSheet(context),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Stack(clipBehavior: Clip.none, children: [
+          Icon(icon, size: 22, color: color),
+          if (pending > 0)
+            Positioned(
+              right: -5, top: -5,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(color: C2.danger, borderRadius: BorderRadius.circular(8)),
+                child: Text('$pending', style: ct(9, FontWeight.w700, Colors.white)),
+              ),
+            ),
+        ]),
+      ),
+    );
+  }
+
+  void _showSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => Container(
+        decoration: const BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+        // Consumer, not a snapshot — the counts keep updating while the
+        // sheet is open (e.g. a drain finishing).
+        child: SafeArea(top: false, child: Consumer<SyncService>(
+          builder: (_, sync, __) {
+            final ts = sync.lastDrainAt;
+            final label = sync.pending == 0
+                ? (ts == null
+                    ? 'Nothing to send yet'
+                    : 'Applied ${sync.lastApplied} · rejected ${sync.lastRejected} · failed ${sync.lastFailed}')
+                : '${sync.pending} pending${sync.isDraining ? ' · sending…' : ''}';
+            final fg = sync.pending == 0 && sync.lastFailed == 0 && sync.lastRejected == 0
+                ? C2.green
+                : (sync.lastFailed > 0 || sync.lastRejected > 0 ? C2.danger : C2.text);
+            return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Center(child: Container(width: 40, height: 4,
+                decoration: BoxDecoration(color: C2.border, borderRadius: BorderRadius.circular(2)))),
+              const SizedBox(height: 14),
+              Row(children: [
+                const Icon(Icons.cloud_outlined, size: 18, color: C2.navy),
+                const SizedBox(width: 8),
+                Text('Sync Status', style: ct(15, FontWeight.w700, C2.navy)),
+              ]),
+              const SizedBox(height: 10),
+              Text(label, style: ct(13.5, FontWeight.w600, fg)),
+              if (ts != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text('Last push: ${fmtTime12(TimeOfDay.fromDateTime(ts))}',
+                      style: ct(11.5, FontWeight.w400, C2.text2)),
+                ),
+              const SizedBox(height: 14),
+              CPrimaryButton(sync.isDraining ? 'Sending…' : 'Sync now',
+                  icon: Icons.sync,
+                  onTap: sync.isDraining ? null : sync.drain),
+            ]);
+          },
+        )),
+      ),
+    );
+  }
+}
+
+/// App-bar notifications bell (user rule 2026-08-16). Placeholder for
+/// now — tap opens a sheet that says "no new notifications". Wired for
+/// backend push later without touching the shells again.
+class NotificationsBell extends StatefulWidget {
+  const NotificationsBell({super.key});
+
+  @override
+  State<NotificationsBell> createState() => _NotificationsBellState();
+}
+
+class _NotificationsBellState extends State<NotificationsBell> {
+  int _unread = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshUnread();
+  }
+
+  Future<void> _refreshUnread() async {
+    final n = await NotificationsStore.unreadCount();
+    if (mounted) setState(() => _unread = n);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => _sheet(context),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Stack(clipBehavior: Clip.none, children: [
+          const Icon(Icons.notifications_none, size: 22, color: C2.navy),
+          if (_unread > 0)
+            Positioned(right: -2, top: -2, child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+              decoration: BoxDecoration(
+                color: C2.danger, borderRadius: BorderRadius.circular(8)),
+              constraints: const BoxConstraints(minWidth: 14),
+              child: Text('$_unread',
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700, color: Colors.white)),
+            )),
+        ]),
+      ),
+    );
+  }
+
+  /// Per-user saved history (user 2026-08-19): every notification the app
+  /// showed/received is listed here, newest first. Opening marks all seen.
+  Future<void> _sheet(BuildContext context) async {
+    final items = await NotificationsStore.list();
+    await NotificationsStore.markSeen();
+    if (mounted) setState(() => _unread = 0);
+    if (!context.mounted) return;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => Container(
+        constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.75),
+        decoration: const BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+        child: SafeArea(top: false, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Center(child: Container(width: 40, height: 4,
+            decoration: BoxDecoration(color: C2.border, borderRadius: BorderRadius.circular(2)))),
+          const SizedBox(height: 14),
+          Row(children: [
+            const Icon(Icons.notifications_none, size: 18, color: C2.navy),
+            const SizedBox(width: 8),
+            Text('Notifications', style: ct(15, FontWeight.w700, C2.navy)),
+          ]),
+          const SizedBox(height: 10),
+          if (items.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 18),
+              child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                const Icon(Icons.check_circle_outline, size: 18, color: C2.text3),
+                const SizedBox(width: 8),
+                Text('You\'re all caught up', style: ct(13, FontWeight.w500, C2.text2)),
+              ]),
+            )
+          else
+            Flexible(child: ListView.separated(
+              shrinkWrap: true,
+              itemCount: items.length,
+              separatorBuilder: (_, __) => const Divider(height: 1, color: C2.border),
+              itemBuilder: (_, i) {
+                final e = items[i];
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Container(width: 32, height: 32,
+                      decoration: BoxDecoration(color: C2.cyanLight, borderRadius: BorderRadius.circular(8)),
+                      child: const Icon(Icons.notifications_active_outlined, size: 16, color: C2.cyan)),
+                    const SizedBox(width: 10),
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('${e['title'] ?? ''}', style: ct(13, FontWeight.w700, C2.text)),
+                      if ('${e['body'] ?? ''}'.isNotEmpty)
+                        Text('${e['body']}', style: ct(12, FontWeight.w400, C2.text2)),
+                      Text(_ago('${e['at'] ?? ''}'), style: ct(10.5, FontWeight.w500, C2.text3)),
+                    ])),
+                  ]),
+                );
+              },
+            )),
+        ])),
+      ),
+    );
+  }
+
+  static String _ago(String iso) {
+    final at = DateTime.tryParse(iso);
+    if (at == null) return '';
+    final d = DateTime.now().difference(at);
+    if (d.inMinutes < 1) return 'just now';
+    if (d.inMinutes < 60) return '${d.inMinutes} min ago';
+    if (d.inHours < 24) return '${d.inHours} hr ago';
+    return '${at.day.toString().padLeft(2, '0')}-${at.month.toString().padLeft(2, '0')}-${at.year} '
+        '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}';
+  }
+}
+
+/// App-bar refresh button used by every shell (user rule 2026-08-16 —
+/// when internet drops or a request stalls, the user needs a way to
+/// re-pull data WITHOUT restarting the app). Tap:
+///   1. Calls the shell's own refresh callback (queues, tiles, roster…)
+///   2. Drains the sync queue (retries anything stuck offline)
+///   3. Shows a spinning indicator while in-flight
+///   4. Toasts success or error
+///
+/// The onRefresh callback owns "what to fetch" — each shell passes its
+/// existing private method (counsellor: _refreshFromBackend, doctor +
+/// pharmacist: their own). This widget owns "how to present" only.
+class ShellRefreshButton extends StatefulWidget {
+  final Future<void> Function() onRefresh;
+  const ShellRefreshButton({super.key, required this.onRefresh});
+
+  @override
+  State<ShellRefreshButton> createState() => _ShellRefreshButtonState();
+}
+
+class _ShellRefreshButtonState extends State<ShellRefreshButton>
+    with SingleTickerProviderStateMixin {
+  bool _busy = false;
+  late final AnimationController _spin = AnimationController(
+    duration: const Duration(seconds: 1), vsync: this)..repeat();
+
+  @override
+  void dispose() {
+    _spin.dispose();
+    super.dispose();
+  }
+
+  Future<void> _tap() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final sync = context.read<SyncService>();
+    try {
+      // Kick a sync drain in parallel — no await, it self-manages and
+      // logs its own errors; we don't want its slowness to keep the
+      // spinner going after the visible refresh has already returned.
+      unawaited(sync.drain());
+      await widget.onRefresh();
+      if (mounted) {
+        messenger.showSnackBar(const SnackBar(
+          content: Text('Refreshed'),
+          duration: Duration(seconds: 1),
+          backgroundColor: C2.green,
+        ));
+      }
+    } catch (e) {
+      if (mounted) {
+        messenger.showSnackBar(SnackBar(
+          content: Text('Refresh failed — check internet'),
+          backgroundColor: C2.danger,
+        ));
+      }
+    }
+    if (mounted) setState(() => _busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: _tap,
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: _busy
+            ? RotationTransition(
+                turns: _spin,
+                child: const Icon(Icons.refresh, size: 22, color: C2.navy))
+            : const Icon(Icons.refresh, size: 22, color: C2.navy),
+      ),
+    );
+  }
+}

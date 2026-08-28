@@ -27,6 +27,10 @@ class Disease {
 /// Loads + caches the ICD-11 disease master from assets/diseases.json.
 class DiseaseMaster {
   static List<Disease>? _all;
+  // Pre-lowercased haystack per row (user 2026-08-26: picker lag was
+  // O(N × 5) lowercase allocations per keystroke; now it's O(N) contains
+  // on a single concatenated lower string built ONCE at load).
+  static List<String> _hay = const [];
   static List<Disease> get all => _all ?? const [];
   static bool get isLoaded => _all != null;
 
@@ -39,6 +43,11 @@ class DiseaseMaster {
       return c != 0 ? c : a.term.compareTo(b.term);
     });
     _all = list;
+    _hay = [
+      for (final d in list)
+        ('${d.term} ${d.sub} ${d.title} ${d.icd} ${d.synonyms.join(' ')}')
+            .toLowerCase(),
+    ];
     return list;
   }
 
@@ -47,12 +56,13 @@ class DiseaseMaster {
   static List<Disease> search(String query) {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return all;
-    return all.where((d) =>
-        d.term.toLowerCase().contains(q) ||
-        d.sub.toLowerCase().contains(q) ||
-        d.title.toLowerCase().contains(q) ||
-        d.icd.toLowerCase().contains(q) ||
-        d.synonyms.any((s) => s.toLowerCase().contains(q))).toList();
+    final src = _all;
+    if (src == null) return const [];
+    final out = <Disease>[];
+    for (var i = 0; i < src.length; i++) {
+      if (_hay[i].contains(q)) out.add(src[i]);
+    }
+    return out;
   }
 
   /// Resolve a clinical-DB disease name to an ICD entry (used to ICD-code the

@@ -1,0 +1,131 @@
+{
+  "_source": "lib/doctor/ddata.dart — kDoctorDb (line 20), scoring in scoreDoctor() (line 121)",
+  "_used_by": "Doctor → Case Details → AI clinical decision support card (likely conditions + suggested tests / Rx / red flags)",
+  "_scoring_rules": {
+    "selected_symptoms": "full weight — symptoms formally selected by the counsellor/doctor",
+    "observation_keywords": "half weight — the doctor's dictated/typed observation text is scanned for each disease's symptom terms; matches not already selected score at 0.5x",
+    "village_trend": "diagnoses actually reported in THIS patient's village (synced queue rows) boost proportionally, up to +18 pct for the village's most common diagnosis",
+    "block_prior_fallback": "+15 pct if no real village data is loaded and the disease appears in the block priors (kGeoDb — same table as likely_conditions_db.json)",
+    "threshold": "diseases below 10 pct are not shown",
+    "levels": "h = pct >= 60, m = pct >= 35, l = below 35",
+    "display": "top 6, sorted by pct descending"
+  },
+  "doctor_db": {
+    "Dengue Fever": {
+      "symptoms": {"Fever": 3, "Headache": 2, "Retro-orbital pain": 3, "Rash": 2, "Joint pain": 2, "Platelet drop": 3, "Nausea": 1, "Vomiting": 1, "Body ache": 2, "Fatigue": 1},
+      "tests": ["CBC with Platelet count", "NS1 Antigen", "Dengue IgM/IgG"],
+      "rx": [
+        {"medicine": "Paracetamol 500mg", "days": "5", "frequency": "TDS", "qty": 15},
+        {"medicine": "ORS Sachets", "days": "5", "frequency": "TDS", "qty": 15},
+        {"medicine": "Domperidone 10mg", "days": "3", "frequency": "BD", "qty": 6}
+      ],
+      "red_flags": ["Platelet <20,000", "Persistent vomiting", "Mucosal bleeding"],
+      "first_line": "Supportive care. Paracetamol for fever. Avoid NSAIDs."
+    },
+    "Malaria": {
+      "symptoms": {"Fever": 3, "Chills": 3, "Sweating": 3, "Headache": 2, "Body ache": 2, "Nausea": 1, "Fatigue": 2, "Jaundice": 2},
+      "tests": ["Malaria Smear", "RDT", "CBC"],
+      "rx": [
+        {"medicine": "ACT (Artesunate+Lumefantrine)", "days": "3", "frequency": "BD", "qty": 6},
+        {"medicine": "Paracetamol 500mg", "days": "3", "frequency": "TDS", "qty": 9},
+        {"medicine": "Primaquine 15mg", "days": "14", "frequency": "OD", "qty": 14}
+      ],
+      "red_flags": ["Altered consciousness", "Severe anaemia", "Respiratory distress"],
+      "first_line": "ACT first-line. Primaquine for P.vivax."
+    },
+    "Typhoid": {
+      "symptoms": {"Fever": 3, "Headache": 2, "Abdominal pain": 3, "Diarrhoea": 2, "Loss of appetite": 2, "Fatigue": 2, "Nausea": 1, "Body ache": 1},
+      "tests": ["Widal Test", "Blood Culture", "CBC"],
+      "rx": [
+        {"medicine": "Azithromycin 500mg", "days": "7", "frequency": "OD", "qty": 7},
+        {"medicine": "Paracetamol 500mg", "days": "5", "frequency": "TDS", "qty": 15},
+        {"medicine": "ORS Sachets", "days": "5", "frequency": "TDS", "qty": 15}
+      ],
+      "red_flags": ["GI perforation", "Persistent high fever >7 days"],
+      "first_line": "Azithromycin first-line. Adequate hydration."
+    },
+    "Viral Fever": {
+      "symptoms": {"Fever": 3, "Headache": 2, "Body ache": 2, "Fatigue": 2, "Runny nose": 1, "Sore throat": 1, "Cough": 1, "Chills": 1, "Weakness": 1},
+      "tests": ["CBC", "CRP"],
+      "rx": [
+        {"medicine": "Paracetamol 500mg", "days": "3", "frequency": "TDS", "qty": 9},
+        {"medicine": "Cetirizine 10mg", "days": "3", "frequency": "OD", "qty": 3},
+        {"medicine": "ORS Sachets", "days": "3", "frequency": "BD", "qty": 6}
+      ],
+      "red_flags": ["Fever >5 days", "Rash development", "Platelet drop"],
+      "first_line": "Symptomatic. Paracetamol, rest, fluids."
+    },
+    "URTI": {
+      "symptoms": {"Cough": 3, "Sore throat": 3, "Runny nose": 3, "Fever": 2, "Headache": 1, "Body ache": 1, "Fatigue": 1},
+      "tests": ["Throat swab", "CBC"],
+      "rx": [
+        {"medicine": "Cetirizine 10mg", "days": "5", "frequency": "OD", "qty": 5},
+        {"medicine": "Paracetamol 500mg", "days": "3", "frequency": "TDS", "qty": 9},
+        {"medicine": "Ambroxol 30mg", "days": "5", "frequency": "BD", "qty": 10}
+      ],
+      "red_flags": ["Stridor", "Unable to swallow", "Neck stiffness"],
+      "first_line": "Antihistamine, warm fluids, steam inhalation."
+    },
+    "Pneumonia": {
+      "symptoms": {"Fever": 3, "Cough": 3, "Shortness of breath": 3, "Chest pain": 2, "Fatigue": 2, "Chills": 2, "Wheezing": 1},
+      "tests": ["Chest X-ray", "CBC", "Sputum culture"],
+      "rx": [
+        {"medicine": "Amoxicillin 500mg", "days": "7", "frequency": "TDS", "qty": 21},
+        {"medicine": "Paracetamol 500mg", "days": "5", "frequency": "TDS", "qty": 15}
+      ],
+      "red_flags": ["SpO2 <92%", "Resp rate >30", "Confusion"],
+      "first_line": "Amoxicillin first-line."
+    },
+    "Gastroenteritis": {
+      "symptoms": {"Diarrhoea": 3, "Vomiting": 3, "Abdominal pain": 2, "Nausea": 2, "Fever": 1, "Dehydration": 3},
+      "tests": ["Stool exam", "CBC", "Electrolytes"],
+      "rx": [
+        {"medicine": "ORS Sachets", "days": "5", "frequency": "TDS", "qty": 15},
+        {"medicine": "Zinc 20mg", "days": "14", "frequency": "OD", "qty": 14},
+        {"medicine": "Ondansetron 4mg", "days": "3", "frequency": "BD", "qty": 6}
+      ],
+      "red_flags": ["Severe dehydration", "Bloody diarrhoea"],
+      "first_line": "ORS and zinc. Ondansetron for vomiting."
+    },
+    "Chikungunya": {
+      "symptoms": {"Fever": 3, "Joint pain": 3, "Rash": 2, "Headache": 2, "Fatigue": 2, "Body ache": 2, "Swelling": 2},
+      "tests": ["Chikungunya IgM", "CBC"],
+      "rx": [
+        {"medicine": "Paracetamol 500mg", "days": "5", "frequency": "TDS", "qty": 15},
+        {"medicine": "ORS Sachets", "days": "5", "frequency": "BD", "qty": 10}
+      ],
+      "red_flags": ["Hemorrhagic signs", "Encephalitis"],
+      "first_line": "Supportive care. Paracetamol."
+    },
+    "UTI": {
+      "symptoms": {"Burning micturition": 3, "Frequent urination": 3, "Lower abdominal pain": 2, "Fever": 2, "Blood in urine": 2},
+      "tests": ["Urine R/E", "Urine Culture", "CBC"],
+      "rx": [
+        {"medicine": "Nitrofurantoin 100mg", "days": "5", "frequency": "BD", "qty": 10},
+        {"medicine": "Paracetamol 500mg", "days": "3", "frequency": "TDS", "qty": 9}
+      ],
+      "red_flags": ["High fever with flank pain", "Persistent haematuria"],
+      "first_line": "Nitrofurantoin first-line. Hydration."
+    },
+    "Hypertension": {
+      "symptoms": {"Headache": 2, "Dizziness": 2, "Chest pain": 1, "Palpitations": 2, "Shortness of breath": 1, "Fatigue": 1},
+      "tests": ["BP Monitoring", "ECG", "Lipid Profile"],
+      "rx": [
+        {"medicine": "Amlodipine 5mg", "days": "30", "frequency": "OD", "qty": 30},
+        {"medicine": "Telmisartan 40mg", "days": "30", "frequency": "OD", "qty": 30}
+      ],
+      "red_flags": ["BP >180/120", "Chest pain", "Visual changes"],
+      "first_line": "Amlodipine or Telmisartan. Lifestyle modification."
+    },
+    "Diabetes Type 2": {
+      "symptoms": {"Frequent urination": 2, "Fatigue": 2, "Weight loss": 2, "Weakness": 1, "Numbness": 2},
+      "tests": ["Fasting Blood Sugar", "HbA1c", "Renal Profile"],
+      "rx": [
+        {"medicine": "Metformin 500mg", "days": "30", "frequency": "BD", "qty": 60},
+        {"medicine": "Glimepiride 1mg", "days": "30", "frequency": "OD", "qty": 30}
+      ],
+      "red_flags": ["Blood sugar >400", "Ketoacidosis", "Non-healing wounds"],
+      "first_line": "Metformin first-line. Lifestyle modification."
+    }
+  }
+}
