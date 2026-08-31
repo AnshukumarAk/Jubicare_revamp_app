@@ -281,20 +281,26 @@ class TerminologyStore extends ChangeNotifier {
     }
     for (final e in _entries) {
       if (seenIds.contains(e.entryId)) continue;
+      var matched = false;
       for (final sym in e.symptoms) {
-        final ph = {
-          for (final w in normalize(sym).split(' '))
-            if (w.trim().isNotEmpty) loose(w.trim()),
-        };
-        // Short phrases only — same guard as likelyConditions
-        // (2026-08-28).
-        if (ph.isEmpty || ph.length > 6) continue;
-        if (patientWordSets
-            .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
-          seenIds.add(e.entryId);
-          candidates.add(e);
-          break;
+        // Split on ';' first — the Symptoms column stores condition
+        // profiles as "headache; rigors; sweating; dry cough" and the
+        // 6-word guard was dropping the whole blob (user 2026-08-29).
+        for (final chunk in sym.split(';')) {
+          final ph = {
+            for (final w in normalize(chunk).split(' '))
+              if (w.trim().isNotEmpty) loose(w.trim()),
+          };
+          if (ph.isEmpty || ph.length > 6) continue;
+          if (patientWordSets
+              .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
+            seenIds.add(e.entryId);
+            candidates.add(e);
+            matched = true;
+            break;
+          }
         }
+        if (matched) break;
       }
     }
     if (candidates.isEmpty) return const [];
@@ -396,22 +402,27 @@ class TerminologyStore extends ChangeNotifier {
     ];
     for (final e in _entries) {
       if (entryOf.containsKey(e.entryId)) continue;
+      var matched = false;
       for (final sym in e.symptoms) {
-        final ph = {
-          for (final w in normalize(sym).split(' '))
-            if (w.trim().isNotEmpty) loose(w.trim()),
-        };
-        // Short phrases only (user 2026-08-28: AIDS topped a plain
-        // Fever + Sore throat case because its symptoms column carries
-        // a long seroconversion PARAGRAPH containing those words — a
-        // narrative sentence is not a symptom name).
-        if (ph.isEmpty || ph.length > 6) continue;
-        if (patientLooseWords
-            .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
-          entryOf[e.entryId] = e;
-          entryInputs[e.entryId] = <String>{};
-          break;
+        // Semicolon-split so a "fever; chills; cough" blob becomes
+        // three short phrases (user 2026-08-29). Narrative paragraphs
+        // (AIDS-style, comma-glued) still land as one long phrase and
+        // stay filtered by the 6-word guard.
+        for (final chunk in sym.split(';')) {
+          final ph = {
+            for (final w in normalize(chunk).split(' '))
+              if (w.trim().isNotEmpty) loose(w.trim()),
+          };
+          if (ph.isEmpty || ph.length > 6) continue;
+          if (patientLooseWords
+              .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
+            entryOf[e.entryId] = e;
+            entryInputs[e.entryId] = <String>{};
+            matched = true;
+            break;
+          }
         }
+        if (matched) break;
       }
     }
     if (entryOf.isEmpty) return const [];
@@ -465,20 +476,34 @@ class TerminologyStore extends ChangeNotifier {
           ? 0.0
           : (inputs.length > synDen ? 1.0 : inputs.length / synDen);
       final share = trendTotal == 0 ? 0.0 : (trendFreq[id] ?? 0) / trendTotal;
-      // Word sets of each SHORT symptom phrase (≤6 content words) of
-      // this condition — long clinical paragraphs excluded (2026-08-28).
-      final phrases = [
-        for (final sym in entry.symptoms)
-          {
-            for (final w in normalize(sym).split(' '))
+      // Two-tier phrase matching (user 2026-08-29 Amipur case: Malaria's
+      // Fever/Chills only live inside long narrative paragraphs, while
+      // COVID has them as short phrases — a short-only guard tied both
+      // at 47%). Short phrases (≤6 content words) score a full 1.0 per
+      // matched chip; long paragraphs still contribute at 0.5 — enough
+      // to break ties, low enough that an incidental AIDS-style mention
+      // can't overtake a real short-phrase match.
+      final shortPhrases = <Set<String>>[];
+      final longPhrases = <Set<String>>[];
+      for (final sym in entry.symptoms) {
+        for (final chunk in sym.split(';')) {
+          final ph = {
+            for (final w in normalize(chunk).split(' '))
               if (w.trim().isNotEmpty) loose(w.trim()),
-          },
-      ].where((ph) => ph.isNotEmpty && ph.length <= 6).toList();
-      var chipHits = 0;
-      for (final chip in patientChips) {
-        if (phrases.any((ph) => chip.every(ph.contains))) chipHits++;
+          };
+          if (ph.isEmpty) continue;
+          (ph.length <= 6 ? shortPhrases : longPhrases).add(ph);
+        }
       }
-      final symMatch = patientN == 0 ? 0.0 : chipHits / patientN;
+      var weighted = 0.0;
+      for (final chip in patientChips) {
+        if (shortPhrases.any((ph) => chip.every(ph.contains))) {
+          weighted += 1.0;
+        } else if (longPhrases.any((ph) => chip.every(ph.contains))) {
+          weighted += 0.5;
+        }
+      }
+      final symMatch = patientN == 0 ? 0.0 : weighted / patientN;
       final caseMatch = synMatch > symMatch ? synMatch : symMatch;
       // 70/30 (user 2026-08-28 final) — mirrors the server's
       // CASE_WEIGHT / VILLAGE_WEIGHT.

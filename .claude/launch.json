@@ -2,10 +2,16 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "jubicare_mmu",
-      "runtimeExecutable": "flutter",
-      "runtimeArgs": ["run", "-d", "chrome", "--web-port=8000"],
+      "name": "jubicare-api",
+      "runtimeExecutable": "D:\\React js Projects\\jubicare\\backend\\venv\\Scripts\\python.exe",
+      "runtimeArgs": ["D:\\React js Projects\\jubicare\\backend\\manage.py", "runserver", "8000"],
       "port": 8000
+    },
+    {
+      "name": "jubicare-web",
+      "runtimeExecutable": "C:\\Users\\Admin\\StudioProjects\\jubicare_mmu\\.claude\\run_jubicare_web.cmd",
+      "runtimeArgs": [],
+      "port": 5173
     }
   ]
 }

@@ -473,14 +473,15 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   /// Debounced (user 2026-08-25 "lagging while taking observation and
   /// after apply"). Deepgram streams partial transcripts every ~200 ms,
   /// so a short debounce fires the heavy work over and over WHILE the
-  /// doctor is still speaking. 800 ms lands the work AFTER the user
-  /// pauses (user 2026-08-26 "app fully freezing during observation").
-  /// Also skips the setState when nothing new was auto-added — no
-  /// visual change to render, so the frame stays free.
+  /// doctor is still speaking. 1200 ms (raised 2026-08-28 from 800 ms —
+  /// long dictation was still causing setState storms on the advisory
+  /// panels) lands the work AFTER the user pauses. Also skips the
+  /// setState when nothing new was auto-added — no visual change to
+  /// render, so the frame stays free.
   void _onObsChanged() {
     if (!mounted) return;
     _obsDebounce?.cancel();
-    _obsDebounce = Timer(const Duration(milliseconds: 800), () {
+    _obsDebounce = Timer(const Duration(milliseconds: 1200), () {
       if (!mounted) return;
       _autoAddFromTranscript();
       if (_autoAddedThisRun) setState(() {});
@@ -610,7 +611,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     final obsText = _obs.text;
     final sig = [
       symptoms.join('|'),
-      obsText,
+      // obsText EXCLUDED (user 2026-08-28 "clicking on observation
+      // freezes"): every dictated keystroke was mutating obsText and
+      // invalidating this cache, re-running the full terminology scan.
+      // The fallback path below still reads obsText — freshness arrives
+      // via the observation debounce, not on every scroll/tap.
       p.village,
       p.block ?? '',
       terminology.isLoaded ? 't' : 'f',
@@ -618,7 +623,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       s.patients.length.toString(),
     ].join('');
     if (sig != _advSig) {
-      final _t0 = DateTime.now().microsecondsSinceEpoch;
       _advSig = sig;
       final vill = p.village.trim().toLowerCase();
       final villageDx = <String, int>{};
@@ -657,12 +661,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       _cachedPlan = _cachedScored.isNotEmpty
           ? doctorDb[_cachedScored.first.name]
           : null;
-      print('[JC] advisory rebuild took '
-          '${DateTime.now().microsecondsSinceEpoch - _t0} µs '
-          '(symptoms=${symptoms.length}, obs=${obsText.length}, '
-          'patients=${s.patients.length}, termLoaded=${terminology.isLoaded})');
-    } else {
-      // Cache HIT — no heavy work.
     }
     final villageDx = _cachedVillageDx ?? const <String, int>{};
     // Avoid unused-variable warnings on the reused caches.
@@ -1136,7 +1134,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         e.redFlags.where((s) => s.trim().length <= 60).take(3).toList();
     final icd = (e.icd11Code ?? '').isEmpty ? '' : ' | ICD ${e.icd11Code}';
     final flagWord = flagHits.length == 1 ? 'RED FLAG' : 'RED FLAGS';
-    return Container(
+    return RepaintBoundary(child: Container(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]), borderRadius: BorderRadius.circular(12)),
@@ -1222,7 +1220,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ],
         ]),
       ]),
-    );
+    ));
   }
 
   Widget _advisory(String name, int pct, DPlan plan, {String? icd}) {
@@ -1237,7 +1235,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ]),
         );
     final rxStr = plan.rx.map((r) => '${r.name} (${r.interval} × ${r.days})').join(', ');
-    return Container(
+    return RepaintBoundary(child: Container(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]), borderRadius: BorderRadius.circular(12)),
@@ -1268,7 +1266,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ],
         ]),
       ]),
-    );
+    ));
   }
 
   Widget _aiBtn(String t, Color bg, VoidCallback onTap, {bool disabled = false}) => InkWell(

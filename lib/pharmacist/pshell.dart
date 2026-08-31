@@ -818,12 +818,27 @@ class _PharmaStockState extends State<PharmaStock> {
     }
     print('[JC] prefill: freq=$freq approved=$approvedOrder');
     // Most-FREQUENTLY requested first (user 2026-08-21): medicines seen in
-    // 2+ past requisitions lead. Thin history fallback (user 2026-08-21
-    // "show last and 2 approved product"): the most recently requested
-    // medicine plus the 2 most recent APPROVED medicines — not just the
-    // latest three.
-    var top = freq.keys.where((k) => freq[k]! >= 2).toList()
-      ..sort((a, b) => freq[b]!.compareTo(freq[a]!));
+    // 2+ past requisitions lead. User 2026-08-29: only the TOP-frequency
+    // tier — not every medicine that clears the ≥2 bar. Their history had
+    // Albendazole/Vit-C at 3× and Cetirizine/Calcium at 2×, and all four
+    // were prefilling; the top pair alone is what the user actually
+    // reorders. Ties break by most-recent use (requisitions list is
+    // newest-first, so the first name to hit `latest` wins).
+    var top = <String>[];
+    if (freq.values.any((n) => n >= 2)) {
+      final maxFreq = freq.values.reduce((a, b) => a > b ? a : b);
+      final recencyIndex = <String, int>{};
+      var idx = 0;
+      for (final r in s.requisitions) {
+        for (final i in r.items) {
+          if (i.isZonalAdded || i.name.trim().isEmpty) continue;
+          recencyIndex.putIfAbsent(i.name, () => idx++);
+        }
+      }
+      top = freq.keys.where((k) => freq[k]! == maxFreq).toList()
+        ..sort((a, b) => (recencyIndex[a] ?? 1 << 30)
+            .compareTo(recencyIndex[b] ?? 1 << 30));
+    }
     if (top.isEmpty) {
       top = [
         if (freq.isNotEmpty) freq.keys.first, // latest requested
@@ -834,7 +849,7 @@ class _PharmaStockState extends State<PharmaStock> {
     setState(() {
       reqItems
         ..clear()
-        ..addAll(top.take(5).map((n) => _Req(
+        ..addAll(top.map((n) => _Req(
               name: n,
               dosage: latest[n]!.dosage,
               unit: latest[n]!.unit,
