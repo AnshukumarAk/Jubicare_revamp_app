@@ -283,15 +283,12 @@ class TerminologyStore extends ChangeNotifier {
       if (seenIds.contains(e.entryId)) continue;
       var matched = false;
       for (final sym in e.symptoms) {
-        // Split on ';' first — the Symptoms column stores condition
-        // profiles as "headache; rigors; sweating; dry cough" and the
-        // 6-word guard was dropping the whole blob (user 2026-08-29).
         for (final chunk in sym.split(';')) {
           final ph = {
             for (final w in normalize(chunk).split(' '))
               if (w.trim().isNotEmpty) loose(w.trim()),
           };
-          if (ph.isEmpty || ph.length > 6) continue;
+          if (ph.isEmpty) continue;
           if (patientWordSets
               .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
             seenIds.add(e.entryId);
@@ -404,16 +401,12 @@ class TerminologyStore extends ChangeNotifier {
       if (entryOf.containsKey(e.entryId)) continue;
       var matched = false;
       for (final sym in e.symptoms) {
-        // Semicolon-split so a "fever; chills; cough" blob becomes
-        // three short phrases (user 2026-08-29). Narrative paragraphs
-        // (AIDS-style, comma-glued) still land as one long phrase and
-        // stay filtered by the 6-word guard.
         for (final chunk in sym.split(';')) {
           final ph = {
             for (final w in normalize(chunk).split(' '))
               if (w.trim().isNotEmpty) loose(w.trim()),
           };
-          if (ph.isEmpty || ph.length > 6) continue;
+          if (ph.isEmpty) continue;
           if (patientLooseWords
               .any((chip) => chip.isNotEmpty && chip.every(ph.contains))) {
             entryOf[e.entryId] = e;
@@ -476,34 +469,28 @@ class TerminologyStore extends ChangeNotifier {
           ? 0.0
           : (inputs.length > synDen ? 1.0 : inputs.length / synDen);
       final share = trendTotal == 0 ? 0.0 : (trendFreq[id] ?? 0) / trendTotal;
-      // Two-tier phrase matching (user 2026-08-29 Amipur case: Malaria's
-      // Fever/Chills only live inside long narrative paragraphs, while
-      // COVID has them as short phrases — a short-only guard tied both
-      // at 47%). Short phrases (≤6 content words) score a full 1.0 per
-      // matched chip; long paragraphs still contribute at 0.5 — enough
-      // to break ties, low enough that an incidental AIDS-style mention
-      // can't overtake a real short-phrase match.
-      final shortPhrases = <Set<String>>[];
-      final longPhrases = <Set<String>>[];
+      // Flat phrase matching — every phrase gives full 1.0 per matched
+      // chip regardless of length (user 2026-08-29: two-tier was
+      // penalising narrative-buried genuine symptoms like Dengue's Fever
+      // and the standalone Fever entry). The 30% village_share bonus
+      // suppresses AIDS-type paragraph noise once real diagnosis data
+      // lands — noisy entries have 0 village diagnoses, real conditions
+      // pick up 10%+ share and dominate.
+      final phrases = <Set<String>>[];
       for (final sym in entry.symptoms) {
         for (final chunk in sym.split(';')) {
           final ph = {
             for (final w in normalize(chunk).split(' '))
               if (w.trim().isNotEmpty) loose(w.trim()),
           };
-          if (ph.isEmpty) continue;
-          (ph.length <= 6 ? shortPhrases : longPhrases).add(ph);
+          if (ph.isNotEmpty) phrases.add(ph);
         }
       }
-      var weighted = 0.0;
+      var chipHits = 0;
       for (final chip in patientChips) {
-        if (shortPhrases.any((ph) => chip.every(ph.contains))) {
-          weighted += 1.0;
-        } else if (longPhrases.any((ph) => chip.every(ph.contains))) {
-          weighted += 0.5;
-        }
+        if (phrases.any((ph) => chip.every(ph.contains))) chipHits++;
       }
-      final symMatch = patientN == 0 ? 0.0 : weighted / patientN;
+      final symMatch = patientN == 0 ? 0.0 : chipHits / patientN;
       final caseMatch = synMatch > symMatch ? synMatch : symMatch;
       // 70/30 (user 2026-08-28 final) — mirrors the server's
       // CASE_WEIGHT / VILLAGE_WEIGHT.

@@ -12,6 +12,7 @@ import '../api/sync_service.dart';
 import '../screens/unified_login.dart';
 import '../services/location_service.dart';
 import '../services/fcm_service.dart';
+import '../services/notification_router.dart';
 import '../services/notifications_store.dart';
 import '../services/patients_cache_store.dart';
 import '../services/terminology_store.dart';
@@ -94,6 +95,29 @@ class _ShellState extends State<_Shell> {
       // CounsellorState.lastRefreshError but the cache stays on screen.
       _refreshFromBackend();
     });
+    // Notification-tap listener — a tap on a check-out reminder jumps
+    // to Attend, on a device-status reminder to Devices, etc (user
+    // 2026-09-10). Consume() clears the pending action so a random
+    // rebuild doesn't re-trigger the jump.
+    NotificationRouter.instance.pending.addListener(_applyNotificationRoute);
+    // Also apply any tap that landed before the shell mounted (e.g. cold
+    // start from a killed-app tap).
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyNotificationRoute());
+  }
+
+  void _applyNotificationRoute() {
+    if (!mounted) return;
+    final r = NotificationRouter.instance.consume();
+    if (r == null) return;
+    switch (r.route) {
+      case 'attend':   _go(5); break;
+      case 'devices':  _go(4); break;
+      case 'camps':    _go(3); break;
+      case 'register': _go(2); break;
+      case 'status':   _go(1); break;
+      case 'home':     _go(0); break;
+      default: /* unknown route — ignore rather than crash */ break;
+    }
   }
 
   @override
@@ -114,6 +138,7 @@ class _ShellState extends State<_Shell> {
   void dispose() {
     _registerScroll.dispose();
     _sync?.removeListener(_onSyncTick);
+    NotificationRouter.instance.pending.removeListener(_applyNotificationRoute);
     // If the counsellor closes the app without hitting Logout, still stop the
     // sampler so we don't leak a Timer. Fire-and-forget is fine — the timer is
     // local and gets GC'd when the state does.
@@ -167,10 +192,18 @@ class _ShellState extends State<_Shell> {
       final listF = api.counsellorPast7Days(limit: 200)
           .then<QueueList?>((v) => v)
           .catchError((_) => null);
-      final results = await Future.wait([tilesF, listF]);
+      // Doctor-attended (WITH_PHARMACIST + COMPLETED) pulled alongside so
+      // the Home tile "Visits Completed" opens instantly on tap without a
+      // per-tap fetch (user 2026-08-29 "only one time download and when
+      // refresh to pull down + app bar refresh then download").
+      final attendedF = api.doctorAttended(limit: 200)
+          .then<QueueList?>((v) => v)
+          .catchError((_) => null);
+      final results = await Future.wait([tilesF, listF, attendedF]);
       if (!mounted) return;
       final tiles = results[0] as Map<String, dynamic>?;
       final list = results[1] as QueueList?;
+      final attended = results[2] as QueueList?;
       if (tiles != null) store.applyTiles(tiles);
       if (list != null) {
         store.mergeBackendPatients(list.items);
@@ -178,6 +211,14 @@ class _ShellState extends State<_Shell> {
           final cache = await PatientsCacheStore.open();
           await cache.save(_patientsCacheKey, list.items);
         } catch (_) {/* best-effort */}
+      }
+      if (attended != null) {
+        // Additive — attended only ADDS its rows (WITH_PHARMACIST + COMPLETED)
+        // to the primary past-7-days snapshot. Non-additive would wipe every
+        // 'B' row the past-7-days merge just inserted, including brand-new
+        // registrations that never enter the attended list (user 2026-09-02
+        // "register today 1 ho gaya but not showing in the list").
+        store.mergeBackendPatients(attended.items, additive: true);
       }
       store.setRefreshState(loading: false);
     } catch (_) {
@@ -201,7 +242,18 @@ class _ShellState extends State<_Shell> {
     // Masters + terminology also refresh on the app-bar/pull refresh so
     // any new medicine, symptom, block/village or clinical-sheet update
     // reaches the app without a re-login (user 2026-08-25).
-    unawaited(context.read<MastersStore>().refresh());
+    // AWAIT the masters refresh so the fresh /mobile/bootstrap `user`
+    // block can be re-applied to AppState right after — a backend-side
+    // org plan flip (free ↔ paid) then reflects on this very pull, not
+    // only on the next app open (user 2026-09-08 "on refresh to pull
+    // down free paid change not working").
+    final masters = context.read<MastersStore>();
+    await masters.refresh();
+    if (!mounted) return;
+    final freshUser = masters.user;
+    if (freshUser != null) {
+      context.read<AppState>().applyBackendUser(freshUser);
+    }
     unawaited(context.read<TerminologyStore>().refresh());
     await _refreshFromBackend();
     switch (_tab) {
@@ -431,18 +483,34 @@ class _ShellState extends State<_Shell> {
               Navigator.pop(context);
               if (!await confirmLogout(context)) return;
               if (!mounted) return;
+              // Center loader so the user sees progress while the
+              // FCM DELETE + auth logout round-trips run — up to a
+              // few seconds on a slow network (user 2026-09-10).
+              showDialog<void>(
+                context: context,
+                barrierDismissible: false,
+                builder: (_) => const Center(child: CircularProgressIndicator()),
+              );
               // Stop location tracking BEFORE clearing session — otherwise the
               // sampler keeps firing after logout.
               context.read<LocationService>().stop();
+              // Kill the FCM registration FIRST so the DELETE call still
+              // carries a valid access token (user 2026-09-10: logout was
+              // racing token-clear vs fcm DELETE; DELETE 401'd and the
+              // server-side FCM row survived, so notifications kept
+              // arriving after logout). AWAIT it with a short cap so a
+              // slow network never blocks the logout tap.
+              try {
+                await FcmService.instance
+                    .unregister(context.read<ApiClient>())
+                    .timeout(const Duration(seconds: 5));
+              } catch (_) {/* offline — the server auto-cleans on the
+                              next UnregisteredError push */}
+              if (!mounted) return;
               // Best-effort backend logout (v2 §1.3 — ends every session
-              // for this account on the server). Fire-and-forget; local
-              // cleanup happens either way.
+              // for this account on the server). Fire-and-forget after
+              // fcm unregister has finished.
               unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-              // Kill the FCM registration so the previous user stops
-              // getting pushes on this handset (user bug 2026-08-20).
-              unawaited(FcmService.instance
-                  .unregister(context.read<ApiClient>())
-                  .catchError((_) {}));
               // Wipe user-scoped lists (user rule 2026-08-16).
               context.read<CounsellorState>().resetForNewUser();
               context.read<AppState>().logout();

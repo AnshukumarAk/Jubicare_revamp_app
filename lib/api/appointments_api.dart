@@ -59,9 +59,13 @@ class AppointmentsApi {
   }) async {
     final joined = symptoms.map((s) => s.trim())
         .where((s) => s.isNotEmpty).join(',');
-    if (joined.isEmpty) return const {};
+    // Skip the round trip only when BOTH are empty — nothing to compute
+    // and nothing to load. A village-only call is a legitimate warm-up
+    // for the symptom picker's "Common in <village>" header (user
+    // 2026-09-08). Server returns trending-only on empty symptoms.
+    if (joined.isEmpty && villageId == null) return const {};
     return ((await client.get('/advisory/preview', query: {
-      'symptoms': joined,
+      if (joined.isNotEmpty) 'symptoms': joined,
       if (villageId != null) 'village_id': villageId,
     })) as Map).cast<String, dynamic>();
   }

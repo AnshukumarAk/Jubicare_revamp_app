@@ -75,10 +75,21 @@ class FcmService {
           final n = m.notification;
           final title = n?.title ?? (m.data['title'] as String? ?? '');
           final body = n?.body ?? (m.data['body'] as String? ?? '');
+          // Encode route + arg into a single payload string —
+          // "route|arg" (arg optional). NotificationsService splits
+          // it back apart on tap and publishes to NotificationRouter
+          // (user 2026-09-10 foreground tap fix).
+          final route = (m.data['route'] as String? ?? '').trim();
+          final arg = (m.data['route_arg'] as String? ?? '').trim();
+          String? payload;
+          if (route.isNotEmpty) {
+            payload = arg.isEmpty ? route : '$route|$arg';
+          }
           if (title.isNotEmpty || body.isNotEmpty) {
             NotificationsService.instance.showNow(
               title: title.isEmpty ? 'JubiCare' : title,
               body: body,
+              payload: payload,
             );
           }
           if (!_messages.isClosed) _messages.add(null);
@@ -97,7 +108,19 @@ class FcmService {
     NotificationsStore.add(
         title: title.isEmpty ? 'JubiCare' : title, body: body,
         id: m.messageId, targetUid: m.data['uid'] as String?);
+    // Emit the tap so the app-level listener can navigate — the OS has
+    // already shown the tray notification; this only fires when the
+    // user actually tapped it (user 2026-09-10 "click on notification
+    // will go to that page for action").
+    if (!_taps.isClosed) _taps.add(m);
   }
+
+  /// Stream of RemoteMessages the user tapped. Payload's `route` +
+  /// `route_arg` (both strings) tell the shell which screen to open.
+  /// Fired for both `onMessageOpenedApp` (background → open) and
+  /// `getInitialMessage` (killed → open).
+  final _taps = StreamController<RemoteMessage>.broadcast();
+  Stream<RemoteMessage> get onNotificationTap => _taps.stream;
 
   Future<void> dispose() async {
     await _tokenSub?.cancel();

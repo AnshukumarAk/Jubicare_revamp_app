@@ -14,9 +14,11 @@ import 'package:path_provider/path_provider.dart';
 /// Runs in an isolate — even a 12 MP image takes 100-400 ms to re-encode,
 /// which would jank the capture screen on the UI thread.
 ///
-/// Format (single line, auto-scaled to photo width; user 2026-08-18):
-///   Location: <lat.6f>, <lng.6f>    Date: DD-MM-YYYY    Time: hh:mm AM/PM
-/// (GPS unavailable → the Location segment is dropped, Date/Time remain.)
+/// Format (always a single line; user 2026-08-31):
+///   <place>  Location: <lat.6f>, <lng.6f> Date: DD-MM-YYYY Time: hh:mm AM/PM
+/// Empty [place] (other capture screens) omits the prefix. GPS unavailable
+/// drops the Location segment; Date/Time remain. Font steps down so a
+/// long place name does not clip Time.
 ///
 /// Returns a NEW File in the app's temp dir — the source file is left
 /// alone so the OS-level camera thumbnail keeps working.
@@ -77,42 +79,56 @@ class PhotoWatermark {
       );
     }
 
-    // Strip height + font pick scale with the photo — small photo,
-    // small font; big photo, big font.
+    // Strip height scales with the photo; the actual bitmap font is
+    // picked below so a long facility name still fits on one line.
     final stripH = math.max(40, (im.height * 0.045).round());
-    final font = _pickFont((stripH * 0.5).round());
 
-    // Compose the stamp (user 2026-08-18; place prefix re-added 2026-08-20
-    // "in watermark print also mmu name"):
-    //   <MMU name>    Location: <lat>, <lng>    Date: DD-MM-YYYY    Time: hh:mm AM/PM
-    // Place blank → segment dropped; GPS unavailable → Location dropped.
+    // Compose the stamp — always ONE line (user 2026-08-31):
+    //   <place>  Location: <lat>, <lng> Date: DD-MM-YYYY Time: hh:mm AM/PM
+    // `place` empty (attachments / camp photos) → that prefix is omitted
+    // so those callers keep GPS + Date + Time only. GPS unavailable →
+    // the Location segment is dropped; Date/Time remain.
     final dt = DateTime.tryParse(whenIso)?.toLocal() ?? DateTime.now();
     final dateStr = '${_p2(dt.day)}-${_p2(dt.month)}-${dt.year}';
     final hour12 = dt.hour == 0 ? 12 : (dt.hour > 12 ? dt.hour - 12 : dt.hour);
     final timeStr = '${_p2(hour12)}:${_p2(dt.minute)} ${dt.hour < 12 ? 'AM' : 'PM'}';
 
-    // Place/block prefix REMOVED from the strip (user 2026-08-21 "remove
-    // ashiana nagar value means block name" — reverses 2026-08-20's "print
-    // also mmu name"). The `place` param stays so call sites don't churn.
-    const prefix = '';
+    final placeSeg = place.trim();
+    final prefix = placeSeg.isEmpty ? '' : '$placeSeg  ';
     final locSeg = (latitude != null && longitude != null)
         ? 'Location: ${latitude.toStringAsFixed(6)}, ${longitude.toStringAsFixed(6)} '
         : '';
     final dtSeg = 'Date: $dateStr Time: $timeStr';
-
-    // drawString does NOT wrap — a long place + GPS + date + time line
-    // overflowed the right edge and the Time was cut off the photo (user
-    // bug 2026-08-21 "Time is not showing"). Measure first; if one line
-    // doesn't fit, split into two (place+GPS / date+time) and double the
-    // band height so every segment stays on the pixels.
-    final padX = math.max(10, (im.width * 0.015).round());
     final oneLine = '$prefix$locSeg$dtSeg';
+
+    final padX = math.max(10, (im.width * 0.015).round());
     final maxW = im.width - padX * 2;
+    // Try to keep the whole stamp on ONE line by stepping the font down.
+    // If even arial14 doesn't fit (long facility name + full GPS + date
+    // + time on a narrow portrait photo picked from the gallery — user
+    // 2026-09-07 "watermark it cuting not fitting fully in single line"),
+    // fall back to TWO lines: <place>+<location> on the first,
+    // <date+time> on the second. Second line will always fit at any
+    // font size because it's short.
+    var font = _pickFont((stripH * 0.5).round());
+    for (final f in <img.BitmapFont>[font, img.arial24, img.arial14]) {
+      font = f;
+      if (_textW(font, oneLine) <= maxW) break;
+    }
     final List<String> lines;
-    if (_textW(font, oneLine) <= maxW || '$prefix$locSeg'.trim().isEmpty) {
+    if (_textW(font, oneLine) <= maxW) {
       lines = [oneLine];
     } else {
-      lines = ['$prefix$locSeg'.trimRight(), dtSeg];
+      // Wrap point: keep prefix+location on line 1, date+time on line 2.
+      // If line 1 STILL overflows (very long place name), drop the
+      // prefix on that line — the date+time on line 2 is what the audit
+      // must never lose.
+      final line1 = '$prefix$locSeg'.trimRight();
+      lines = [
+        _textW(font, line1) <= maxW ? line1 : locSeg.trimRight(),
+        dtSeg,
+      ].where((l) => l.isNotEmpty).toList();
+      if (lines.isEmpty) lines.add(dtSeg);
     }
 
     // Semi-transparent black band across the bottom, tall enough for

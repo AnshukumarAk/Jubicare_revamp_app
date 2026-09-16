@@ -105,6 +105,35 @@ const List<String> kMedicineNames = [
 // 2026-08-16. The value stays a valid frequency if a legacy row carries
 // it — validation only rejects picks the doctor makes now.
 const List<String> kFrequencies = ['OD','BD','TDS','QID','SOS'];
+/// Dosage form options rendered right of the Dosage field in the
+/// doctor's prescription row (user 2026-09-08). Kept short so a long
+/// facility name never clips the picker. Backend has no dedicated
+/// column — the value round-trips as a "<form> · " prefix on the
+/// PrescriptionItem.dosage column (see RxItem.dosageForm).
+const List<String> kDosageForms = ['Tab', 'Cap', 'Syp', 'Gel', 'Cream'];
+
+/// Solid forms count as pieces (Tab / Cap) — a per-dose quantity makes
+/// sense, so the auto-QTY box is shown. Syrup / Gel / Cream are
+/// dispensed by volume or by tube, not by tablet count, so the QTY
+/// field is hidden for those forms (user 2026-09-14).
+bool dosageFormNeedsQty(String form) =>
+    form.isEmpty || form == 'Tab' || form == 'Cap';
+const String kDosageFormSep = ' · ';
+
+/// Split a stored dosage string into (form, strength).
+/// "Tab · 500 mg"       -> ("Tab", "500 mg")
+/// "500 mg"             -> ("",    "500 mg")     ← old rows, no prefix
+/// "SomethingElse · X"  -> ("",    "SomethingElse · X") ← unknown prefix kept as-is
+/// The prefix must match one of [kDosageForms] exactly; otherwise the
+/// whole string is treated as plain strength, so an older prescription
+/// that already used " · " for its own purposes is not misread.
+({String form, String strength}) parseDosage(String stored) {
+  final ix = stored.indexOf(kDosageFormSep);
+  if (ix <= 0) return (form: '', strength: stored);
+  final head = stored.substring(0, ix).trim();
+  if (!kDosageForms.contains(head)) return (form: '', strength: stored);
+  return (form: head, strength: stored.substring(ix + kDosageFormSep.length).trim());
+}
 const List<String> kDurations = ['3','5','7','10 Days','14','30'];
 
 /// Score likely conditions from chosen symptoms + block geo prior.

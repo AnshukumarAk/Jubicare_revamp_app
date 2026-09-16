@@ -247,7 +247,11 @@ class _CounAttendanceState extends State<CounAttendance> {
         checkIn:   _fmtIsoTime(r['check_in']),
         checkOut:  _fmtIsoTime(r['check_out']),
         location:  ((r['anchor_name'] ?? r['location']) ?? '').toString(),
-        status:    (r['status'] ?? 'Present').toString(),
+        // Open shift (no check-out) surfaces as "Pending" on the list row's
+        // badge and detail sheet (user 2026-08-29: was showing blank).
+        status:    r['check_out'] == null
+                     ? 'Pending'
+                     : (r['status'] ?? 'Present').toString(),
         photo:     (r['photo_path'] ?? '').toString().isNotEmpty,
         photoPath: _photoUrl(r['photo_path']),
         photoPathOut: _photoUrl(r['photo_path_out']),
@@ -707,15 +711,12 @@ class _CounAttendanceState extends State<CounAttendance> {
     return '${n.year.toString().padLeft(4, '0')}-${n.month.toString().padLeft(2, '0')}-${n.day.toString().padLeft(2, '0')}';
   }
 
-  /// Human-friendly place text for the watermark strip. Prefers the
-  /// snapped camp anchor name (from GPS + /camps/anchors), falls back
-  /// to the counsellor-picked location, then the facility name.
+  /// Facility name for the attendance selfie strip. Camp-anchor /
+  /// block names stay off the pixels (user 2026-08-31: facility_name
+  /// only, single line with GPS + date + time).
   String _placeLabelForWatermark() {
-    if (location != null && location!.isNotEmpty) return location!;
     final fac = context.read<MastersStore>().facility;
-    final facilityName =
-        ((fac?['name'] ?? fac?['facility_name']) as String?)?.trim() ?? '';
-    return facilityName;
+    return ((fac?['name'] ?? fac?['facility_name']) as String?)?.trim() ?? '';
   }
 
   /// Hours the current shift has been open. `check_in` is a bare TIME
@@ -888,7 +889,13 @@ class _CounAttendanceState extends State<CounAttendance> {
         CCard(child: open == null ? _checkInForm() : _checkOutForm(open)),
 
       if (!showForm && !_loading) ...[
-        if (past.isEmpty)
+        // Only show the "no records" placeholder when there's no past
+        // attendance AND no open shift for today — otherwise the
+        // "Shift open since ..." banner above already conveys the state
+        // (user 2026-09-07: attendance card was contradicting itself,
+        // saying "no attendance marked" while today's check-in banner
+        // sat right above it).
+        if (past.isEmpty && open == null)
           CCard(child: Padding(padding: const EdgeInsets.all(12), child: Center(child: Text('No attendance marked yet', style: ct(12, FontWeight.w400, C2.text2)))))
         else
           ...past.map((r) => CCard(
@@ -898,9 +905,11 @@ class _CounAttendanceState extends State<CounAttendance> {
               const SizedBox(width: 12),
               Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Text(r.date, style: ct(13.5, FontWeight.w700, C2.text)),
-                Text('${r.checkIn} – ${r.checkOut} · ${r.location}', style: ct(11.5, FontWeight.w400, C2.text2)),
+                Text('${r.checkIn} – ${r.checkOut.isEmpty ? 'Pending' : r.checkOut} · ${r.location}', style: ct(11.5, FontWeight.w400, C2.text2)),
               ])),
-              CBadge(r.status, bg: const Color(0xFFEDF7E0), fg: C2.green),
+              CBadge(r.status,
+                bg: r.status == 'Pending' ? const Color(0xFFFFF3D6) : const Color(0xFFEDF7E0),
+                fg: r.status == 'Pending' ? const Color(0xFF8A6A00) : C2.green),
             ]))),
       ],
     ]);
@@ -1014,14 +1023,19 @@ class _CounAttendanceState extends State<CounAttendance> {
             ]),
           ),
         );
+    // Driver row hidden (user 2026-09-15: MMU no longer counts driver
+    // attendance separately). The `driver` state stays wired so any
+    // ambient reads stay valid — the checkbox itself just doesn't
+    // render, and every caller pins driver=false, so nothing is
+    // silently ticked.
     return Column(children: [
       Row(children: [
-        Expanded(child: cell('Driver', driver, onDriver, locked: lockDriver)),
         Expanded(child: cell('Doctor', doctor, onDoctor, locked: lockDoctor)),
+        Expanded(child: cell('Pharmacist', pharma, onPharma, locked: lockPharma)),
       ]),
       Row(children: [
-        Expanded(child: cell('Pharmacist', pharma, onPharma, locked: lockPharma)),
         Expanded(child: cell('Other', other, onOther, locked: lockOther)),
+        const Spacer(),
       ]),
     ]);
   }
@@ -1133,7 +1147,7 @@ class _CounAttendanceState extends State<CounAttendance> {
             const SizedBox(height: 14),
             Text('Attendance — ${r.date}', style: ct(15, FontWeight.w700, C2.navy)),
             const SizedBox(height: 10),
-            _row('Date', r.date), _row('Check-in', r.checkIn), _row('Check-out', r.checkOut),
+            _row('Date', r.date), _row('Check-in', r.checkIn), _row('Check-out', r.checkOut.isEmpty ? 'Pending' : r.checkOut),
             _row('Location', r.location),
             // Staff (In)/(Out) rows removed (user 2026-08-19) — server rows
             // never carried the flags, so they always said "None"; the crew
@@ -1331,6 +1345,35 @@ class _CounCampsState extends State<CounCamps> {
     if (mounted) setState(() => _loading = false);
   }
 
+  /// One-shot GPS for the camp-photo watermark. Permission already
+  /// granted for attendance is reused; a timed-out fresh fix falls back
+  /// to last-known so the Location segment still prints.
+  Future<(double?, double?)> _gpsForWatermark() async {
+    try {
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm != LocationPermission.always &&
+          perm != LocationPermission.whileInUse) {
+        return (null, null);
+      }
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        return (null, null);
+      }
+      try {
+        final pos = await Geolocator.getCurrentPosition(
+                desiredAccuracy: LocationAccuracy.high)
+            .timeout(const Duration(seconds: 8));
+        return (pos.latitude, pos.longitude);
+      } catch (_) {
+        final last = await Geolocator.getLastKnownPosition();
+        if (last != null) return (last.latitude, last.longitude);
+      }
+    } catch (_) {/* date/time-only strip */}
+    return (null, null);
+  }
+
   /// Camera-or-gallery chooser (user 2026-08-19: "there should be also
   /// option from camera"). Camera = one shot per tap; Gallery = multi.
   Future<void> _pickPhotos() async {
@@ -1368,6 +1411,15 @@ class _CounCampsState extends State<CounCamps> {
     );
     if (source == null || !mounted) return;
     try {
+      // GPS BEFORE camera/gallery — same order as attendance selfies.
+      // Sampling after the camera activity returns routinely times out
+      // in 6s (GPS was paused), so the strip baked Date/Time only even
+      // when location was already granted (user 2026-08-31).
+      setState(() => _processingPhotos = true);
+      final gps = await _gpsForWatermark();
+      final lat = gps.$1;
+      final lng = gps.$2;
+
       final List<String> rawPaths = [];
       if (source == 'camera') {
         final shot = await ImagePicker().pickImage(
@@ -1378,35 +1430,20 @@ class _CounCampsState extends State<CounCamps> {
           imageQuality: 70, maxWidth: 1280);
         rawPaths.addAll([for (final p in picks) p.path]);
       }
-      if (rawPaths.isEmpty || !mounted) return;
+      if (rawPaths.isEmpty || !mounted) {
+        if (mounted) setState(() => _processingPhotos = false);
+        return;
+      }
 
-      // Watermark every camp photo (user 2026-08-19) — same
-      // Location/Date/Time strip as attendance selfies. GPS is sampled
-      // once per batch, best-effort; without a fix the strip still
-      // carries date+time. The loader flag drives the progress UI.
-      setState(() => _processingPhotos = true);
-      double? lat, lng;
-      try {
-        var perm = await Geolocator.checkPermission();
-        if (perm == LocationPermission.denied) {
-          perm = await Geolocator.requestPermission();
-        }
-        if (perm != LocationPermission.denied &&
-            perm != LocationPermission.deniedForever &&
-            await Geolocator.isLocationServiceEnabled()) {
-          final pos = await Geolocator.getCurrentPosition(
-                  desiredAccuracy: LocationAccuracy.medium)
-              .timeout(const Duration(seconds: 6));
-          lat = pos.latitude;
-          lng = pos.longitude;
-        }
-      } catch (_) {/* no GPS — date/time-only strip */}
       for (final path in rawPaths) {
         if (_photos.length >= 10) break; // sane cap per camp
         try {
           final stamped = await PhotoWatermark.stamp(
             File(path),
-            place: village ?? block ?? '',
+            // Camp photos stay GPS + Date + Time only. Passing village/
+            // block here would print them now that `place` is live again
+            // on the shared stamp (attendance uses facility_name).
+            place: '',
             latitude: lat, longitude: lng,
           );
           _photos.add(stamped.path);
@@ -1450,10 +1487,15 @@ class _CounCampsState extends State<CounCamps> {
       } catch (_) { skipped++; }
     }
 
+    // camp_type_id resolved from bootstrap master so the server
+    // can skip the case-insensitive name lookup (user 2026-09-10).
+    final masters = context.read<MastersStore>();
+    final campTypeId = masters.masterIdOf('camp_types', type);
     final payload = {
       'village_name': village!,
       'block_name':   block!,
       'camp_type':    type!,
+      if (campTypeId != null) 'camp_type_id': campTypeId,
       'camp_name':    _name.text.trim(),
       'venue':        _venue.text.trim(),
       'camp_date':    _campDateIso,
@@ -1463,6 +1505,7 @@ class _CounCampsState extends State<CounCamps> {
       await api.create(
         campName: _name.text.trim(),
         campType: type!,
+        campTypeId: campTypeId,
         campDate: _campDateIso,
         villageName: village!,
         blockName: block!,
@@ -1522,6 +1565,26 @@ class _CounCampsState extends State<CounCamps> {
     });
   }
 
+  /// Camp Type options — server master (bootstrap `masters.camp_types`)
+  /// leads; the const `kCampTypes` list is the offline fallback. Result
+  /// is deduplicated so a server list that already covers a fallback
+  /// name does not repeat it. Preserves the currently-picked value even
+  /// when server and hardcoded lists overlap (user 2026-09-10 dynamic
+  /// camp types, mirror of the doctor-side frequency helper).
+  List<String> _campTypeOptions(BuildContext ctx) {
+    final server = ctx.read<MastersStore>().masterStrings('camp_types');
+    if (server.isNotEmpty) {
+      final seen = <String>{};
+      final out = <String>[];
+      for (final s in [...server, ...kCampTypes]) {
+        if (s.trim().isEmpty) continue;
+        if (seen.add(s)) out.add(s);
+      }
+      return out;
+    }
+    return kCampTypes;
+  }
+
   static String _isoOf(DateTime d) =>
       '${d.year.toString().padLeft(4, '0')}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
 
@@ -1556,11 +1619,23 @@ class _CounCampsState extends State<CounCamps> {
               ? InputDecorator(decoration: cInput().copyWith(fillColor: C2.bg, filled: true),
                   child: Text('Select block first', style: ct(13.5, FontWeight.w400, C2.text3)))
               : _dd(villages, village, (v) => setState(() => village = v), hint: 'Select Village'), required: true),
-          CField('Camp Type', _dd(kCampTypes, type, (v) => setState(() => type = v), hint: 'Select Type'), required: true),
+          // Camp Type is DYNAMIC — pulled from server's `masters.camp_types`
+          // (bootstrap). Hardcoded `kCampTypes` stays as offline fallback
+          // so a fresh install / cache-miss still renders a working picker
+          // (user 2026-09-10 "use from master dynamic"). Server auto-
+          // creates the row on save when the name doesn't match any
+          // existing CampType — matches the doctor-side frequency pattern.
+          CField('Camp Type', _dd(_campTypeOptions(context), type,
+              (v) => setState(() => type = v), hint: 'Select Type'), required: true),
           CField('Camp Name', TextField(controller: _name, decoration: cInput('Enter camp name')), required: true),
           CField('Venue', TextField(controller: _venue, decoration: cInput('Enter venue')), required: true),
           // Future dates disabled (user 2026-08-19): last = today.
-          CField('Date', DateField(hint: 'Select date', first: DateTime(2025), last: DateTime.now(),
+          // Cap first at today - dataWindowDays (user 2026-08-29): matches
+          // the backend list-window so a camp saved outside the window
+          // wouldn't disappear from Past Activities the next reload.
+          CField('Date', DateField(hint: 'Select date',
+              first: DateTime.now().subtract(const Duration(days: AppConfig.dataWindowDays)),
+              last: DateTime.now(),
             onPicked: (d) { _campDateIso = _isoOf(d); _campDateShow = fmtDate(d); }), required: true),
           // Photo gallery — pick many, remove any, thumbnails preview.
           CField('Photos', Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1808,6 +1883,19 @@ class CounDevices extends StatefulWidget {
 }
 
 class _CounDevicesState extends State<CounDevices> {
+  /// Device state options — dynamic from bootstrap `masters.device_states`
+  /// (user 2026-09-10). Hardcoded `kDeviceStates` remains the offline
+  /// fallback; dedupe keeps a saved value valid regardless of source.
+  List<String> _deviceStateOptions(BuildContext ctx) {
+    final server = ctx.read<MastersStore>().masterStrings('device_states');
+    if (server.isEmpty) return kDeviceStates;
+    final seen = <String>{};
+    return [
+      for (final s in [...server, ...kDeviceStates])
+        if (s.trim().isNotEmpty && seen.add(s)) s,
+    ];
+  }
+
   // Submissions are MONTHLY and always for the CURRENT month, stored
   // server-side against its 1st (user rule 2026-08-14: one update per
   // month; the form unlocks again when the next month starts). Computed
@@ -1899,18 +1987,12 @@ class _CounDevicesState extends State<CounDevices> {
     try {
       final api = context.read<DevicesApi>();
       final devices = await api.status();
-      // Device reports are MONTHLY and land on the 1st of the month, so an
-      // 8-day window silently hides this month's own submission once the
-      // month is more than 8 days old — the tab then thinks nothing was
-      // submitted (root cause of "device status not saving", 2026-08-21;
-      // the DB had the rows all along). Reach back to at least the month
-      // start; the 8-day rule still governs when it reaches further.
-      final now = DateTime.now();
-      final monthStart =
-          '${now.year.toString().padLeft(4, '0')}-${now.month.toString().padLeft(2, '0')}-01';
-      final winFrom = AppConfig.dataWindowFrom;
-      final from = monthStart.compareTo(winFrom) < 0 ? monthStart : winFrom;
-      final history = await api.history(dateFrom: from);
+      // Device reports are monthly, so the audit trail needs a much
+      // longer look-back than attendance/camps (user 2026-08-29:
+      // "devices 8 month"). Backend caps identically via
+      // DEVICES_HISTORY_DEFAULT_DAYS = 240 in field_views.py.
+      final history =
+          await api.history(dateFrom: AppConfig.deviceWindowFrom);
       _devices = devices;
       _history = history;
       // Persist for offline use (user rule 2026-08-20 "update device
@@ -2141,7 +2223,8 @@ class _CounDevicesState extends State<CounDevices> {
                         ),
                         child: Text(st, style: ct(13.5, FontWeight.w600, C2.text)),
                       )
-                    : _dd(kDeviceStates, st, (v) => setState(() { if (v != null) _chosen[id] = v; })),
+                    : _dd(_deviceStateOptions(context), st,
+                        (v) => setState(() { if (v != null) _chosen[id] = v; })),
               ),
             ]));
           }),

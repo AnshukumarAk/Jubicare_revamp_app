@@ -26,6 +26,14 @@ class AppState extends ChangeNotifier {
   // unreachable) can keep working with just role + mmuId. -----
   int? backendUserId;
   int? backendOrgId;
+  // Organisation plan gate for payment-related UI (user 2026-09-02).
+  // Free orgs never charge a consultation fee, so the counsellor's
+  // Register form hides the Payment section entirely. Default TRUE
+  // (safer wrong answer): if the server hasn't answered yet, Payment
+  // stays hidden until proven otherwise. Backend enforces the same
+  // rule at save time (defence-in-depth).
+  bool orgIsFree = true;
+  String orgPlanType = 'free';
   int? backendFacilityId;
   String? backendFacilityCode;
   String? backendFacilityName;
@@ -46,6 +54,8 @@ class AppState extends ChangeNotifier {
     currentMmuId = null;
     backendUserId = null;
     backendOrgId = null;
+    orgIsFree = true;
+    orgPlanType = 'free';
     backendFacilityId = null;
     backendFacilityCode = null;
     backendFacilityName = null;
@@ -144,16 +154,27 @@ class AppState extends ChangeNotifier {
     }
     currentMmuId          = mmuId ?? (u['facility_code'] as String?) ?? currentMmuId;
     backendUserId         = (u['id'] as num?)?.toInt() ?? (u['user_id'] as num?)?.toInt();
-    backendOrgId          = (u['org_id'] as num?)?.toInt();
-    backendFacilityId     = (u['facility_id'] as num?)?.toInt();
-    backendFacilityCode   = u['facility_code'] as String?;
-    backendFacilityName   = u['facility_name'] as String?;
-    backendFacilityType   = u['facility_type'] as String?;
-    backendStateId        = (u['state_id'] as num?)?.toInt();
-    backendDistrictId     = (u['district_id'] as num?)?.toInt();
-    backendStateName      = u['state_name'] as String?;
-    backendDistrictName   = u['district_name'] as String?;
-    backendBlockName      = u['block_name'] as String?;
+    backendOrgId          = (u['org_id'] as num?)?.toInt() ?? backendOrgId;
+    // org_is_free / org_plan_type land here on the very first login and on
+    // every bootstrap refresh; both surfaces call applyBackendUser (user
+    // 2026-09-02 org plan gate).
+    orgIsFree             = (u['org_is_free'] as bool?) ?? true;
+    orgPlanType           = (u['org_plan_type'] as String?) ?? 'free';
+    // Every field below → PRESERVE existing value when the incoming
+    // payload omits it (user 2026-09-08: pull-to-refresh calls
+    // applyBackendUser with the /mobile/bootstrap `user` block, which
+    // carries only ids for state/district — never the human names.
+    // Without the `?? backend…` guard, the assigned State + District
+    // badges on the Register form went blank on the next pull).
+    backendFacilityId     = (u['facility_id'] as num?)?.toInt() ?? backendFacilityId;
+    backendFacilityCode   = (u['facility_code'] as String?) ?? backendFacilityCode;
+    backendFacilityName   = (u['facility_name'] as String?) ?? backendFacilityName;
+    backendFacilityType   = (u['facility_type'] as String?) ?? backendFacilityType;
+    backendStateId        = (u['state_id'] as num?)?.toInt() ?? backendStateId;
+    backendDistrictId     = (u['district_id'] as num?)?.toInt() ?? backendDistrictId;
+    backendStateName      = (u['state_name'] as String?) ?? backendStateName;
+    backendDistrictName   = (u['district_name'] as String?) ?? backendDistrictName;
+    backendBlockName      = (u['block_name'] as String?) ?? backendBlockName;
     notifyListeners();
   }
 

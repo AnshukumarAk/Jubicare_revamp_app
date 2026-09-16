@@ -26,7 +26,7 @@ import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList, kUploadsBase;
 import '../doctor/dshell.dart' show DocHeader, DocBottomNav;
-import '../doctor/ddata.dart' show kMedicineNames;
+import '../doctor/ddata.dart' show kMedicineNames, parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty;
 import '../services/connectivity_service.dart';
 import '../services/deepgram_stt.dart';
 import '../services/attendance_store.dart';
@@ -35,6 +35,7 @@ import '../services/terminology_store.dart';
 import '../services/back_form_registry.dart';
 import '../services/requisitions_store.dart';
 import '../services/fcm_service.dart';
+import '../services/notification_router.dart';
 import '../services/notifications_service.dart';
 import '../state/app_state.dart';
 import '../widgets/attendance_capture.dart';
@@ -99,6 +100,47 @@ class _PharmacistShellState extends State<PharmacistShell> {
       if (_stockKey.currentState != null) _stockKey.currentState!.refreshNow(),
     ]);
     if (_tab == 2) _attendRefresh.value++;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    NotificationRouter.instance.pending.addListener(_applyNotificationRoute);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyNotificationRoute());
+  }
+
+  @override
+  void dispose() {
+    NotificationRouter.instance.pending.removeListener(_applyNotificationRoute);
+    super.dispose();
+  }
+
+  void _applyNotificationRoute() {
+    if (!mounted) return;
+    final r = NotificationRouter.instance.consume();
+    if (r == null) return;
+    switch (r.route) {
+      // Pharma tabs: 0=Home, 1=Stock, 2=Attend
+      case 'attend':          _go(2); break;
+      case 'pharma_dispense': _go(0); break; // dashboard shows queue
+      case 'stock':           _go(1); break;
+      // Requisitions live inside the Stock tab. Additionally, if the
+      // push carried a req id in route_arg, jump straight into that
+      // requisition's detail sheet on the Past sub-tab (user
+      // 2026-09-10 "when requisition accept then send on Past tab
+      // here his info page").
+      case 'requisition':
+        _go(1);
+        final reqId = int.tryParse(r.arg ?? '');
+        if (reqId != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _stockKey.currentState?.openRequisition(reqId);
+          });
+        }
+        break;
+      case 'home':            _go(0); break;
+      default: break;
+    }
   }
 
   @override
@@ -437,16 +479,23 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
         final lines = <RxItem>[
           for (final r in (d['prescription'] as List? ?? const []))
             if (r is Map)
-              RxItem(
-                itemId: (r['prescription_item_id'] as num?)?.toInt(),
-                name: '${r['medicine_name'] ?? ''}',
-                dosage: '${r['dosage'] ?? ''}',
-                interval: '${r['frequency'] ?? 'TDS'}',
-                days: '${r['duration_days'] ?? 5} Days',
-                qty: (r['qty'] as num?)?.toInt() ?? 0,
-                dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
-                dispensed: (r['dispensed'] as bool?) ?? false,
-              ),
+              () {
+                final parsed = parseDosage('${r['dosage'] ?? ''}');
+                final serverForm = '${r['dosage_form'] ?? ''}'.trim();
+                return RxItem(
+                  itemId: (r['prescription_item_id'] as num?)?.toInt(),
+                  name: '${r['medicine_name'] ?? ''}',
+                  dosage: parsed.strength,
+                  dosageForm: serverForm.isNotEmpty ? serverForm : parsed.form,
+                  interval: '${r['frequency'] ?? 'TDS'}',
+                  days: '${r['duration_days'] ?? 5} Days',
+                  qty: (r['qty'] as num?)?.toInt() ?? 0,
+                  dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
+                  dispensed: (r['dispensed'] as bool?) ?? false,
+                  dispenseReason: '${r['qty_change_reason'] ?? ''}',
+                  comboKey: '${r['combo_key'] ?? ''}',
+                );
+              }(),
         ]..removeWhere((m) => m.name.trim().isEmpty);
         if (lines.isNotEmpty) p.prescription = lines;
       } catch (_) {/* offline — sheet shows what we have */}
@@ -481,9 +530,17 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
               padding: const EdgeInsets.all(10),
               decoration: BoxDecoration(color: C2.white, borderRadius: BorderRadius.circular(8), border: Border.all(color: C2.border)),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(m.dosage.isEmpty ? m.name : '${m.name} · ${m.dosage}', style: ct(13, FontWeight.w600, C2.text)),
+                Text(_displayNameWithDosage(m), style: ct(13, FontWeight.w600, C2.text)),
                 const SizedBox(height: 2),
-                Text('${m.interval} · ${m.days} · Dispensed Qty ${m.dispensedQty}', style: ct(11.5, FontWeight.w400, C2.text2)),
+                Text('${m.interval} · ${m.days} · Prescribed ${m.qty} · Dispensed ${m.dispensedQty}',
+                    style: ct(11.5, FontWeight.w400, C2.text2)),
+                // Show the pharmacist's reason when dispensed qty differed
+                // from prescribed and a note was captured (user 2026-09-08).
+                if (m.dispenseReason.trim().isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text('Reason: ${m.dispenseReason.trim()}',
+                      style: ct(11.5, FontWeight.w600, C2.danger)),
+                ],
               ]),
             )),
             const SizedBox(height: 8),
@@ -498,6 +555,44 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
 /// queue row's own `medicine_count` is the only number available. Reading
 /// `prescription.length` alone showed every backend patient as "0 meds",
 /// which reads as "nothing to dispense" for someone sent to the pharmacy.
+/// Compose the medicine name + dosage cell for display, including the
+/// dosage form when the doctor picked one (user 2026-09-08).
+/// Format: "Paracetamol · Tab · 500 mg" / "Paracetamol · 500 mg" (no
+/// form) / "Paracetamol" (no dosage either).
+/// A requisition item's stored dosage might be "Cream · 20" (form
+/// prefixed by the mobile submit) or a bare "500" from older builds.
+/// Render the unit that matches the form — "20 ml" for liquid /
+/// semi-solid forms, "500 mg" for tablets/capsules. Blank stays blank
+/// so the caller decides how to show missing data (user 2026-09-14
+/// "Cream Clotrimazole showing 20 mg — should be ml").
+String _fmtReqDose(String stored) {
+  final s = stored.trim();
+  if (s.isEmpty) return '';
+  final parsed = parseDosage(s);
+  final strength = parsed.strength;
+  final form = parsed.form;
+  if (strength.isEmpty) return s; // no digits parseable — echo as-is
+  final unit = dosageFormNeedsQty(form) ? 'mg' : 'ml';
+  return form.isEmpty ? '$strength $unit' : '$form · $strength $unit';
+}
+
+String _displayNameWithDosage(RxItem m) {
+  final form = m.dosageForm.trim();
+  var strength = m.dosage.trim();
+  // Append the unit that matches the form so "Cream · 20" reads as
+  // "Cream · 20 ml" on Deliver Medicine, not "20 mg" (user
+  // 2026-09-14 "cream Clotrimazole showing 20 mg — should be ml").
+  // Skip if the doctor already wrote a unit in the strength.
+  if (strength.isNotEmpty && !RegExp(r'(mg|ml|mcg|iu|g)\b', caseSensitive: false).hasMatch(strength)) {
+    strength = '$strength ${dosageFormNeedsQty(form) ? 'mg' : 'ml'}';
+  }
+  final tail = [
+    if (form.isNotEmpty) form,
+    if (strength.isNotEmpty) strength,
+  ].join(' · ');
+  return tail.isEmpty ? m.name : '${m.name} · $tail';
+}
+
 int medsLabel(CPatient p) =>
     p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount;
 
@@ -520,12 +615,76 @@ class _PharmaDispenseState extends State<PharmaDispense> {
   static const _kReasonOptions = ['Not Available', 'Buy From Outside', 'Other'];
   bool _loadingRx = false;
 
+  // Snapshot of the ORIGINAL dispensedQty per line, taken when the
+  // Deliver Medicine screen opens (and again once /appointments/{id}
+  // hydrates the lines). If the pharmacist edits a quantity, taps
+  // back WITHOUT Confirm Delivery, and opens the same patient again,
+  // the field must reappear with the doctor's prescribed number —
+  // not the abandoned edit (user 2026-09-07). Restored in dispose
+  // unless _confirmed = true (Confirm Delivery ran successfully).
+  final Map<RxItem, int> _originalDispensedQty = {};
+  bool _confirmed = false;
+
+  // Per-medicine available stock at THIS pharmacist's facility. Populated
+  // in initState from the offline cache (pharma_stock_v1 — same key the
+  // Overall Status tab writes) and then refreshed from GET /medicines/stock
+  // when online. Case-insensitive lookup so "Paracetamol" and "paracetamol"
+  // match (user 2026-09-07 stock-aware dispense).
+  Map<String, int> _stock = {};
+
+  int _stockOf(String medicineName) {
+    final key = medicineName.trim().toLowerCase();
+    if (key.isEmpty) return 0;
+    for (final e in _stock.entries) {
+      if (e.key.trim().toLowerCase() == key) return e.value;
+    }
+    return 0;
+  }
+
+  void _snapshotDispensedQty() {
+    for (final m in p.prescription) {
+      _originalDispensedQty.putIfAbsent(m, () => m.dispensedQty);
+    }
+  }
+
   TextEditingController _reasonCtl(RxItem m) => _reason.putIfAbsent(m, () => TextEditingController());
 
   @override
   void initState() {
     super.initState();
+    _snapshotDispensedQty();
     _loadPrescription();
+    _loadStock();
+  }
+
+  Future<void> _loadStock() async {
+    // 1) Warm from the cache the Overall Status tab already writes.
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('pharma_stock_v1');
+      if (raw != null && mounted) {
+        final m = (jsonDecode(raw) as Map).cast<String, dynamic>();
+        setState(() => _stock =
+            {for (final e in m.entries) e.key: (e.value as num).toInt()});
+      }
+    } catch (_) {/* first run — no cache yet */}
+    // 2) Refresh from server so a just-received requisition is reflected.
+    try {
+      final res = await context.read<ApiClient>().get('/medicines/stock');
+      if (!mounted || res is! List) return;
+      final next = <String, int>{};
+      for (final r in res) {
+        if (r is! Map) continue;
+        final name = (r['medicine_name'] ?? '').toString();
+        if (name.isEmpty) continue;
+        next[name] = (r['quantity'] as num?)?.toInt() ?? 0;
+      }
+      setState(() => _stock = next);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('pharma_stock_v1', jsonEncode(next));
+      } catch (_) {/* best-effort */}
+    } catch (_) {/* offline — cache holds */}
   }
 
   /// Fetch the medicines the doctor prescribed.
@@ -551,7 +710,11 @@ class _PharmaDispenseState extends State<PharmaDispense> {
             RxItem(
               itemId:   (r['prescription_item_id'] as num?)?.toInt(),
               name:     '${r['medicine_name'] ?? ''}',
-              dosage:   '${r['dosage'] ?? ''}',
+              // Split "<form> · <strength>" back apart (user 2026-09-08).
+              dosage:   parseDosage('${r['dosage'] ?? ''}').strength,
+              dosageForm: '${r['dosage_form'] ?? ''}'.trim().isNotEmpty
+                  ? '${r['dosage_form']}'.trim()
+                  : parseDosage('${r['dosage'] ?? ''}').form,
               interval: '${r['frequency'] ?? 'TDS'}',
               days:     '${r['duration_days'] ?? 5} Days',
               qty:      (r['qty'] as num?)?.toInt() ?? 0,
@@ -565,11 +728,18 @@ class _PharmaDispenseState extends State<PharmaDispense> {
                   ? (r['dispensed_qty'] as num).toInt()
                   : null,
               dispensed: (r['dispensed'] as bool?) ?? false,
+              // Combination-strip group id so _medRows can merge two
+              // lines the doctor wrote as one deliverable (user
+              // 2026-09-12). Blank on standalone lines.
+              comboKey: '${r['combo_key'] ?? ''}',
             ),
       ]..removeWhere((m) => m.name.trim().isEmpty);
       setState(() {
         if (lines.isNotEmpty) p.prescription = lines;
         _loadingRx = false;
+        // Fresh lines from server → snapshot their dispensedQty so
+        // dispose can restore the original values.
+        _snapshotDispensedQty();
       });
     } catch (_) {
       // Offline: leave the list empty rather than blocking. The pharmacist
@@ -580,6 +750,15 @@ class _PharmaDispenseState extends State<PharmaDispense> {
 
   @override
   void dispose() {
+    // Abandoned edits → restore original dispensed quantities so the
+    // next visit shows the doctor's prescribed number (user 2026-09-07).
+    // Confirm Delivery sets _confirmed=true, so a successful dispense
+    // keeps the pharmacist's committed values.
+    if (!_confirmed) {
+      for (final entry in _originalDispensedQty.entries) {
+        entry.key.dispensedQty = entry.value;
+      }
+    }
     for (final c in _reason.values) { c.dispose(); }
     super.dispose();
   }
@@ -609,9 +788,29 @@ class _PharmaDispenseState extends State<PharmaDispense> {
                   child: Center(child: CircularProgressIndicator(strokeWidth: 2)))
             else if (p.prescription.isEmpty)
               Text('No medicines prescribed', style: ct(12, FontWeight.w400, C2.text2)),
-            ...p.prescription.map(_medRow),
+            ..._medRows(p.prescription),
             const SizedBox(height: 8),
             CPrimaryButton('Confirm Delivery', icon: Icons.check_circle_outline, onTap: () {
+              void err(String m) => ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text(m), backgroundColor: C2.danger));
+              // Guard 1 — user 2026-09-07: dispensed CANNOT exceed the
+              // doctor's prescribed quantity. Over-dispense used to slip
+              // through silently and lose stock without an audit reason.
+              for (final m in p.prescription) {
+                final given = m.dispensedQty ?? 0;
+                if (given > m.qty) {
+                  return err('Dispensed medicine count cannot be more than prescribed medicine count (${m.name})');
+                }
+              }
+              // Guard 2 — user 2026-09-07: reject any line whose dispense
+              // exceeds this pharmacist's on-hand stock. The stock number
+              // is the same one the Overall Status tab shows.
+              for (final m in p.prescription) {
+                final given = m.dispensedQty ?? 0;
+                if (given > 0 && given > _stockOf(m.name)) {
+                  return err('Insufficient stock for ${m.name} (available: ${_stockOf(m.name)})');
+                }
+              }
               // Reason for quantity change is mandatory when delivered ≠ prescribed.
               for (final m in p.prescription) {
                 if (m.dispensedQty != m.qty && _reasonCtl(m).text.trim().isEmpty) {
@@ -619,6 +818,7 @@ class _PharmaDispenseState extends State<PharmaDispense> {
                   return;
                 }
               }
+              _confirmed = true; // dispose() must NOT restore originals.
               s.pharmacistDispense(p);
               // Enqueue appointment.dispense for /mobile/sync/push (v2 §4).
               // Same contract the doctor submit needs: the server resolves the
@@ -650,14 +850,120 @@ class _PharmaDispenseState extends State<PharmaDispense> {
     );
   }
 
-  Widget _medRow(RxItem m) {
-    final changed = m.dispensedQty != m.qty;
+  /// Lay out the prescription list, grouping any two lines that share
+  /// a non-empty [RxItem.comboKey] into ONE combination card — that
+  /// pair was written by the doctor as a single strip (Paracetamol +
+  /// Vitamin C) and the pharmacist should not tick two rows for one
+  /// physical item (user 2026-09-12). Standalone lines fall back to
+  /// the existing single-line renderer.
+  List<Widget> _medRows(List<RxItem> items) {
+    final out = <Widget>[];
+    final seen = <int>{};
+    for (var i = 0; i < items.length; i++) {
+      if (seen.contains(i)) continue;
+      final m = items[i];
+      if (m.comboKey.trim().isNotEmpty) {
+        RxItem? partner;
+        for (var j = i + 1; j < items.length; j++) {
+          if (!seen.contains(j) && items[j].comboKey == m.comboKey) {
+            partner = items[j];
+            seen.add(j);
+            break;
+          }
+        }
+        if (partner != null) {
+          out.add(_comboMedRow(m, partner));
+          continue;
+        }
+      }
+      out.add(_medRow(m));
+    }
+    return out;
+  }
+
+  /// Card for a combination pair: single title "A + B", shared
+  /// Prescribed line and DELIVERED QTY. The typed qty writes to BOTH
+  /// RxItems so the existing per-line dispense payload stays valid.
+  Widget _comboMedRow(RxItem a, RxItem b) {
+    final changed = a.dispensedQty != a.qty;
+    final stockA = _stockOf(a.name);
+    final stockB = _stockOf(b.name);
+    final short = stockA < a.qty || stockB < b.qty;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(color: C2.bg, borderRadius: BorderRadius.circular(10), border: Border.all(color: C2.border)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [Expanded(child: Text(m.dosage.isEmpty ? m.name : '${m.name} · ${m.dosage}', style: ct(13, FontWeight.w600, C2.text))), const CBadge('Rx', bg: C2.navyLight, fg: C2.navy)]),
+        Row(children: [
+          Expanded(child: Text(
+              '${_displayNameWithDosage(a)} + ${_displayNameWithDosage(b)}',
+              style: ct(13, FontWeight.w600, C2.text))),
+          CBadge('Stock: $stockA / $stockB',
+              bg: short ? const Color(0xFFFFE6E6) : const Color(0xFFEDF7E0),
+              fg: short ? C2.danger : C2.green),
+          const SizedBox(width: 6),
+          const CBadge('Rx', bg: C2.navyLight, fg: C2.navy),
+        ]),
+        const SizedBox(height: 6),
+        Row(children: [
+          Expanded(child: _ro('Prescribed', '${a.interval} · ${a.days} · Qty ${a.qty}')),
+          const SizedBox(width: 8),
+          SizedBox(width: 92, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('DELIVERED QTY', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
+            SizedBox(height: 38, child: TextFormField(initialValue: '${a.dispensedQty}', keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)],
+              textAlign: TextAlign.center, style: ct(13, FontWeight.w500, C2.text), decoration: cInput(),
+              onChanged: (v) => setState(() {
+                final n = int.tryParse(v) ?? 0;
+                a.dispensedQty = n;
+                b.dispensedQty = n;
+              }))),
+          ])),
+        ]),
+        if (changed) ...[
+          Padding(padding: const EdgeInsets.only(top: 6), child: DropdownButtonFormField<String>(
+            value: _reasonChoice[a],
+            isExpanded: true,
+            decoration: cInput('Reason for quantity change *'),
+            style: ct(12.5, FontWeight.w400, C2.text),
+            items: [ for (final o in _kReasonOptions) DropdownMenuItem(value: o, child: Text(o)) ],
+            onChanged: (v) => setState(() {
+              _reasonChoice[a] = v;
+              _reasonChoice[b] = v;
+              final text = (v == null || v == 'Other') ? '' : v;
+              _reasonCtl(a).text = text;
+              _reasonCtl(b).text = text;
+            }),
+          )),
+          if (_reasonChoice[a] == 'Other')
+            Padding(padding: const EdgeInsets.only(top: 6), child: TextField(controller: _reasonCtl(a),
+              decoration: cInput('Enter reason *'), style: ct(12.5, FontWeight.w400, C2.text),
+              onChanged: (v) => setState(() { _reasonCtl(b).text = v; }))),
+        ],
+      ]),
+    );
+  }
+
+  Widget _medRow(RxItem m) {
+    final changed = m.dispensedQty != m.qty;
+    // On-hand stock for THIS medicine at THIS pharmacist's facility
+    // (user 2026-09-07: show every medicine stock in deliver medicine —
+    // his own stock quantity). Red tint when short of the prescribed qty.
+    final stock = _stockOf(m.name);
+    final low = stock < m.qty;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(color: C2.bg, borderRadius: BorderRadius.circular(10), border: Border.all(color: C2.border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(_displayNameWithDosage(m), style: ct(13, FontWeight.w600, C2.text))),
+          CBadge('Stock: $stock',
+              bg: low ? const Color(0xFFFFE6E6) : const Color(0xFFEDF7E0),
+              fg: low ? C2.danger : C2.green),
+          const SizedBox(width: 6),
+          const CBadge('Rx', bg: C2.navyLight, fg: C2.navy),
+        ]),
         const SizedBox(height: 6),
         Row(children: [
           Expanded(child: _ro('Prescribed', '${m.interval} · ${m.days} · Qty ${m.qty}')),
@@ -709,7 +1015,13 @@ class _Req {
   String dosage;
   String unit;
   String qty;
-  _Req({this.name, this.dosage = '', this.unit = 'Strip', this.qty = '10'});
+  /// Dosage form (Tab / Cap / Syp / Gel / Cream) — same picker the
+  /// doctor uses on prescription rows (user 2026-09-14). Rides on the
+  /// server payload as part of the `dosage` string ("Tab · 500 mg")
+  /// so no requisition schema change is needed.
+  String dosageForm;
+  _Req({this.name, this.dosage = '', this.unit = 'Strip', this.qty = '10',
+        this.dosageForm = 'Tab'});
 }
 
 const List<String> _kMedUnits = ['Tab', 'Strip', 'Bottle', 'Vial', 'Sachet', 'ml', 'Ampoule', 'Tube', 'Piece'];
@@ -789,6 +1101,35 @@ class _PharmaStockState extends State<PharmaStock> {
   /// Public hook — the shell app-bar refresh button calls this.
   Future<void> refreshNow() => _loadRequisitions();
 
+  /// Public entry point from the pharma shell's notification handler:
+  /// switch to Past sub-tab and pop the detail sheet for [backendReqId]
+  /// (user 2026-09-10 "requisition notification tap should open this
+  /// info page, not just the Stock tab"). If the row hasn't landed yet
+  /// (offline / mid-refresh) waits up to 3 s for _loadRequisitions.
+  Future<void> openRequisition(int backendReqId) async {
+    if (!mounted) return;
+    setState(() => tab = 1); // Past sub-tab
+    // Give the refresh a moment if it's currently in flight.
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (mounted && DateTime.now().isBefore(deadline)) {
+      final match = context.read<CounsellorState>().requisitions
+          .where((r) => r.backendId == backendReqId).toList();
+      if (match.isNotEmpty) {
+        await _ensureLinesLoaded(match.first);
+        if (!mounted) return;
+        final fresh = context.read<CounsellorState>().requisitions
+            .firstWhere((x) => x.backendId == backendReqId,
+                        orElse: () => match.first);
+        Navigator.push(context, MaterialPageRoute(
+            builder: (_) => _RequisitionDetail(req: fresh)));
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    // Not found — user still on Past tab where the row will appear
+    // once the next refresh lands (best-effort deep link).
+  }
+
   bool _didPrefill = false;
 
   /// Pre-fill the Requisition form with the pharmacist's MOST-REQUESTED
@@ -849,12 +1190,20 @@ class _PharmaStockState extends State<PharmaStock> {
     setState(() {
       reqItems
         ..clear()
-        ..addAll(top.map((n) => _Req(
-              name: n,
-              dosage: latest[n]!.dosage,
-              unit: latest[n]!.unit,
-              qty: latest[n]!.requested > 0 ? '${latest[n]!.requested}' : '10',
-            )));
+        ..addAll(top.map((n) {
+          // Split any stored "Tab · 500 mg" back into (form, strength)
+          // so the form dropdown hydrates and the dosage box keeps
+          // just the number — otherwise submit would re-prefix and
+          // send "Tab · Tab · 500 mg" (user 2026-09-14).
+          final parsed = parseDosage(latest[n]!.dosage);
+          return _Req(
+            name: n,
+            dosage: parsed.strength,
+            dosageForm: parsed.form.isNotEmpty ? parsed.form : 'Tab',
+            unit: latest[n]!.unit,
+            qty: latest[n]!.requested > 0 ? '${latest[n]!.requested}' : '10',
+          );
+        }));
       if (reqItems.isEmpty) reqItems.add(_Req());
       _didPrefill = true;
     });
@@ -1055,9 +1404,11 @@ class _PharmaStockState extends State<PharmaStock> {
               // was originally requested) so the pharmacist just taps
               // Submit for an identical re-order.
               final prevQty = i.approvedQty > 0 ? i.approvedQty : i.requested;
+              final parsed = parseDosage(i.dosage);
               return _Req(
                 name: i.name,
-                dosage: i.dosage,
+                dosage: parsed.strength,
+                dosageForm: parsed.form.isNotEmpty ? parsed.form : 'Tab',
                 unit: i.unit,
                 qty: prevQty > 0 ? prevQty.toString() : '',
               );
@@ -1081,19 +1432,43 @@ class _PharmaStockState extends State<PharmaStock> {
           if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key)), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         Row(children: [
-          Expanded(flex: 2, child: CField('Dosage (mg)', TextField(
-            controller: TextEditingController(text: e.value.dosage),
-            decoration: cInput('e.g. 500'),
-            keyboardType: TextInputType.number,
-            // 3-digit cap, digits only — no requisitioned medicine above
-            // 999 mg per unit in this prototype.
-            inputFormatters: [
-              FilteringTextInputFormatter.digitsOnly,
-              LengthLimitingTextInputFormatter(3),
-            ],
-            onChanged: (v) => e.value.dosage = v,
+          // Dosage Form first (user 2026-09-14) — picking Tab vs Syp
+          // decides the label + input rules of the Dosage box beside
+          // it, so the form belongs upstream in the reading order.
+          Expanded(flex: 2, child: CField('Dosage Form', SearchDropdown(
+            items: kDosageForms,
+            value: kDosageForms.contains(e.value.dosageForm) ? e.value.dosageForm : null,
+            onChanged: (v) => setState(() { e.value.dosageForm = v ?? ''; }),
           ), required: true)),
           const SizedBox(width: 8),
+          Expanded(flex: 2, child: () {
+            // Solid forms are counted in mg; syrups / gels / creams are
+            // measured by ml, so widen the label + allow decimal input
+            // for those (user 2026-09-14).
+            final needsQty = dosageFormNeedsQty(e.value.dosageForm);
+            return CField(
+              needsQty ? 'Dosage (mg)' : 'Dosage (ML)',
+              TextField(
+                controller: TextEditingController(text: e.value.dosage),
+                decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
+                keyboardType: needsQty
+                    ? TextInputType.number
+                    : const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: needsQty
+                    ? [
+                        FilteringTextInputFormatter.digitsOnly,
+                        LengthLimitingTextInputFormatter(3),
+                      ]
+                    : [LengthLimitingTextInputFormatter(12)],
+                onChanged: (v) => e.value.dosage = v,
+              ),
+              required: true,
+            );
+          }()),
+          const SizedBox(width: 8),
+          // Qty is always asked on a requisition — even for creams /
+          // gels / syrups the pharmacist orders N tubes or bottles,
+          // not a bare volume (user 2026-09-14).
           Expanded(flex: 1, child: CField('Qty', TextField(
             controller: TextEditingController(text: e.value.qty),
             keyboardType: TextInputType.number,
@@ -1117,7 +1492,10 @@ class _PharmaStockState extends State<PharmaStock> {
 
   Future<void> _submitReq(BuildContext context) async {
     if (_submittingReq) return;
-    // Parse qty once per row so validation and construction see the same value.
+    // Parse qty once per row so validation and construction see the
+    // same value. Qty is a piece count for every form — creams / gels
+    // / syrups are ordered by tube or bottle, not by bare volume
+    // (user 2026-09-14).
     final parsed = reqItems
         .map((r) => (draft: r, qty: int.tryParse(r.qty.trim()) ?? 0))
         .toList();
@@ -1128,23 +1506,26 @@ class _PharmaStockState extends State<PharmaStock> {
     setState(() => _submittingReq = true);
     final s = context.read<CounsellorState>();
     final api = context.read<RequisitionsApi>();
-    // Try the server first — success = the server-issued id is what
-    // the pharmacist should see; local-only rows are the offline
-    // fallback (user rule 2026-08-16: safe API integration).
+    // Same "<form> · <strength>" encoding the doctor uses on Rx
+    // items so the requisition list reads back as "Tab · 500" and
+    // pharmacist reports can group by form without parsing free
+    // text (user 2026-09-14).
+    String _fmtDosage(_Req d) {
+      final s = d.dosage.trim();
+      if (s.isEmpty) return '';
+      if (d.dosageForm.isEmpty) return s;
+      return '${d.dosageForm}$kDosageFormSep$s';
+    }
     final lines = [
       for (final p in valid)
         {
           'medicine_name': p.draft.name,
-          'dosage':        p.draft.dosage.trim(),
+          'dosage':        _fmtDosage(p.draft),
           'requested_qty': p.qty,
         }
     ];
     try {
       await api.create(lines: lines);
-      if (!mounted) return;
-      // Re-pull the whole list so the new row lands with server-assigned
-      // id, status, and audit fields — no local drift.
-      await _loadRequisitions();
       if (!mounted) return;
       // Blank the form, then immediately re-arm the history prefill so
       // coming back from the Past tab shows a filled form again instead
@@ -1155,6 +1536,11 @@ class _PharmaStockState extends State<PharmaStock> {
         content: Text('Requisition submitted · Awaiting approval'),
         backgroundColor: C2.green,
       ));
+      // Refresh in the background so the new row lands with server-
+      // assigned id/status without making the user wait for a second
+      // round trip (user 2026-09-10: "simple sa requisition send karne
+      // ke liye taking too much time").
+      unawaited(_loadRequisitions());
     } on ApiException catch (e) {
       if (e.code == ApiErrorCode.networkUnreachable) {
         // Offline — save locally so the pharmacist isn't blocked, AND
@@ -1172,7 +1558,7 @@ class _PharmaStockState extends State<PharmaStock> {
           date: fmtDate(now),
           status: 'pending_zi',
           items: valid.map((p) => ReqLine(
-            name: p.draft.name!, dosage: p.draft.dosage.trim(), unit: p.draft.unit,
+            name: p.draft.name!, dosage: _fmtDosage(p.draft), unit: p.draft.unit,
             requested: p.qty, status: 'Pending',
           )).toList(),
           audit: [AuditEntry(when: now, actor: 'Pharmacist', action: 'Submitted (offline)')],
@@ -1396,7 +1782,7 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
         Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(i.name, style: ct(12.5, FontWeight.w700, C2.text)),
           if (i.dosage.isNotEmpty)
-            Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
+            Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
         ])),
         Expanded(flex: 2, child: Text('Req ${i.requested}', textAlign: TextAlign.center, style: ct(11.5, FontWeight.w600, C2.text))),
         if (showApproved)
@@ -1422,7 +1808,7 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           ),
         ]),
         if (i.dosage.isNotEmpty)
-          Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
+          Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
         if (i.zonalRemark.isNotEmpty)
           Padding(padding: const EdgeInsets.only(top: 4),
             child: Text('Note: ${i.zonalRemark}', style: ct(11, FontWeight.w500, C2.text2))),
@@ -1457,7 +1843,7 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(i.name + (i.isZonalAdded ? '  ★' : ''), style: ct(12, FontWeight.w700, C2.text)),
             if (i.dosage.isNotEmpty)
-              Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
+              Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
           ])),
           Expanded(flex: 2, child: Text('${i.approvedQty > 0 ? i.approvedQty : i.requested}', textAlign: TextAlign.center, style: ct(11.5, FontWeight.w700, C2.text))),
           Expanded(flex: 3, child: SizedBox(height: 34, child: TextFormField(
@@ -1635,7 +2021,7 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           Text(i.name + (i.isZonalAdded ? '  ★' : ''),
               style: ct(12.5, FontWeight.w700, C2.text)),
           if (i.dosage.isNotEmpty)
-            Text('${i.dosage} mg', style: ct(10.5, FontWeight.w400, C2.text2)),
+            Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
           if (i.zonalRemark.isNotEmpty)
             Text('Note: ${i.zonalRemark}', style: ct(10.5, FontWeight.w500, C2.text2)),
         ])),
@@ -1810,7 +2196,7 @@ class _PharmaReportState extends State<PharmaReport> {
               Text('${p.name} · ${p.age}/${p.gender}', style: ct(12.5, FontWeight.w700, C2.text)),
               if (p.prescription.isEmpty) Text('No medicines', style: ct(11, FontWeight.w400, C2.text2)),
               ...p.prescription.map((m) => Padding(padding: const EdgeInsets.only(top: 3),
-                child: Text('• ${m.dosage.isEmpty ? m.name : "${m.name} ${m.dosage}"} · ${m.interval} · Qty ${m.dispensedQty}', style: ct(11.5, FontWeight.w400, C2.text2)))),
+                child: Text('• ${_displayNameWithDosage(m)} · ${m.interval} · Qty ${m.dispensedQty}', style: ct(11.5, FontWeight.w400, C2.text2)))),
             ]),
           )),
           const SizedBox(height: 12),
@@ -1927,7 +2313,7 @@ class _PharmaReportState extends State<PharmaReport> {
         rows.add([
           r.date,
           l.name,
-          l.dosage.isEmpty ? '-' : '${l.dosage} mg',
+          l.dosage.isEmpty ? '-' : _fmtReqDose(l.dosage),
           '${l.requested}',
           '$disp',
           '${l.received}',
@@ -1973,6 +2359,10 @@ class PharmaAttendance extends StatefulWidget {
 
 class _PharmaAttendanceState extends State<PharmaAttendance> {
   bool showForm = false;
+  // Blocks a double-tap on Submit Check-In / Check-Out (user 2026-09-02
+  // parity fix — a fast second tap could addPharmaAttendance twice
+  // before the setState reset cleared the photo/time).
+  bool _submitting = false;
   // Mode selector (rule 2026-08-05) — Check-In / Check-Out are mutually
   // exclusive so the pharmacist marks one side at a time.
   String _mode = 'in';
@@ -2197,7 +2587,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Counsellor').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Recipient').toString());
           return;
         }
       }
@@ -2288,6 +2678,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
   }
 
   void _submit(CounsellorState s) {
+    if (_submitting) return;
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     final open = _openPharmaShift(s);
     // Guard rule 2026-08-05: Check-Out only if today's Check-In exists.
@@ -2301,6 +2692,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
     if (_mode == 'out' && _checkOut.isEmpty) return err('Waiting for current time…');
     if (location == null) return err('Waiting for GPS to pick the nearest camp…');
     if (_photoPath == null) return err('Take a selfie to mark attendance');
+    setState(() => _submitting = true);
     if (_mode == 'in') {
       s.addPharmaAttendance(AttendanceRecord(
         date: _date,
@@ -2377,6 +2769,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
       _date = fmtDate(DateTime.now()); location = null; _notes.clear();
       _photoPath = null; _lat = null; _lng = null;
       _mode = 'in';
+      _submitting = false;
     });
   }
 
@@ -2490,7 +2883,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Counsellor $_counsellorMarkedBy has marked you present today.',
+              'Recipient $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),
@@ -2569,18 +2962,19 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
           // photoPathOut depending on Check-In vs Check-Out.
           CField('Selfie + Location', AttendanceCapture(
             initialPhotoPath: _photoPath, initialLat: _lat, initialLng: _lng,
-            // MMU name on the watermark (user 2026-08-20). Snapped anchor
-            // wins, facility name falls back — same ladder as counsellor.
-            placeLabel: location
-                ?? ((context.read<MastersStore>().facility?['name']
+            // Facility name only — not the camp-anchor / location pill
+            // (user 2026-08-31). Empty string if bootstrap has no team.
+            placeLabel: ((context.read<MastersStore>().facility?['name']
                        ?? context.read<MastersStore>().facility?['facility_name'])
                      as String?)?.trim()
                 ?? '',
             onCaptured: (path, lat, lng) => setState(() { _photoPath = path; _lat = lat; _lng = lng; }),
           ), required: true),
           const SizedBox(height: 4),
-          CPrimaryButton(_mode == 'in' ? 'Submit Check-In' : 'Submit Check-Out',
-            icon: Icons.check_circle_outline, onTap: () => _submit(s)),
+          CPrimaryButton(
+            _submitting ? 'Submitting…' : (_mode == 'in' ? 'Submit Check-In' : 'Submit Check-Out'),
+            icon: _submitting ? Icons.hourglass_top : Icons.check_circle_outline,
+            onTap: _submitting ? null : () => _submit(s)),
         ])),
       if (!showForm) ...[
         if (s.pharmaAttendance.isEmpty)

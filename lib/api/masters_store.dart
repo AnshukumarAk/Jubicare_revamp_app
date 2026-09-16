@@ -55,10 +55,41 @@ class MastersStore extends ChangeNotifier {
 
   /// Convenience readers for the enum lists inside `masters` — used to
   /// seed dropdowns instead of hand-typed constants.
+  /// Names from a master list. Handles BOTH shapes bootstrap emits:
+  ///   * plain `List<String>` (older format for enums)
+  ///   * `List<{id, name}>` (id-first format, 2026-09-10 upgrade)
+  /// so a mixed bootstrap response never surfaces "{id: 3, name: O+}"
+  /// as a dropdown label.
   List<String> masterStrings(String key) {
     final v = masters?[key];
-    if (v is List) return [ for (final e in v) if (e != null) e.toString() ];
-    return const [];
+    if (v is! List) return const [];
+    return [
+      for (final e in v)
+        if (e is String) e
+        else if (e is Map)
+          if ((e['name'] ?? e['term'] ?? e['code'] ?? e['label']) != null)
+            (e['name'] ?? e['term'] ?? e['code'] ?? e['label']).toString(),
+    ];
+  }
+
+  /// Lookup the pk id for a value in one of the master enums bootstrap
+  /// now ships as `[{id, name}]` rows (blood_groups, camp_types,
+  /// frequencies, and any other rows-shape master). Returns null when
+  /// the value isn't in the master or the row doesn't carry an id
+  /// (fallback rows do carry `id: null`).
+  int? masterIdOf(String key, String? name) {
+    if (name == null || name.trim().isEmpty) return null;
+    final target = name.trim().toLowerCase();
+    for (final r in masterRows(key)) {
+      final n = (r['name'] ?? r['term'] ?? r['code'] ?? r['label'])?.toString();
+      if (n != null && n.trim().toLowerCase() == target) {
+        final id = r['id'];
+        if (id is int) return id;
+        if (id is num) return id.toInt();
+        return int.tryParse(id?.toString() ?? '');
+      }
+    }
+    return null;
   }
 
   /// Medicine names from the server master (bootstrap). The requisition

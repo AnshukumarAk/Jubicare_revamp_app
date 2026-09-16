@@ -6,7 +6,10 @@ enum Role { counselor, doctor, pharmacist }
 
 extension RoleX on Role {
   String get label => switch (this) {
-        Role.counselor => 'Counsellor',
+        // User-facing rename 2026-09-10: "Counsellor" → "Recipient".
+        // The enum name (Role.counselor) and backend role code ("counsellor")
+        // stay unchanged — this only affects UI labels.
+        Role.counselor => 'Recipient',
         Role.doctor => 'Doctor',
         Role.pharmacist => 'Pharmacist',
       };

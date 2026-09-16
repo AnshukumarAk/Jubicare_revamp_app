@@ -4,6 +4,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 
+import 'notification_router.dart';
 import 'notifications_store.dart';
 
 /// Local notifications for the Attend flow (ATTEND task D2, 2026-08-18):
@@ -34,12 +35,49 @@ class NotificationsService {
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     await _plugin.initialize(
       settings: const InitializationSettings(android: android),
+      // Every local notif carries a payload like "attend" or
+      // "doctor_case|42" — parse and publish so the shell tab-switch
+      // fires (user 2026-09-10: taps on foreground FCM + scheduled
+      // check-out reminders were silently dropped because no callback
+      // was wired here).
+      onDidReceiveNotificationResponse: _onTap,
+      onDidReceiveBackgroundNotificationResponse: _bgTap,
     );
     await _plugin
         .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin>()
         ?.requestNotificationsPermission();
+    // App was KILLED and the user opened it by tapping a scheduled
+    // reminder — the callback above doesn't fire in that case; the
+    // launch payload is here instead.
+    final launch = await _plugin.getNotificationAppLaunchDetails();
+    final p = launch?.notificationResponse?.payload;
+    if (p != null && p.isNotEmpty) _dispatch(p);
     _ready = true;
+  }
+
+  static void _onTap(NotificationResponse r) {
+    final p = r.payload;
+    if (p != null && p.isNotEmpty) _dispatch(p);
+  }
+
+  @pragma('vm:entry-point')
+  static void _bgTap(NotificationResponse r) {
+    // Background isolate: we can't reach NotificationRouter directly,
+    // but the OS wakes the app to foreground before this fires on the
+    // main isolate too (Android). Same handler is safe.
+    _onTap(r);
+  }
+
+  /// Split "route|arg" and push the pending action.
+  static void _dispatch(String payload) {
+    final ix = payload.indexOf('|');
+    if (ix < 0) {
+      NotificationRouter.instance.push(payload);
+    } else {
+      NotificationRouter.instance
+          .push(payload.substring(0, ix), payload.substring(ix + 1));
+    }
   }
 
   /// Schedule the 3/6/9-hour check-out reminders. Replaces any previous
@@ -63,7 +101,15 @@ class NotificationsService {
               priority: Priority.high,
             ),
           ),
-          androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+          // Payload → NotificationRouter route on tap; opens Attend tab
+          // directly (user 2026-09-10 "tap should open the action page").
+          payload: 'attend',
+          // Exact-while-idle so the alarm fires during Doze. Inexact alarms
+          // are batched into Doze maintenance windows, so the mid-shift 3h
+          // reminder was deferred until the shift had already closed (which
+          // cancels it) while 6h/9h landed once the phone was active again
+          // (user 2026-09-02). Needs USE_EXACT_ALARM in the manifest.
+          androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
         );
       }
     } catch (_) {
@@ -88,7 +134,8 @@ class NotificationsService {
   /// banner there, so we render it ourselves; background/killed states
   /// are handled by the OS automatically). ATTEND task D1. Every shown
   /// notification also lands in the per-user history (user 2026-08-19).
-  Future<void> showNow({required String title, required String body}) async {
+  Future<void> showNow({required String title, required String body,
+                        String? payload}) async {
     try {
       await init();
       await _plugin.show(
@@ -103,6 +150,8 @@ class NotificationsService {
             priority: Priority.high,
           ),
         ),
+        // Route so tap on a foreground FCM opens the right tab.
+        payload: payload,
       );
       unawaited(NotificationsStore.add(title: title, body: body));
     } catch (_) {/* courtesy only */}

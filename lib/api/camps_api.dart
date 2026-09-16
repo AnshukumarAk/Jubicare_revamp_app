@@ -51,6 +51,7 @@ class CampsApi {
     required String campName,
     required String campType, // Community / School / Workplace / Health Awareness
     required String campDate, // yyyy-mm-dd
+    int? campTypeId,           // preferred — skips server name lookup
     int? villageId,
     String? villageName,
     String? blockName,
@@ -64,6 +65,9 @@ class CampsApi {
     final res = await client.post('/camps', body: {
       'camp_name': campName,
       'camp_type': campType,
+      // camp_type_id preferred — server picks the master row by pk
+      // instead of a case-insensitive name scan (user 2026-09-10).
+      if (campTypeId != null) 'camp_type_id': campTypeId,
       'camp_date':  campDate,
       if (villageId != null)   'village_id':   villageId,
       if (villageName != null) 'village_name': villageName,

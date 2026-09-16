@@ -50,10 +50,13 @@ class CCard extends StatelessWidget {
 }
 
 /// Section header: cyan dot + navy bold title + cyan-light underline.
+/// [required] appends an inline red asterisk to the title, kept on the same
+/// baseline as the text so it does not drift below (user 2026-09-02).
 class SecBar extends StatelessWidget {
   final String title;
   final Widget? trailing;
-  const SecBar(this.title, {super.key, this.trailing});
+  final bool required;
+  const SecBar(this.title, {super.key, this.trailing, this.required = false});
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -63,7 +66,13 @@ class SecBar extends StatelessWidget {
       child: Row(children: [
         Container(width: 8, height: 8, decoration: const BoxDecoration(color: C2.cyan, shape: BoxShape.circle)),
         const SizedBox(width: 6),
-        Expanded(child: Text(title, style: _t(13, FontWeight.w700, C2.navy))),
+        Expanded(child: RichText(text: TextSpan(
+          text: title,
+          style: _t(13, FontWeight.w700, C2.navy),
+          children: required
+              ? [TextSpan(text: ' *', style: _t(13, FontWeight.w700, C2.danger))]
+              : null,
+        ))),
         if (trailing != null) trailing!,
       ]),
     );

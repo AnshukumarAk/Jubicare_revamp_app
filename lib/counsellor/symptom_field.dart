@@ -68,9 +68,14 @@ class SymptomField extends StatefulWidget {
   final bool error;
   final VoidCallback? onRetry;
 
+  /// Hide the Likely Conditions card on this instance (user 2026-09-10:
+  /// counsellor Register screen no longer surfaces it — the doctor's
+  /// Case Details still does). Default false keeps doctor unchanged.
+  final bool hideLikelyPanel;
   const SymptomField({super.key, required this.selected, required this.block,
       required this.onChanged, this.placeName, this.trending, this.freeText,
       this.serverRelated, this.hideVillagePanel = false,
+      this.hideLikelyPanel = false,
       this.serverLikely, this.loading = false,
       this.error = false, this.onRetry});
   @override
@@ -201,7 +206,7 @@ class _SymptomFieldState extends State<SymptomField> {
         _geoPanel(),
         const SizedBox(height: 6),
         _relatedPanel(),
-        if (_showLikelyPanel) ...[
+        if (_showLikelyPanel && !widget.hideLikelyPanel) ...[
           const SizedBox(height: 6),
           _likelyPanel(),
         ],

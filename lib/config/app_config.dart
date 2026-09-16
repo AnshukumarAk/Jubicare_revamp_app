@@ -21,14 +21,25 @@ class AppConfig {
   static const String apiPrefix = '/api/m';
 
   /// How much history the handset downloads for its lists (attendance,
-  /// camps, device history, requisitions) — every role, every user
+  /// camps, requisitions) — every role, every user
   /// (user rule 2026-08-21). On-demand drill-downs (patient search /
   /// clinical history) stay full: they are pulled per patient, not bulk.
   static const int dataWindowDays = 8;
 
+  /// Device reports land monthly, so the audit trail needs a much longer
+  /// look-back than the attendance/camp lists (user 2026-08-29:
+  /// "devices 8 month"). Matched on the server default (240 days).
+  static const int deviceWindowDays = 240;
+
   /// ISO date `dataWindowDays` ago — ready for date_from params.
   static String get dataWindowFrom => DateTime.now()
       .subtract(const Duration(days: dataWindowDays))
+      .toIso8601String()
+      .substring(0, 10);
+
+  /// ISO date `deviceWindowDays` ago — used only by the Devices tab.
+  static String get deviceWindowFrom => DateTime.now()
+      .subtract(const Duration(days: deviceWindowDays))
       .toIso8601String()
       .substring(0, 10);
 

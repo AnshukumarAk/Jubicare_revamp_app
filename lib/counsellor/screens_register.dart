@@ -241,12 +241,62 @@ class _CounRegisterState extends State<CounRegister> {
         final v = prefs.getString(_kLastVillage);
         if (!mounted || (b == null && v == null)) return;
         setState(() { block = b; village = v; });
+        // Sticky village → warm the trending fetch so the symptom
+        // dropdown opens with "Common in <village>" ready on first tap
+        // (user 2026-09-08).
+        if (v != null) {
+          _previewDebounce?.cancel();
+          _previewDebounce = Timer(const Duration(milliseconds: 300), _fetchPreview);
+        }
       } catch (_) {}
     }();
     // Warm up the hi→en translation models in the background so the
     // first submit with remarks is instant (skipped entirely if the
     // remarks field is left blank).
     TranslationService.warmUp();
+    // Load the counsellor's most-used fees so the quick-pick chips
+    // reflect real prescribing habits (user 2026-09-11).
+    _loadFrequentFees();
+  }
+
+  // ─── Frequently-used consultation fees ─────────────────────────────
+  // Last 20 accepted amounts persisted in SharedPreferences; top-4 by
+  // count feed the chips under Paid Amount. Static defaults show only
+  // while the history is empty.
+  static const _kFeeHistory = 'reg_fee_history_v1';
+  List<int> _frequentFees = const [200, 300, 500, 1000];
+
+  Future<void> _loadFrequentFees() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getStringList(_kFeeHistory) ?? const [];
+      if (raw.isEmpty) return;
+      final count = <int, int>{};
+      for (final s in raw) {
+        final n = int.tryParse(s);
+        if (n == null || n <= 0) continue;
+        count[n] = (count[n] ?? 0) + 1;
+      }
+      final top = count.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      final picks = top.take(4).map((e) => e.key).toList();
+      if (mounted && picks.isNotEmpty) {
+        setState(() => _frequentFees = picks);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _rememberFee(int amount) async {
+    if (amount <= 0) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final list = (prefs.getStringList(_kFeeHistory) ?? const []).toList();
+      list.add(amount.toString());
+      // Keep the last 20 so the ranking follows recent habit, not
+      // ancient one-offs.
+      if (list.length > 20) list.removeRange(0, list.length - 20);
+      await prefs.setStringList(_kFeeHistory, list);
+    } catch (_) {}
   }
 
   /// Debounced call to /advisory/preview so the Register screen's
@@ -265,7 +315,12 @@ class _CounRegisterState extends State<CounRegister> {
 
   Future<void> _fetchPreview() async {
     if (!mounted) return;
-    if (symptoms.isEmpty) {
+    final vid = context.read<MastersStore>().geoVillageId(block, village);
+    // Symptoms may be empty on first tap — still fetch village trending
+    // so the dropdown opens with "Common in <village>" ready to pick
+    // (user 2026-09-08). Server returns trending-only when inputs are
+    // empty; related/likely/advisory stay null and the panels hide.
+    if (symptoms.isEmpty && vid == null) {
       if (_previewTrending != null || _previewRelated != null
           || _previewLikely != null || _previewLoading) {
         setState(() {
@@ -277,7 +332,6 @@ class _CounRegisterState extends State<CounRegister> {
       }
       return;
     }
-    final vid = context.read<MastersStore>().geoVillageId(block, village);
     final key = '${symptoms.join("|")}|v=$vid';
     if (key == _lastPreviewKey) return;
     _lastPreviewKey = key;
@@ -422,7 +476,14 @@ class _CounRegisterState extends State<CounRegister> {
     // complaint gives the doctor and the advisory nothing to work from.
     if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
-    if (payment == 'Paid' && _amount.text.trim().isEmpty) return err('Enter paid amount');
+    // Paid orgs must always collect a consultation fee (payment is
+    // pinned to Paid by the render Builder). Free orgs skip this
+    // entirely — no amount asked (user 2026-09-02).
+    final _paidOrgReg = !context.read<AppState>().orgIsFree;
+    if (_paidOrgReg && _amount.text.trim().isEmpty) return err('Enter paid amount');
+    // Pin the payment variable to match the org gate so a race between
+    // build's post-frame flip and submit can't send the wrong pair.
+    payment = _paidOrgReg ? 'Paid' : 'Free';
     if (onMed && _attachments.isEmpty) return err('Attach at least one prescription or report');
     if (pregnant && _lmp == null) return err('Pick the $_pregMode date');
     // Vitals + height/weight are optional, but anything typed must
@@ -439,6 +500,13 @@ class _CounRegisterState extends State<CounRegister> {
     // yet goes up now; on success the row gains its server name
     // ("patient_docs/<uuid>.jpg"). Offline / timeout → the local path
     // stays as fallback and the registration still goes through.
+    //
+    // _submitting stays TRUE through EVERY awaited step below — uploads,
+    // translation, addPatient, sync enqueue, redirect — so a second
+    // Submit tap during the 8-second translation window can never
+    // create a duplicate patient (user 2026-09-02: registered Shyam,
+    // waited for the "Submitting…" state, tapped again and got two
+    // rows in the queue, one blank).
     setState(() => _submitting = true);
     try {
       final uploads = context.read<UploadsApi>();
@@ -456,10 +524,15 @@ class _CounRegisterState extends State<CounRegister> {
           // Offline or server hiccup — keep the phone-local path.
         }
       }
+      if (!mounted) return;
+      await _submitAfterUploads(s);
     } finally {
       if (mounted) setState(() => _submitting = false);
     }
-    if (!mounted) return;
+  }
+
+  Future<void> _submitAfterUploads(CounsellorState s) async {
+    void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
 
     final vitals = <String, String>{};
     void v(String k, TextEditingController c) { if (c.text.trim().isNotEmpty) vitals[k] = c.text.trim(); }
@@ -666,7 +739,8 @@ class _CounRegisterState extends State<CounRegister> {
     // appointment to the same patient row instead of inserting a
     // duplicate (user rule 2026-08-16).
     final reappointmentPatientId = _reAppointmentSource?.backendPatientId;
-    context.read<SyncService>().enqueue(kind: 'patient.register', payload: {
+    final sync = context.read<SyncService>();
+    final _clientActionId = await sync.enqueue(kind: 'patient.register', payload: {
       if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
       // Basic identity
       'patient_name':      p.name,
@@ -684,8 +758,18 @@ class _CounRegisterState extends State<CounRegister> {
       if (_address.text.trim().isNotEmpty) 'address': _address.text.trim(),
       // Identity extras
       if (aadharValue != null)     'aadhar_number': aadharValue,
+      // blood_group_id preferred — server skips the name-lookup when
+      // the id is present (user 2026-09-10 id-first). Name still sent
+      // as fallback so an older server build reads it unchanged.
       if (bloodGroup != null)      'blood_group': bloodGroup,
+      if (bloodGroup != null &&
+          masters.masterIdOf('blood_groups', bloodGroup) != null)
+                                   'blood_group_id': masters.masterIdOf('blood_groups', bloodGroup),
       if (categoryId != null)      'category_id': categoryId,
+      // Village id — resolved from the geo cascade already. Extra
+      // `_id` keys let the server skip the get_or_create name path.
+      if (masters.geoVillageId(block, village) != null)
+                                   'village_id': masters.geoVillageId(block, village),
       'disability':                pwd == 'Yes',
       if (p.pastHistory.trim().isNotEmpty) 'past_history': p.pastHistory,
       // Appointment leg
@@ -731,6 +815,16 @@ class _CounRegisterState extends State<CounRegister> {
       if (diagnoses.isNotEmpty)   'diagnoses':   diagnoses,
       if (attachments.isNotEmpty) 'attachments': attachments,
     });
+    // Wait until THIS action leaves the queue — plain `sync.drain()`
+    // returns immediately when a drain is already in flight (user
+    // 2026-09-10 "still going first on sync, then after some time
+    // shows sent"). waitUntilDrained polls the queue for this
+    // clientActionId so the snackbar + redirect only fire once the
+    // server has acknowledged the row. 8 s cap keeps offline / slow
+    // networks non-blocking — a timeout leaves the row queued for the
+    // next drain, same as before.
+    await sync.waitUntilDrained(_clientActionId,
+        timeout: const Duration(seconds: 8));
     // Redirect FIRST, then show the snackbar. Any unexpected throw between
     // enqueue and this line was leaving the counsellor stranded on the
     // register form with the patient already saved (user 2026-08-20:
@@ -752,6 +846,15 @@ class _CounRegisterState extends State<CounRegister> {
       }();
       widget.onSubmitted?.call();
     } catch (_) {/* redirect must never block the toast/reset below */}
+    // Remember this fee so the Paid Amount chips rank by real usage
+    // (user 2026-09-11). Only paid orgs write; free orgs stay at ₹0.
+    if (payment == 'Paid') {
+      final feeVal = int.tryParse(_amount.text.trim());
+      if (feeVal != null && feeVal > 0) {
+        await _rememberFee(feeVal);
+        await _loadFrequentFees();
+      }
+    }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('${p.name} added to Doctor Queue'),
       backgroundColor: C2.green,
@@ -1027,14 +1130,24 @@ class _CounRegisterState extends State<CounRegister> {
                       ? geo.geoVillagesOf(block!)
                       : (kBlockVillages[block!] ?? const ['Other'])),
               value: village, hint: 'Select Village',
-              onChanged: (v) => setState(() => village = v)), required: true),
+              onChanged: (v) {
+                setState(() => village = v);
+                // Trending is village-scoped, so a fresh village
+                // triggers a preview fetch even before the first
+                // symptom is chipped (user 2026-09-08).
+                _lastPreviewKey = '';
+                _previewDebounce?.cancel();
+                _previewDebounce = Timer(const Duration(milliseconds: 300), _fetchPreview);
+              }), required: true),
           ]);
         }),
       ])),
 
       // SYMPTOMS (its own section, not part of Advance Details)
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SecBar('Symptoms of the Patient'),
+        // Section header carries the required marker — submit blocks when
+        // symptoms is empty (user 2026-09-02 asterisk audit).
+        const SecBar('Symptoms of the Patient', required: true),
         SymptomField(
           selected: symptoms,
           block: block,
@@ -1043,6 +1156,10 @@ class _CounRegisterState extends State<CounRegister> {
           // Conditions card keeps its village-share bonus; only the
           // visible "Common in <village>" chip strip is suppressed.
           hideVillagePanel: true,
+          // Counsellor Register no longer surfaces Likely Conditions
+          // (user 2026-09-10). Doctor Case Details keeps it — that
+          // instance leaves the flag unset (default false).
+          hideLikelyPanel: true,
           placeName: village ?? block,
           trending: _previewTrending,
           serverRelated: _previewRelated,
@@ -1073,9 +1190,20 @@ class _CounRegisterState extends State<CounRegister> {
             Expanded(child: CField('Weight (kg)', TextField(controller: _weight, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3, decimals: 1)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 55.2').copyWith(errorText: _vitalMinErr(_weight))))),
           ]),
           Row(children: [
-            Expanded(child: CField('Blood Group', _dd(kBloodGroups, bloodGroup, (v) => setState(() => bloodGroup = v), hint: 'Select'))),
+            // Blood Group + Category — dynamic from server masters
+            // (bootstrap `blood_groups` / `categories`). Hardcoded consts
+            // stay as offline fallback; when the server list already
+            // covers a fallback value, dedupe keeps a single row (user
+            // 2026-09-10 dynamic masters, same pattern as Camp Type).
+            Expanded(child: CField('Blood Group',
+                _dd(_masterOr(context, 'blood_groups', kBloodGroups),
+                    bloodGroup, (v) => setState(() => bloodGroup = v),
+                    hint: 'Select'))),
             const SizedBox(width: 8),
-            Expanded(child: CField('Category', _dd(kCategories, category, (v) => setState(() => category = v), hint: 'Select'))),
+            Expanded(child: CField('Category',
+                _dd(_masterOr(context, 'categories', kCategories),
+                    category, (v) => setState(() => category = v),
+                    hint: 'Select'))),
           ]),
           CField('Person with Disability (PWD)', _radios(['Yes','No'], pwd, (v) => setState(() => pwd = v))),
           CField('Pin Code', TextField(controller: _pin, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(6)], decoration: cInput())),
@@ -1135,9 +1263,62 @@ class _CounRegisterState extends State<CounRegister> {
               onChanged: (list) => setState(() { _attachments..clear()..addAll(list); }),
             ),
             required: true),
-        CField('Payment', _radios(['Paid','Free'], payment, (v) => setState(() => payment = v)), required: true),
-        if (payment == 'Paid')
-          CField('Paid Amount (₹)', TextField(controller: _amount, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)], decoration: cInput()), required: true),
+        // Payment section — final rule (user 2026-09-02):
+        //   Free org  → NOTHING shown (payment auto-Free, amount zero)
+        //   Paid org  → ONLY the Paid Amount field (radio hidden,
+        //               payment is always "Paid" by definition of a
+        //               paid organisation).
+        // The `payment` variable is pinned to "Paid" for paid orgs so
+        // the submit path's `payment == 'Paid'` amount check fires,
+        // and to "Free" for free orgs so the same check is skipped.
+        Builder(builder: (context) {
+          final free = context.watch<AppState>().orgIsFree;
+          if (free) {
+            if (payment != 'Free') {
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted && payment != 'Free') setState(() => payment = 'Free');
+              });
+            }
+            return const SizedBox.shrink();
+          }
+          if (payment != 'Paid') {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && payment != 'Paid') setState(() => payment = 'Paid');
+            });
+          }
+          return CField('Paid Amount (₹)',
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                TextField(controller: _amount, keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly,
+                                    LengthLimitingTextInputFormatter(5)],
+                  decoration: cInput('Enter consultation fee')),
+                const SizedBox(height: 8),
+                // Quick-pick amount chips — cream card, medium radius,
+                // frequently used fees (user 2026-09-11). Tap fills the
+                // field above; still fully editable.
+                Wrap(spacing: 8, runSpacing: 6, children: [
+                  for (final v in _frequentFees)
+                    InkWell(
+                      borderRadius: BorderRadius.circular(12),
+                      onTap: () => setState(() {
+                        _amount.text = v.toString();
+                        _amount.selection = TextSelection.fromPosition(
+                            TextPosition(offset: _amount.text.length));
+                      }),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          border: Border.all(color: C2.border),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text('₹ $v', style: ct(12.5, FontWeight.w700, C2.text)),
+                      ),
+                    ),
+                ]),
+              ]),
+              required: true);
+        }),
         // Single-doctor MMU (the normal case): show them locked — no
         // dropdown to mis-tap. Multiple rows (e.g. until the backend
         // with_login deploy lands) keep the picker so nothing breaks.
@@ -1177,6 +1358,39 @@ class _CounRegisterState extends State<CounRegister> {
         child: Switch(value: value, activeColor: Colors.white, activeTrackColor: C2.cyan,
           materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, onChanged: onCh),
       );
+
+  /// Merge server master values with a hardcoded fallback list.
+  ///
+  /// * `key` is the bootstrap `masters` key — bootstrap accepts two shapes:
+  ///   plain `List<String>` (blood_groups, camp_types, frequencies,
+  ///   device_states, genders, payment_types) OR
+  ///   `List<{id, name}>` rows (categories, symptoms, diseases, medicines,
+  ///   devices, referral_destinations, lab_tests). Both are supported —
+  ///   the row shape has its `name` field pulled out.
+  /// * Fallback const is appended (deduped) so an old saved value
+  ///   still validates and offline sessions render a working picker
+  ///   (user 2026-09-10 dynamic masters).
+  List<String> _masterOr(BuildContext ctx, String key, List<String> fallback) {
+    final store = ctx.read<MastersStore>();
+    var server = store.masterStrings(key);
+    if (server.isEmpty) {
+      // Rows-shape? Extract the `name` field.
+      final rows = store.masterRows(key);
+      server = [
+        for (final r in rows)
+          if ((r['name'] ?? r['term'] ?? r['label']) != null)
+            (r['name'] ?? r['term'] ?? r['label']).toString(),
+      ];
+    }
+    if (server.isEmpty) return fallback;
+    final seen = <String>{};
+    final out = <String>[];
+    for (final s in [...server, ...fallback]) {
+      if (s.trim().isEmpty) continue;
+      if (seen.add(s)) out.add(s);
+    }
+    return out;
+  }
 
   Widget _radios(List<String> opts, String val, ValueChanged<String> onCh) => Wrap(spacing: 14, children: opts.map((o) => InkWell(
         onTap: () => onCh(o),

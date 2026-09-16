@@ -25,6 +25,7 @@ import '../services/patients_cache_store.dart';
 import '../services/connectivity_service.dart';
 import '../services/deepgram_stt.dart';
 import '../services/fcm_service.dart';
+import '../services/notification_router.dart';
 import '../services/terminology_store.dart';
 import '../services/notifications_service.dart';
 import '../screens/unified_login.dart';
@@ -85,6 +86,35 @@ class _DoctorShellState extends State<DoctorShell> {
   }
 
   final _attendRefresh = ValueNotifier(0);
+
+  @override
+  void initState() {
+    super.initState();
+    NotificationRouter.instance.pending.addListener(_applyNotificationRoute);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _applyNotificationRoute());
+  }
+
+  @override
+  void dispose() {
+    NotificationRouter.instance.pending.removeListener(_applyNotificationRoute);
+    super.dispose();
+  }
+
+  void _applyNotificationRoute() {
+    if (!mounted) return;
+    final r = NotificationRouter.instance.consume();
+    if (r == null) return;
+    switch (r.route) {
+      // Doctor tabs: 0=Home (queue), 1=Case (needs a selected patient),
+      // 2=Attend. `doctor_case` lands on Home so the doctor sees the
+      // new patient in the queue and can tap in — Case tab without a
+      // selected patient renders empty (user 2026-09-10).
+      case 'attend':      _go(2); break;
+      case 'doctor_case': _go(0); break;
+      case 'home':        _go(0); break;
+      default: break;
+    }
+  }
 
   /// One refresh path for the app-bar button AND pull-to-refresh: online
   /// check first, then the CURRENT tab's server data. The offline sync
@@ -219,13 +249,26 @@ class DocHeader extends StatelessWidget {
                 Navigator.pop(context);
                 if (!await confirmLogout(context)) return;
                 if (!context.mounted) return;
+                // Center loader while FCM DELETE + auth logout finish.
+                showDialog<void>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => const Center(child: CircularProgressIndicator()),
+                );
+                // FCM unregister FIRST so the DELETE call still has a
+                // valid access token — parity with the counsellor
+                // shell fix (user 2026-09-10: logout was racing token
+                // clear vs DELETE, leaving the server-side FCM row
+                // alive and pushes kept arriving).
+                try {
+                  await FcmService.instance
+                      .unregister(context.read<ApiClient>())
+                      .timeout(const Duration(seconds: 5));
+                } catch (_) {/* offline — server auto-cleans on next
+                                UnregisteredError push */}
+                if (!context.mounted) return;
                 // Best-effort backend logout (v2 §1.3).
                 unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                // Kill FCM so pushes stop coming for the old user
-                // (bug 2026-08-20).
-                unawaited(FcmService.instance
-                    .unregister(context.read<ApiClient>())
-                    .catchError((_) {}));
                 // Wipe user-scoped lists (user rule 2026-08-16).
                 context.read<CounsellorState>().resetForNewUser();
                 context.read<AppState>().logout();
@@ -687,6 +730,8 @@ class DoctorAttendance extends StatefulWidget {
 
 class _DoctorAttendanceState extends State<DoctorAttendance> {
   bool showForm = false;
+  // Double-tap guard on Submit Check-In / Check-Out (user 2026-09-02).
+  bool _submitting = false;
   // Attendance mode (rule 2026-08-05): Check-In and Check-Out are mutually
   // exclusive so the doctor can only mark one side at a time.
   String _mode = 'in';   // 'in' | 'out'
@@ -808,7 +853,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Counsellor').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Recipient').toString());
           return;
         }
       }
@@ -1065,6 +1110,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
   }
 
   void _submit(CounsellorState s) {
+    if (_submitting) return;
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     final open = _openDoctorShift(s);
     // Guard rule 2026-08-05: Check-Out is only allowed if a matching
@@ -1080,6 +1126,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
     if (_mode == 'out' && _checkOut.isEmpty) return err('Waiting for current time…');
     if (location == null) return err('Waiting for GPS to pick the nearest camp…');
     if (_photoPath == null) return err('Take a selfie to mark attendance');
+    setState(() => _submitting = true);
     if (_mode == 'in') {
       s.addDoctorAttendance(AttendanceRecord(
         date: _date,
@@ -1166,6 +1213,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
       // Snap back to the mode that makes sense the next time the form
       // opens — a fresh day starts with Check-In.
       _mode = 'in';
+      _submitting = false;
     });
   }
 
@@ -1279,7 +1327,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Counsellor $_counsellorMarkedBy has marked you present today.',
+              'Recipient $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),
@@ -1357,18 +1405,19 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             suffixIcon: RemarksMicButton(controller: _notes)))),
           CField('Selfie + Location', AttendanceCapture(
             initialPhotoPath: _photoPath, initialLat: _lat, initialLng: _lng,
-            // MMU name on the watermark (user 2026-08-20). Snapped anchor
-            // wins, facility name falls back — same ladder as counsellor.
-            placeLabel: location
-                ?? ((context.read<MastersStore>().facility?['name']
+            // Facility name only — not the camp-anchor / location pill
+            // (user 2026-08-31). Empty string if bootstrap has no team.
+            placeLabel: ((context.read<MastersStore>().facility?['name']
                        ?? context.read<MastersStore>().facility?['facility_name'])
                      as String?)?.trim()
                 ?? '',
             onCaptured: (path, lat, lng) => setState(() { _photoPath = path; _lat = lat; _lng = lng; }),
           ), required: true),
           const SizedBox(height: 4),
-          CPrimaryButton(_mode == 'in' ? 'Submit Check-In' : 'Submit Check-Out',
-            icon: Icons.check_circle_outline, onTap: () => _submit(s)),
+          CPrimaryButton(
+            _submitting ? 'Submitting…' : (_mode == 'in' ? 'Submit Check-In' : 'Submit Check-Out'),
+            icon: _submitting ? Icons.hourglass_top : Icons.check_circle_outline,
+            onTap: _submitting ? null : () => _submit(s)),
         ])),
       if (!showForm) ...[
         if (s.doctorAttendance.isEmpty)
@@ -1681,10 +1730,22 @@ class SimpleProfile extends StatelessWidget {
                 // pushes, wipe user-scoped state, land on Login with no
                 // back stack. Serves BOTH doctor and pharmacist (the
                 // pharmacist shell reuses this SimpleProfile).
+                // Center loader while FCM DELETE + auth logout finish
+                // (user 2026-09-10).
+                showDialog<void>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => const Center(child: CircularProgressIndicator()),
+                );
+                // FCM unregister FIRST — DELETE needs the still-valid
+                // access token (user 2026-09-10 fix).
+                try {
+                  await FcmService.instance
+                      .unregister(context.read<ApiClient>())
+                      .timeout(const Duration(seconds: 5));
+                } catch (_) {}
+                if (!context.mounted) return;
                 unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                unawaited(FcmService.instance
-                    .unregister(context.read<ApiClient>())
-                    .catchError((_) {}));
                 context.read<CounsellorState>().resetForNewUser();
                 context.read<AppState>().logout();
                 Navigator.of(context).pushAndRemoveUntil(

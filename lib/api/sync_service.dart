@@ -73,6 +73,30 @@ class SyncService extends ChangeNotifier {
     } catch (_) { /* corrupted cache; start clean */ }
   }
 
+  /// True while the given action still sits in the offline queue.
+  /// Register/Case submit handlers poll this to know when the row has
+  /// been shipped to the server, so the "Pending" chip on Home is
+  /// gone before the snackbar / redirect fires (user 2026-09-10 "still
+  /// showing sync then after some time sent").
+  bool hasPending(String clientActionId) =>
+      _queue.any((a) => a.clientActionId == clientActionId);
+
+  /// Await until [clientActionId] leaves the queue (drain succeeded)
+  /// or [timeout] elapses. Returns true when drained cleanly, false
+  /// on timeout / offline — the caller then treats it as "queued for
+  /// later" instead of blocking the submit forever.
+  Future<bool> waitUntilDrained(String clientActionId,
+      {Duration timeout = const Duration(seconds: 8)}) async {
+    final deadline = DateTime.now().add(timeout);
+    // Kick a drain in case none is running.
+    unawaited(drain());
+    while (DateTime.now().isBefore(deadline)) {
+      if (!hasPending(clientActionId)) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+    }
+    return !hasPending(clientActionId);
+  }
+
   /// Enqueue a mutation. Call from screen submit handlers. Returns the
   /// client_action_id so callers can correlate future drain results
   /// back to the UI row that triggered them.

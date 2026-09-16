@@ -27,11 +27,43 @@ class RxItem {
   int qty;
   int dispensedQty;
   bool dispensed;
+  /// Reason the pharmacist wrote when dispensed qty ≠ prescribed qty.
+  /// Server column: prescription_items.dispense_reason, payload key:
+  /// qty_change_reason (user 2026-09-08: surface it on the Dispensed
+  /// Patients detail sheet).
+  String dispenseReason;
+  /// Dosage form the doctor picked (Tab / Cap / Syp) — kept alongside
+  /// the strength text (user 2026-09-08). Combined into the server's
+  /// `dosage` field as "<form> · <strength>" so no PrescriptionItem
+  /// schema change is needed; parsed back apart when loading (see
+  /// RxItem.parseDosage in dcase.dart / pharmacist pshell.dart).
+  String dosageForm;
+  /// Zero, one, or many combination medicines paired with this row —
+  /// Paracetamol + Vitamin A + Vitamin B style (user 2026-09-15
+  /// "keep multiple combined medicine option"). Every partner shares
+  /// the primary's frequency / duration / qty / dosage form; each
+  /// carries its own strength text. Empty list = standalone row.
+  List<ComboMed> combos;
+  /// Shared id across two RxItems the doctor wrote as one combination
+  /// strip (Paracetamol + Vitamin C). The pharmacist Deliver Medicine
+  /// screen groups lines with the same key into a single card (user
+  /// 2026-09-12). Empty for standalone lines.
+  String comboKey;
   // No default duration (user rule 2026-08-16): the doctor must enter
   // the day count explicitly — pre-filling "5 Days" left rows silently
   // wrong and read as a required-field error.
-  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '', this.interval = 'TDS', this.qty = 0, int? dispensedQty, this.dispensed = false})
-      : dispensedQty = dispensedQty ?? qty;
+  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '', this.interval = 'TDS', this.qty = 0, int? dispensedQty, this.dispensed = false, this.dispenseReason = '', this.dosageForm = '', List<ComboMed>? combos, this.comboKey = ''})
+      : dispensedQty = dispensedQty ?? qty,
+        combos = combos ?? <ComboMed>[];
+}
+
+/// One combination partner attached to a primary [RxItem]. Its
+/// frequency / duration / qty / dosage form all come from the primary
+/// (single strip). Only the strength text is per-partner.
+class ComboMed {
+  String name;
+  String dosage;
+  ComboMed({required this.name, this.dosage = ''});
 }
 
 /// A historical prescription line (for the Previous Prescriptions section).
@@ -1128,9 +1160,18 @@ class CounsellorState extends ChangeNotifier {
   /// `B` (e.g. B53) so we can find and replace them on the next refresh
   /// without touching the demo seed rows. Existing seed rows keep their
   /// numeric ids (`1`, `2`, `1000`...) and are untouched.
-  void mergeBackendPatients(List<Map<String, dynamic>> queueRows, {String? statusOverride}) {
-    // Drop the previous backend snapshot — replace, don't accumulate.
-    patients.removeWhere((p) => p.id.startsWith('B'));
+  ///
+  /// [additive] preserves already-merged 'B' rows and only inserts new ones,
+  /// so a companion fetch (e.g. doctor-attended alongside counsellor-past-7)
+  /// won't wipe the primary list's rows (user 2026-09-02: the second
+  /// mergeBackendPatients was wiping just-registered patients because
+  /// they weren't in the second endpoint's response).
+  void mergeBackendPatients(List<Map<String, dynamic>> queueRows,
+      {String? statusOverride, bool additive = false}) {
+    if (!additive) {
+      // Drop the previous backend snapshot — replace, don't accumulate.
+      patients.removeWhere((p) => p.id.startsWith('B'));
+    }
     // Also drop locally-added rows ('P…') whose registration has landed on
     // the server — the incoming backend row is the authoritative copy.
     // Without this the counsellor sees the same patient twice after a
@@ -1205,6 +1246,16 @@ class CounsellorState extends ChangeNotifier {
           _optimisticStatus.remove(apptId); // server caught up
         } else {
           adapted.status = optimistic;
+        }
+      }
+      // In additive mode the primary list already inserted this patient,
+      // so replace the earlier copy in place instead of double-inserting
+      // (user 2026-09-02).
+      if (additive) {
+        final existing = patients.indexWhere((p) => p.id == adapted.id);
+        if (existing >= 0) {
+          patients[existing] = adapted;
+          continue;
         }
       }
       patients.insert(0, adapted);

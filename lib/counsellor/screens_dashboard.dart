@@ -38,7 +38,7 @@ class CounDashboard extends StatelessWidget {
     // (older visits are one tap away via the stat tiles).
     final todaysList = s.patients.where((p) => p.registeredOn == 'Today').toList();
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      GradGreeting(name: name, sub: 'Counsellor Dashboard', initials: initials),
+      GradGreeting(name: name, sub: 'Recipient Dashboard', initials: initials),
       // Sync status moved to the app-bar cloud icon (user 2026-08-14) —
       // tap it for the counts + a "Sync now" action.
       // Backend refresh status: thin loading bar while the shell's
@@ -63,9 +63,18 @@ class CounDashboard extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(child: StatTile(
             '$done', 'Visits Completed', C2.cyan,
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
-              title: 'Visits Completed',
-              patients: s.patients.where((p) => p.status == 'completed').toList()))))),
+            // The shell's _refreshFromBackend pulls /queues/doctor/attended
+            // alongside tiles + past-7-days on mount, pull-to-refresh, and
+            // app-bar refresh, so `s.patients` already carries the COMPLETED
+            // rows and the tap opens instantly with no per-tap fetch
+            // (user 2026-08-29 "only one time download and when refresh").
+            onTap: () {
+              final list = s.patients
+                  .where((p) => p.status == 'completed').toList()
+                ..sort((a, b) => b.regDate.compareTo(a.regDate));
+              Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
+                  title: 'Visits Completed', patients: list)));
+            })),
           const SizedBox(width: 8),
           // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
           // Tap opens the shared CounPatientsList filtered to newest-first
@@ -258,6 +267,7 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                   ? (r['dispensed_qty'] as num).toInt()
                   : null,
               dispensed: (r['dispensed'] as bool?) ?? false,
+              comboKey: (r['combo_key'] ?? '').toString(),
             ),
       ];
       // Also tell CounsellorState so the Home list rebuilds against

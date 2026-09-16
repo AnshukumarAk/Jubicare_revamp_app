@@ -6,6 +6,12 @@
          the scheduled 3h/6h/9h reminders survive a phone restart. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- Exact alarms so the 3h/6h/9h check-out reminders fire during Doze
+         instead of being deferred to a maintenance window (user 2026-09-02).
+         USE_EXACT_ALARM needs no runtime prompt and suits a sideloaded
+         enterprise app; if this ever ships on Google Play, switch to
+         SCHEDULE_EXACT_ALARM + a runtime requestExactAlarmsPermission() call. -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM"/>
     <!-- MMU location tracking (foreground only — no BACKGROUND_LOCATION). -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>

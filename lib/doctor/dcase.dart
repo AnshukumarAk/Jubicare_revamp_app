@@ -93,6 +93,12 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // attempt, not while the doctor is still filling the card in (user
   // 2026-08-21 "dont show required red box, show on submitting").
   bool _showRxErrors = false;
+  // Blocks a second Submit tap while the first submit is still working
+  // (uploads, translation, enqueue, redirect). Without this, tapping
+  // twice during the ~12 s translation window created duplicate
+  // appointment.doctor_submit pushes (user 2026-09-02: parity with the
+  // counsellor register double-submit guard).
+  bool _submittingCase = false;
   // Village advisory (GET /appointments/{id}/advisory) — real village name
   // + trending terms for the SymptomField panels. Null until loaded.
   String? _advPlaceName;
@@ -148,10 +154,36 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // }
     if (p.prescription.isNotEmpty) {
       // Copy each RxItem so edits don't mutate the source until Submit.
-      for (final m in p.prescription) {
+      // Split stored dosage back into (form, strength) so the two
+      // dropdowns hydrate correctly — old rows without a form prefix
+      // keep the whole string as strength (user 2026-09-08).
+      // Combo pairs / triples (N lines sharing combo_key) are
+      // re-assembled into ONE RxItem — otherwise re-opening a case
+      // shows the group as N duplicate rows (user 2026-09-14).
+      // Multiple partners are supported (user 2026-09-15).
+      final seenComboKeys = <String>{};
+      for (var i = 0; i < p.prescription.length; i++) {
+        final m = p.prescription[i];
+        final key = m.comboKey.trim();
+        if (key.isNotEmpty && seenComboKeys.contains(key)) continue;
+        final parsed = parseDosage(m.dosage);
+        final partners = <ComboMed>[];
+        if (key.isNotEmpty) {
+          seenComboKeys.add(key);
+          for (var j = i + 1; j < p.prescription.length; j++) {
+            if (p.prescription[j].comboKey == key) {
+              final pp = parseDosage(p.prescription[j].dosage);
+              partners.add(ComboMed(name: p.prescription[j].name, dosage: pp.strength));
+            }
+          }
+        }
         rx.add(RxItem(
-          name: m.name, dosage: m.dosage,
+          name: m.name,
+          dosage: parsed.strength,
+          dosageForm: m.dosageForm.isNotEmpty ? m.dosageForm : parsed.form,
           days: m.days, interval: m.interval, qty: m.qty,
+          comboKey: key,
+          combos: partners,
         ));
       }
     }
@@ -530,6 +562,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // itself is removed per user rule 2026-08-16, see kFrequencies).
   static const _perDay = {'OD': 1, 'BD': 2, 'TDS': 3, 'QID': 4, 'SOS': 1, 'HS': 1};
   void _recalcQty(RxItem m) {
+    // Non-solid forms have no piece count — set qty to 0 so the
+    // backend gets a truthful "dispense by volume/tube" value
+    // (user 2026-09-14).
+    if (!dosageFormNeedsQty(m.dosageForm)) { m.qty = 0; return; }
     final perDay = _perDay[m.interval] ?? 1;
     final days = int.tryParse(RegExp(r'\d+').firstMatch(m.days)?.group(0) ?? '') ?? 0;
     m.qty = perDay * days;
@@ -701,11 +737,15 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ])),
           // registration details (read-only, filled by counsellor)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Counsellor', bg: C2.cyanLight, fg: C2.cyan)]),
+            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Recipient', bg: C2.cyanLight, fg: C2.cyan)]),
             _kv('Symptoms', p.symptoms.isNotEmpty
                 ? p.symptoms.join(', ')
                 : (_loadingRegDetail ? 'Loading…' : '—')),
-            if (p.remarks.isNotEmpty) _kv('Remarks', p.remarks),
+            // Label matches patient_history.dart (user 2026-08-22 rename).
+            // p.remarks is set by _applyRegistrationDetail with the English
+            // version preferred (counsellor_remarks_english), falling back
+            // to the original counsellor_remarks only when English is empty.
+            if (p.remarks.isNotEmpty) _kv('Patient Remarks', p.remarks),
           ])),
           // Editable Vitals card (rule 2026-07-31). Collapsible — same
           // switch pattern as the Counsellor Register form's Vitals section.
@@ -885,15 +925,60 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 }
                 return const SizedBox.shrink();
               }),
-            CField('Diagnosis (ICD-11)', _diagnosisField()),
+            CField('Diagnosis (ICD-11)', required: true, _diagnosisField()),
             CField('Investigations', _testsField()),
           ])),
           // prescription
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Prescription'),
-            if (rx.isEmpty) Padding(padding: const EdgeInsets.symmetric(vertical: 6), child: Text('No medicines added', style: ct(12, FontWeight.w400, C2.text2))),
+            // Section header carries the required marker so the Prescription
+            // card matches Symptoms / Diagnosis (user 2026-09-02: add red
+            // asterisk on required fields, don't touch working functionality).
+            const SecBar('Prescription', required: true),
+            if (rx.isEmpty) Padding(padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Text(_showRxErrors ? 'Add at least one medicine' : 'No medicines added',
+                    style: ct(12, FontWeight.w400,
+                        _showRxErrors ? C2.danger : C2.text2))),
             ...rx.map(_medCard),
-            const SizedBox(height: 4),
+            const SizedBox(height: 6),
+            // Frequently prescribed medicines — chip strip above the
+            // "Add Medicine" button. Each chip carries the name AND the
+            // most-common strength (e.g. "Paracetamol · 500 mg"), so a
+            // tap adds a fully-prefilled Rx row. Cream card, medium
+            // radius (user 2026-09-11).
+            Builder(builder: (_) {
+              final freq = _frequentMedicines();
+              if (freq.isEmpty) return const SizedBox.shrink();
+              return Padding(padding: const EdgeInsets.only(bottom: 6),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('FREQUENTLY PRESCRIBED', style: ct(10, FontWeight.w700, C2.text2)),
+                  const SizedBox(height: 4),
+                  Wrap(spacing: 8, runSpacing: 6, children: [
+                    for (final f in freq)
+                      InkWell(
+                        borderRadius: BorderRadius.circular(12),
+                        onTap: () => setState(() {
+                          if (rx.any((x) => x.name == f.name)) return;
+                          rx.add(RxItem(name: f.name, dosage: f.dosage));
+                        }),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            border: Border.all(color: C2.border),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            const Icon(Icons.add, size: 13, color: C2.text),
+                            const SizedBox(width: 4),
+                            Text(f.dosage.isEmpty ? f.name : '${f.name} · ${f.dosage}',
+                                style: ct(12, FontWeight.w700, C2.text)),
+                          ]),
+                        ),
+                      ),
+                  ]),
+                ]),
+              );
+            }),
             COutlineButton('Add Medicine', icon: Icons.add_circle_outline, onTap: _addMed),
           ])),
           // doctor remarks (with speech-to-text)
@@ -906,7 +991,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // to the server as follow_up_date, which doctor_submit already
           // stores on the prescription.
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Next Follow-Up'),
+            const SecBar('Next Follow-Up', required: true),
             Row(children: [
               for (final yes in [true, false]) ...[
                 InkWell(
@@ -957,7 +1042,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             ],
           ])),
           const SizedBox(height: 4),
-          CPrimaryButton('Submit Case', icon: Icons.check_circle_outline, onTap: () async {
+          CPrimaryButton(
+              _submittingCase ? 'Submitting…' : 'Submit Case',
+              icon: _submittingCase ? Icons.hourglass_top : Icons.check_circle_outline,
+              onTap: _submittingCase ? null : () async {
             // [JC] debug trail (user 2026-08-21) — visible in logcat.
             print('[JC] submit tapped: dx=${diagnoses.length} rx=${rx.length} '
                 'followUp=$_nextFollowUp date=$_followUpDate '
@@ -968,6 +1056,13 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             }
             if (symptoms.isEmpty) { return err('Add at least one symptom'); }
             if (diagnoses.isEmpty) { return err('Add at least one diagnosis'); }
+            // Prescription is now a hard requirement — a doctor's submit
+            // without any medicine used to slip through and land at the
+            // pharmacist with nothing to dispense (user 2026-09-02).
+            if (rx.isEmpty) {
+              setState(() => _showRxErrors = true);
+              return err('Add at least one medicine');
+            }
             if (_nextFollowUp == null) { return err('Answer "Next Follow-Up" (Yes/No)'); }
             if (_nextFollowUp == true && _followUpDate == null) { return err('Select the follow-up date'); }
             // Vitals must be clinically plausible (user 2026-08-22).
@@ -978,16 +1073,26 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // Prescription validation: any row added must be complete.
             // Doctor's prescription is the audit trail — half-filled rows
             // block dispense downstream (user rule 2026-08-16).
+            // Validation reads the SAME options the dropdown showed —
+            // server list first, static fallback next (user 2026-09-07
+            // dynamic frequencies). Never reject a value that the row
+            // itself just offered.
+            final _allowedFreqs = _frequencyOptions(context).toSet();
             for (final m in rx) {
+              final missingCombo = m.combos.firstWhere(
+                  (c) => c.dosage.trim().isEmpty,
+                  orElse: () => ComboMed(name: ''));
               final bad = m.dosage.trim().isEmpty ||
-                  !kFrequencies.contains(m.interval) ||
-                  _durationError(m.days) != null;
+                  !_allowedFreqs.contains(m.interval) ||
+                  _durationError(m.days) != null ||
+                  missingCombo.name.isNotEmpty;
               // Light up the inline "Required" boxes from here on — they
               // stay hidden until the first failed Submit (user 2026-08-21).
               if (bad) setState(() => _showRxErrors = true);
               if (m.dosage.trim().isEmpty) return err('${m.name}: enter dosage');
-              if (!kFrequencies.contains(m.interval)) return err('${m.name}: pick frequency');
+              if (!_allowedFreqs.contains(m.interval)) return err('${m.name}: pick frequency');
               if (_durationError(m.days) != null) return err('${m.name}: ${_durationError(m.days)!.toLowerCase()} in duration');
+              if (missingCombo.name.isNotEmpty) return err('${missingCombo.name}: enter dosage');
             }
             // Bilingual columns (user 2026-08-21): the original goes to
             // `observation` / `doctor_remarks` exactly as dictated; the
@@ -1006,6 +1111,12 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 return t; // worst case: original rides in both columns
               }
             }
+            // Lock the button for the WHOLE remaining flow (translation,
+            // enqueue, snackbar, pop). A second tap during the up-to-12 s
+            // translation was creating a duplicate doctor_submit push
+            // (user 2026-09-02 parity fix with counsellor register).
+            setState(() => _submittingCase = true);
+            try {
             final obsEnglish = await toEnglish(obsOriginal);
             final remEnglish = await toEnglish(remOriginal);
             if (!mounted) return;
@@ -1059,17 +1170,51 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               // The doctor only *advises* tests here, so they ride along as text
               // (see _remarksWithTests) and the case routes on medicines alone.
               'lab_test_names': [ for (final t in tests) t ],
-              'prescription': [
-                for (final m in rx)
-                  {
-                    'medicine_name': m.name,
-                    'dosage':        m.dosage,
-                    'frequency':     m.interval,
-                    // Schema wants a day count, not a label like '5 Days'.
+              'prescription': () {
+                // Resolve master ids on the mobile side so the server
+                // skips the case-insensitive name/code scan (user
+                // 2026-09-10 id-first). Name/code still ride as fallback
+                // for older server builds. Combination medicines split
+                // into TWO prescription lines that share frequency,
+                // duration, and qty (user 2026-09-11).
+                final masters = context.read<MastersStore>();
+                Map<String, dynamic> line(String name, String dosage,
+                    String dosageForm, RxItem m, {String comboKey = ''}) {
+                  final medId = masters.masterIdOf('medicines', name);
+                  final freqId = masters.masterIdOf('frequencies', m.interval);
+                  return {
+                    'medicine_name': name,
+                    if (medId != null) 'medicine_id': medId,
+                    'dosage': dosageForm.isEmpty
+                        ? dosage
+                        : '$dosageForm$kDosageFormSep$dosage',
+                    if (dosageForm.isNotEmpty) 'dosage_form': dosageForm,
+                    'frequency': m.interval,
+                    if (freqId != null) 'frequency_id': freqId,
                     'duration_days': _daysToInt(m.days),
-                    'qty':           m.qty,
-                  },
-              ],
+                    'qty': m.qty,
+                    if (comboKey.isNotEmpty) 'combo_key': comboKey,
+                  };
+                }
+                final out = <Map<String, dynamic>>[];
+                var comboSeq = 0;
+                for (final m in rx) {
+                  // Every line in a combination strip shares one
+                  // combo_key so the pharmacist card groups them
+                  // together. Single medicines stay untouched (user
+                  // 2026-09-12, multi-combo 2026-09-15).
+                  final comboKey = m.combos.isEmpty
+                      ? ''
+                      : 'c${DateTime.now().millisecondsSinceEpoch}_${comboSeq++}';
+                  out.add(line(m.name, m.dosage, m.dosageForm, m, comboKey: comboKey));
+                  for (final c in m.combos) {
+                    // Every combo partner shares the primary's dosage
+                    // form (one physical strip carrying all).
+                    out.add(line(c.name, c.dosage, m.dosageForm, m, comboKey: comboKey));
+                  }
+                }
+                return out;
+              }(),
               'vitals': {
                 for (final e in p.vitals.entries) e.key: e.value,
               },
@@ -1086,6 +1231,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               print('[JC] pop OK');
             } catch (e) {
               print('[JC] pop FAILED: ' + e.toString());
+            }
+            } finally {
+              // Release the button — no-op if pop already disposed us.
+              if (mounted) setState(() => _submittingCase = false);
             }
           }),
           const SizedBox(height: 8),
@@ -1319,7 +1468,23 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       COutlineButton('Add Test', icon: Icons.add, onTap: () async {
         print('[JC] Add Test TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
         _parkFocus();
-        final picked = await _pick(context, 'Add Test', kLabTests.where((t) => !tests.contains(t)).toList());
+        // Lab tests DYNAMIC — server master `lab_tests` first, static
+        // fallback (user 2026-09-10 dynamic masters, additive only —
+        // send-side payload unchanged, no breakage risk).
+        final labTests = () {
+          final rows = context.read<MastersStore>().masterRows('lab_tests');
+          final serverNames = <String>[
+            for (final r in rows)
+              if ((r['name'] ?? r['term']) != null) (r['name'] ?? r['term']).toString(),
+          ];
+          if (serverNames.isEmpty) return kLabTests;
+          final seen = <String>{};
+          return <String>[
+            for (final s in [...serverNames, ...kLabTests])
+              if (s.trim().isNotEmpty && seen.add(s)) s,
+          ];
+        }();
+        final picked = await _pick(context, 'Add Test', labTests.where((t) => !tests.contains(t)).toList());
         if (!mounted) return;
         _parkFocus();
         if (picked != null) setState(() => tests.add(picked));
@@ -1334,7 +1499,27 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       decoration: BoxDecoration(color: C2.bg, borderRadius: BorderRadius.circular(10), border: Border.all(color: C2.border)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Expanded(child: Text(m.name, style: ct(13, FontWeight.w600, C2.text))),
+          // Combined name — "Paracetamol + Vitamin A + Vitamin B" when
+          // combo partners are attached (a single tablet strip that
+          // carries all, user 2026-09-15 multi-combo). Single-medicine
+          // rows show name alone.
+          Expanded(child: Text(
+              m.combos.isEmpty
+                  ? m.name
+                  : '${m.name}${m.combos.map((c) => ' + ${c.name}').join()}',
+              style: ct(13, FontWeight.w600, C2.text))),
+          // The link icon is now ALWAYS the "add another combo" button
+          // — each attached partner has its own X below (user
+          // 2026-09-15 "if user chose two combined ... he want to
+          // remove vitamin b then how he will do that").
+          InkWell(
+            onTap: () => _pickComboMed(m),
+            child: Tooltip(
+              message: 'Add combination medicine',
+              child: const Icon(Icons.add_link, size: 18, color: C2.cyan),
+            ),
+          ),
+          const SizedBox(width: 10),
           InkWell(onTap: () => setState(() => rx.remove(m)), child: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         // Pharmacy on-hand for this unit (user 2026-08-21). Only rendered
@@ -1346,30 +1531,99 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 style: ct(10.5, FontWeight.w600, qty > 0 ? C2.green : C2.danger));
           })),
         const SizedBox(height: 8),
-        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('DOSAGE', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
-          TextFormField(initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
-            decoration: cInput('e.g. 500 mg').copyWith(
-              errorText: (_showRxErrors && m.dosage.trim().isEmpty) ? 'Required' : null,
-              errorStyle: const TextStyle(fontSize: 11),
-              isDense: true,
-            ),
-            onChanged: (v) => setState(() => m.dosage = v)),
+        // Dosage + Dosage Form on the SAME row (user 2026-09-08).
+        // Dosage on the left (expanded, free-text mg/ml), Dosage Form
+        // dropdown on the right (Tab / Cap / Syp). Both save to the
+        // same RxItem — combined at submit as "<form> · <strength>"
+        // so the backend column stays unchanged.
+        // Primary medicine — Dosage + Dosage Form. Label carries the
+        // medicine name when a combo is set so it is obvious which of
+        // the two strengths belongs where ("Paracetamol dosage" vs
+        // "Vitamin C dosage", user 2026-09-12).
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(m.combos.isEmpty
+                    ? 'DOSAGE'
+                    : '${m.name.toUpperCase()} — DOSAGE',
+                style: ct(9.5, FontWeight.w600, C2.text2)),
+            const SizedBox(height: 3),
+            TextFormField(initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
+              decoration: cInput('e.g. 500 mg/ml').copyWith(
+                errorText: (_showRxErrors && m.dosage.trim().isEmpty) ? 'Required' : null,
+                errorStyle: const TextStyle(fontSize: 11),
+                isDense: true,
+              ),
+              onChanged: (v) => setState(() => m.dosage = v)),
+          ])),
+          const SizedBox(width: 6),
+          SizedBox(width: 100, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('DOSAGE FORM', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
+            SizedBox(height: 38, child: SearchDropdown(
+              items: kDosageForms,
+              value: kDosageForms.contains(m.dosageForm) ? m.dosageForm : null,
+              onChanged: (v) => setState(() { m.dosageForm = v ?? ''; _recalcQty(m); }))),
+          ])),
         ]),
+        // Combination partner rows — one per attached ComboMed. Each
+        // shows medicine name header + its own dosage box + an
+        // individual X to remove only that partner (user 2026-09-15
+        // "keep multiple combined medicine option ... remove Vitamin
+        // B how"). Frequency / Duration / Qty / Dosage Form stay
+        // shared with the primary (single strip carrying all).
+        for (final c in List<ComboMed>.from(m.combos)) ...[
+          const SizedBox(height: 8),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(child: Text('${c.name.toUpperCase()} — DOSAGE',
+                  style: ct(9.5, FontWeight.w600, C2.text2))),
+              InkWell(
+                onTap: () => setState(() => m.combos.remove(c)),
+                child: Tooltip(
+                  message: 'Remove ${c.name}',
+                  child: const Icon(Icons.close, size: 16, color: C2.text2),
+                ),
+              ),
+            ]),
+            const SizedBox(height: 3),
+            TextFormField(initialValue: c.dosage, style: ct(12.5, FontWeight.w500, C2.text),
+              decoration: cInput('e.g. 400 mg/ml').copyWith(
+                errorText: (_showRxErrors && c.dosage.trim().isEmpty) ? 'Required' : null,
+                errorStyle: const TextStyle(fontSize: 11),
+                isDense: true,
+              ),
+              onChanged: (v) => setState(() => c.dosage = v)),
+          ]),
+        ],
         const SizedBox(height: 8),
-        Row(children: [
-          Expanded(child: _mini('Frequency', m.interval, kFrequencies, (v) => setState(() { m.interval = v; _recalcQty(m); }))),
+        // Top-align — a "Required" error under Duration makes that
+        // column ~20px taller than Frequency / QTY, and the default
+        // center-alignment was dropping the neighbours by half that
+        // gap, breaking the row (user 2026-09-15).
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Frequency options are DYNAMIC — pulled from the server's
+          // `masters.frequencies` (bootstrap). Static `kFrequencies` stays
+          // as the offline fallback so a fresh install / cache-miss still
+          // renders a working dropdown, and validation always accepts
+          // either source (user 2026-09-07: "do dynamic frequencies").
+          Expanded(child: _mini('Frequency', m.interval, _frequencyOptions(context),
+              (v) => setState(() { m.interval = v; _recalcQty(m); }))),
           const SizedBox(width: 6),
           // Open-ended duration: 1-2 digit days OR a 3-letter code (SOS, PRN).
           // Dropdown can't cover all values the AI advisory suggests.
           Expanded(child: _miniDuration(m)),
-          const SizedBox(width: 6),
-          SizedBox(width: 64, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('QTY (auto)', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
-            Container(height: 38, alignment: Alignment.center,
-              decoration: BoxDecoration(color: C2.cyanLight, borderRadius: BorderRadius.circular(8), border: Border.all(color: C2.border)),
-              child: Text('${m.qty}', style: ct(14, FontWeight.w700, C2.navy))),
-          ])),
+          // QTY only makes sense for solid forms (Tab / Cap). For
+          // syrup / jell / cream the pharmacist dispenses by volume
+          // or a whole tube, so hide the auto-count box (user
+          // 2026-09-14).
+          if (dosageFormNeedsQty(m.dosageForm)) ...[
+            const SizedBox(width: 6),
+            SizedBox(width: 64, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('QTY (auto)', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
+              Container(height: 38, alignment: Alignment.center,
+                decoration: BoxDecoration(color: C2.cyanLight, borderRadius: BorderRadius.circular(8), border: Border.all(color: C2.border)),
+                child: Text('${m.qty}', style: ct(14, FontWeight.w700, C2.navy))),
+            ])),
+          ],
         ]),
       ]),
     );
@@ -1381,6 +1635,26 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           items: opts, value: opts.contains(val) ? val : null,
           onChanged: (v) => onCh(v ?? val))),
       ]);
+
+  /// Frequency options — server master (bootstrap `masters.frequencies`)
+  /// leads; the const `kFrequencies` list is the offline fallback. Result
+  /// is deduplicated so a server list that already covers the fallback
+  /// codes does not repeat them (user 2026-09-07 dynamic frequencies).
+  List<String> _frequencyOptions(BuildContext ctx) {
+    final server = ctx.read<MastersStore>().masterStrings('frequencies');
+    if (server.isNotEmpty) {
+      // Preserve server order but ensure every static fallback code is
+      // reachable — an old build's saved value must still validate.
+      final seen = <String>{};
+      final out = <String>[];
+      for (final s in [...server, ...kFrequencies]) {
+        if (s.trim().isEmpty) continue;
+        if (seen.add(s)) out.add(s);
+      }
+      return out;
+    }
+    return kFrequencies;
+  }
 
   /// Duration input — days only, 1-99 (user rule 2026-08-16: no
   /// letter codes, plain number). Label spells out the unit so the
@@ -1424,6 +1698,155 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     return null;
   }
 
+  /// Top-5 (name + strength) pairs this doctor prescribes most often,
+  /// counted across every patient in local state (`prescription` +
+  /// `previousRx`). Chip label = "Paracetamol · 500 mg" so a tap adds
+  /// a fully-prefilled Rx row. Names already in the current Rx are
+  /// filtered out (user 2026-09-11).
+  List<({String name, String dosage})> _frequentMedicines() {
+    final s = context.read<CounsellorState>();
+    // Key by "name||dosage" so the same drug at different strengths
+    // shows twice (e.g. Paracetamol 500 vs 650). Strip the dosage-form
+    // prefix ("Tab · 500 mg" → "500 mg") — the chip only re-fills the
+    // strength box; form is picked separately.
+    String stripForm(String d) {
+      final ix = d.indexOf(kDosageFormSep);
+      return ix < 0 ? d.trim() : d.substring(ix + kDosageFormSep.length).trim();
+    }
+    final count = <String, int>{};
+    final key = (String n, String d) => '${n.trim().toLowerCase()}||${d.trim().toLowerCase()}';
+    final labels = <String, ({String name, String dosage})>{};
+    void bump(String n, String d) {
+      final nn = n.trim();
+      if (nn.isEmpty) return;
+      final dd = stripForm(d);
+      final k = key(nn, dd);
+      count[k] = (count[k] ?? 0) + 1;
+      labels.putIfAbsent(k, () => (name: nn, dosage: dd));
+    }
+    for (final pat in s.patients) {
+      for (final m in pat.prescription) {
+        bump(m.name, m.dosage);
+      }
+      for (final pr in pat.previousRx) {
+        bump(pr.medicine, pr.dosage);
+      }
+    }
+    final entries = count.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final taken = {for (final x in rx) x.name.toLowerCase()};
+    final out = <({String name, String dosage})>[];
+    for (final e in entries) {
+      if (out.length >= 5) break;
+      final rec = labels[e.key]!;
+      if (taken.contains(rec.name.toLowerCase())) continue;
+      out.add(rec);
+      taken.add(rec.name.toLowerCase());
+    }
+    if (out.length >= 5) return out;
+    // Fresh install / thin history — top up from the medicine master
+    // so the strip is never empty (user 2026-09-11). Master carries
+    // names only, so pair each with a common OPD default strength
+    // for the chip label (user 2026-09-15 "show also mg with the
+    // medicine name"). Doctor can still edit the strength on the
+    // added row.
+    const defaults = <String, String>{
+      'paracetamol': '500 mg',
+      'ibuprofen': '400 mg',
+      'diclofenac': '50 mg',
+      'aceclofenac': '100 mg',
+      'acebrophylline': '100 mg',
+      'acyclovir': '400 mg',
+      'allopurinol': '100 mg',
+      'alprazolam': '0.25 mg',
+      'cetirizine': '10 mg',
+      'levocetirizine': '5 mg',
+      'chlorpheniramine': '4 mg',
+      'montelukast': '10 mg',
+      'amoxicillin': '500 mg',
+      'amoxicillin-clavulanate': '625 mg',
+      'azithromycin': '500 mg',
+      'cefixime': '200 mg',
+      'ciprofloxacin': '500 mg',
+      'ofloxacin': '200 mg',
+      'doxycycline': '100 mg',
+      'metronidazole': '400 mg',
+      'albendazole': '400 mg',
+      'ors sachets': '21 g',
+      'zinc': '20 mg',
+      'pantoprazole': '40 mg',
+      'omeprazole': '20 mg',
+      'domperidone': '10 mg',
+      'ondansetron': '4 mg',
+      'ambroxol': '30 mg',
+      'dextromethorphan syrup': '10 ml',
+      'salbutamol inhaler': '100 mcg',
+      'amlodipine': '5 mg',
+      'telmisartan': '40 mg',
+      'metformin': '500 mg',
+      'glimepiride': '1 mg',
+      'ferrous sulphate + folic acid': '60 mg',
+      'vitamin c': '500 mg',
+      'vitamin d3': '60000 IU',
+      'multivitamin': '1 tab',
+      'calcium': '500 mg',
+      'nitrofurantoin': '100 mg',
+      'b-complex': '1 tab',
+      'betadine gargle': '10 ml',
+    };
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    for (final n in pool) {
+      if (out.length >= 5) break;
+      if (taken.contains(n.toLowerCase())) continue;
+      out.add((name: n, dosage: defaults[n.toLowerCase()] ?? ''));
+      taken.add(n.toLowerCase());
+    }
+    return out;
+  }
+
+  /// Open the medicine picker to attach a COMBINATION medicine to [m].
+  /// Already-selected medicines (either primary or combo partners) are
+  /// filtered out so the same drug isn't picked twice on one visit
+  /// (user 2026-09-11).
+  Future<void> _pickComboMed(RxItem m) async {
+    _parkFocus();
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final taken = <String>{
+      for (final x in rx) x.name.toLowerCase(),
+      for (final x in rx)
+        for (final c in x.combos) c.name.toLowerCase(),
+    };
+    // Same case-insensitive de-dup as the main picker so a server
+    // master with duplicated names doesn't repeat rows here either
+    // (user 2026-09-15).
+    final seen = <String>{};
+    final opts = <String>[];
+    for (final n in medOptions) {
+      final t = n.trim();
+      if (t.isEmpty) continue;
+      final k = t.toLowerCase();
+      if (taken.contains(k) || !seen.add(k)) continue;
+      opts.add(t);
+    }
+    // Multi-select — parity with the main Add Medicine picker so the
+    // doctor can tick several partners at once (Vitamin A + Vitamin B
+    // + Vitamin C ...) and Add them together (user 2026-09-15
+    // "combined medicine dropdown same as add medicine — checkbox").
+    final picked = await _pickMulti(context, 'Add Combination Medicine', opts);
+    if (!mounted || picked == null || picked.isEmpty) return;
+    _parkFocus();
+    setState(() {
+      for (final name in picked) {
+        // Guard against a double-tap adding the same drug twice in
+        // this same batch.
+        if (m.combos.any((c) => c.name.toLowerCase() == name.toLowerCase())) continue;
+        m.combos.add(ComboMed(name: name));
+      }
+    });
+  }
+
   Future<void> _addMed() async {
     print('[JC] Add Medicine TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
     final _tMed0 = DateTime.now().microsecondsSinceEpoch;
@@ -1433,14 +1856,46 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // the requisition "No line matched" bug, 2026-08-21).
     final serverMeds = context.read<MastersStore>().medicineNames();
     final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
-    final _opts = medOptions.where((m) => !rx.any((x) => x.name == m)).toList();
+    // Case-insensitive de-dup — the server master occasionally lists a
+    // medicine twice (name variants under different ids), and the
+    // multi-select checkbox picker was rendering both, letting the
+    // doctor tick the same drug twice (user 2026-09-15 "still showing
+    // duplicate on medicine dropdown"). Also drops names already on
+    // the current Rx.
+    final rxNames = {for (final x in rx) x.name.toLowerCase()};
+    final seen = <String>{};
+    final _opts = <String>[];
+    for (final m in medOptions) {
+      final n = m.trim();
+      if (n.isEmpty) continue;
+      final k = n.toLowerCase();
+      if (rxNames.contains(k) || !seen.add(k)) continue;
+      _opts.add(n);
+    }
     print('[JC] Add Medicine prep took '
         '${DateTime.now().microsecondsSinceEpoch - _tMed0} µs '
         '(options=${_opts.length})');
-    final picked = await _pick(context, 'Add Medicine', _opts);
+    // Multi-select — doctor ticks any number of medicines and one tap
+    // on Add adds them all (parity with the previous app, user
+    // 2026-09-14). Combination picker + test picker stay single-pick
+    // since each of those adds one row.
+    final picked = await _pickMulti(context, 'Add Medicine', _opts);
     if (!mounted) return;
     _parkFocus();
-    if (picked != null) setState(() => rx.add(RxItem(name: picked)));
+    if (picked != null && picked.isNotEmpty) {
+      setState(() {
+        for (final name in picked) {
+          if (rx.any((x) => x.name == name)) continue;
+          rx.add(RxItem(name: name));
+        }
+      });
+    }
+  }
+
+  Future<List<String>?> _pickMulti(BuildContext context, String title, List<String> options) {
+    return showModalBottomSheet<List<String>>(context: context, isScrollControlled: true, backgroundColor: C2.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _MultiPickerSheet(title: title, options: options));
   }
 
   Future<String?> _pick(BuildContext context, String title, List<String> options) {
@@ -1768,6 +2223,93 @@ class _PickerSheetState extends State<_PickerSheet> {
                     onTap: () => Navigator.pop(context, m[i]),
                   ),
                 )),
+      ]),
+    );
+  }
+}
+
+/// Multi-select picker sheet (user 2026-09-14 "checkbox user will click on
+/// 10 medicine checked"). Same search-and-list layout as [_PickerSheet],
+/// but each row carries a checkbox and the sheet returns every ticked
+/// value at once via a bottom "Add N" button.
+class _MultiPickerSheet extends StatefulWidget {
+  final String title;
+  final List<String> options;
+  const _MultiPickerSheet({required this.title, required this.options});
+  @override
+  State<_MultiPickerSheet> createState() => _MultiPickerSheetState();
+}
+
+class _MultiPickerSheetState extends State<_MultiPickerSheet> {
+  String q = '';
+  final Set<String> _sel = <String>{};
+  @override
+  Widget build(BuildContext context) {
+    final query = q.trim();
+    final ql = query.toLowerCase();
+    final m = query.isEmpty
+        ? widget.options
+        : widget.options.where((o) => o.toLowerCase().contains(ql)).toList();
+    return Padding(
+      padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(widget.title, style: ct(15, FontWeight.w700, C2.navy))),
+          if (_sel.isNotEmpty)
+            TextButton(
+              onPressed: () => setState(_sel.clear),
+              child: Text('Clear (${_sel.length})',
+                  style: ct(12, FontWeight.w600, C2.text2)),
+            ),
+        ]),
+        const SizedBox(height: 6),
+        TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
+        const SizedBox(height: 8),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 320),
+          child: m.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                      style: ct(13, FontWeight.w400, C2.text2)))
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: m.length,
+                  itemExtent: 44,
+                  itemBuilder: (_, i) {
+                    final name = m[i];
+                    final checked = _sel.contains(name);
+                    return InkWell(
+                      onTap: () => setState(() {
+                        if (checked) { _sel.remove(name); } else { _sel.add(name); }
+                      }),
+                      child: Row(children: [
+                        Checkbox(
+                          value: checked,
+                          onChanged: (v) => setState(() {
+                            if (v == true) { _sel.add(name); } else { _sel.remove(name); }
+                          }),
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        Expanded(child: Text(name, style: ct(13.5, FontWeight.w500, C2.text))),
+                      ]),
+                    );
+                  },
+                )),
+        const SizedBox(height: 10),
+        SizedBox(width: double.infinity, child: ElevatedButton(
+          onPressed: _sel.isEmpty
+              ? null
+              : () => Navigator.pop(context, _sel.toList()),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: C2.navy, foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+          child: Text(_sel.isEmpty ? 'Select medicines' : 'Add ${_sel.length}',
+              style: ct(13.5, FontWeight.w700, Colors.white)),
+        )),
       ]),
     );
   }

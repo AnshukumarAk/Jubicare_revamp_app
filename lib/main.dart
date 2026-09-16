@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:provider/provider.dart';
 import 'api/api_client.dart';
@@ -24,6 +25,7 @@ import 'models/models.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'services/fcm_service.dart';
+import 'services/notification_router.dart';
 import 'services/terminology_store.dart';
 import 'services/notifications_service.dart';
 import 'services/notifications_store.dart';
@@ -39,8 +41,18 @@ import 'services/connectivity_service.dart';
 import 'services/firebase_service.dart';
 import 'services/location_service.dart';
 
+/// Global navigator key so onSignedOutRemotely can bounce back to the
+/// login screen from anywhere — background timers, api-level 401
+/// handlers, isolate callbacks — without needing a BuildContext
+/// (user 2026-09-10).
+final GlobalKey<NavigatorState> _rootNavigator = GlobalKey<NavigatorState>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Lock the app to portrait orientation — MMU screens are designed
+  // portrait-only; landscape breaks form layouts (user 2026-09-11).
+  await SystemChrome.setPreferredOrientations(
+      [DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
   // One-time cleanup: the removed on-device ASR experiments (Whisper /
   // sherpa-Dolphin, 2026-08-18) left ~340 MB of model files in app
   // storage on test phones. Fire-and-forget delete; no-op once gone.
@@ -74,6 +86,19 @@ void main() async {
     onSignedOutRemotely: () async {
       await TokenStore.clear();
       await AuthPersistence.clear();
+      // Bounce the user back to the login screen — clearing the prefs
+      // alone left the shell mounted with dead tokens, so a stale
+      // Android-11-OEM restore of a doctor session used to open the
+      // Doctor shell directly (user 2026-09-10). Uses the global
+      // navigator key so the callback works from anywhere in the tree,
+      // including background timers and the api layer.
+      final nav = _rootNavigator.currentState;
+      if (nav != null) {
+        await nav.pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const SplashScreen()),
+          (_) => false,
+        );
+      }
     },
   );
   final authApi          = AuthApi(apiClient);
@@ -110,6 +135,21 @@ void main() async {
   // D1: an already-logged-in user re-registers their FCM token at every
   // app start (covers token rotation + fresh installs restoring session).
   if (session != null) unawaited(FcmService.instance.register(apiClient));
+  // App-wide tap handler — every notification the user opens fires this
+  // stream (both background→open and killed→open), and we push the
+  // matching screen via the root navigator (user 2026-09-10 "click on
+  // notification will go to that page for action"). Unawaited: never
+  // block main().
+  FcmService.instance.onNotificationTap.listen((RemoteMessage m) {
+    final route = (m.data['route'] as String? ?? '').trim();
+    final arg = (m.data['route_arg'] as String?)?.trim();
+    if (route.isEmpty) return;
+    // Publish to the NotificationRouter; each role shell listens and
+    // switches to the matching tab / opens the matching detail. Shells
+    // are already mounted so a global push here would race with the
+    // shell's own tab controller.
+    NotificationRouter.instance.push(route, arg);
+  });
   // Per-user notification history (user 2026-08-19) — key the store to
   // whoever this stored session belongs to.
   if (session != null) {
@@ -225,6 +265,13 @@ class JubiCareApp extends StatelessWidget {
       await mastersStore.refresh();
       final freshFacility = mastersStore.facility;
       if (freshFacility != null) app.applyBootstrapFacility(freshFacility);
+      // Re-apply the fresh user block from bootstrap so a backend-side
+      // change (org.plan_type flipped between free ↔ paid, role edited,
+      // facility reassigned) reflects on the very next app open without
+      // a logout+login (user 2026-09-08). applyBackendUser is the same
+      // method the login response uses — no new code path.
+      final freshUser = mastersStore.user;
+      if (freshUser != null) app.applyBackendUser(freshUser, mmuId: s.mmuId);
       // Clinical terminology too — at boot the network refresh only runs
       // when a session already exists, so a FRESH INSTALL's first login
       // reached the doctor screen with an empty sheet: legacy likely-list,
@@ -285,6 +332,7 @@ class JubiCareApp extends StatelessWidget {
         title: 'JubiCare MMU',
         debugShowCheckedModeBanner: false,
         theme: buildJubiCareTheme(),
+        navigatorKey: _rootNavigator,
         home: Builder(builder: (context) {
           if (session != null) return _homeForSession(context);
           return const SplashScreen();
