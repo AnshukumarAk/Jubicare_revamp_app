@@ -1508,19 +1508,37 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                   ? m.name
                   : '${m.name}${m.combos.map((c) => ' + ${c.name}').join()}',
               style: ct(13, FontWeight.w600, C2.text))),
-          // The link icon is now ALWAYS the "add another combo" button
-          // — each attached partner has its own X below (user
-          // 2026-09-15 "if user chose two combined ... he want to
-          // remove vitamin b then how he will do that").
+          // Edit combo — bare pencil icon (user 2026-09-18 "remove
+          // rounded circle from pencil icon"). Opens the manage sheet
+          // where the doctor can tick / untick partners in one place.
+          //
+          // The icon LOOKS 20px but its tap target is 42x42 (user
+          // 2026-09-22 "pencil edit icon ... nothing happening"):
+          // Icon(20) + EdgeInsets.all(4) gave a 28x28 hit box, so any
+          // tap more than ~14px off centre landed on the dead gap
+          // between the pencil and the X and did nothing. Measured on
+          // device — 38px off still fired, 53px off did not. 42 clears
+          // Material's 48-dp guidance far enough for a finger without
+          // pushing the two icons apart visually.
           InkWell(
-            onTap: () => _pickComboMed(m),
-            child: Tooltip(
-              message: 'Add combination medicine',
-              child: const Icon(Icons.add_link, size: 18, color: C2.cyan),
+            onTap: () => _editCombos(m),
+            borderRadius: BorderRadius.circular(6),
+            child: const SizedBox(
+              width: 42, height: 42,
+              child: Icon(Icons.edit, size: 20, color: C2.navy),
             ),
           ),
-          const SizedBox(width: 10),
-          InkWell(onTap: () => setState(() => rx.remove(m)), child: const Icon(Icons.close, size: 18, color: C2.text2)),
+          // Remove medicine — same enlarged target. This one is
+          // destructive, so an accidental near-miss mattered even more
+          // than the pencil's: the bare Icon(20) was a 20x20 hit box.
+          InkWell(
+            onTap: () => setState(() => rx.remove(m)),
+            borderRadius: BorderRadius.circular(6),
+            child: const SizedBox(
+              width: 42, height: 42,
+              child: Icon(Icons.close, size: 20, color: C2.text2),
+            ),
+          ),
         ]),
         // Pharmacy on-hand for this unit (user 2026-08-21). Only rendered
         // once /medicines/stock has answered — unknown medicines show 0.
@@ -1531,68 +1549,82 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 style: ct(10.5, FontWeight.w600, qty > 0 ? C2.green : C2.danger));
           })),
         const SizedBox(height: 8),
-        // Dosage + Dosage Form on the SAME row (user 2026-09-08).
-        // Dosage on the left (expanded, free-text mg/ml), Dosage Form
-        // dropdown on the right (Tab / Cap / Syp). Both save to the
-        // same RxItem — combined at submit as "<form> · <strength>"
-        // so the backend column stays unchanged.
-        // Primary medicine — Dosage + Dosage Form. Label carries the
-        // medicine name when a combo is set so it is obvious which of
-        // the two strengths belongs where ("Paracetamol dosage" vs
-        // "Vitamin C dosage", user 2026-09-12).
+        // Dosage Form FIRST, then Dosage — same reading order the
+        // pharmacist requisition form has used since 2026-09-14, now
+        // asked for here too (user 2026-09-22). The form is not a
+        // detail hanging off the strength; it decides what the
+        // strength MEANS, so it has to be answered first: Tab / Cap
+        // are counted in mg, Syp / Gel / Cream are measured in ml, and
+        // the label, placeholder, keyboard and input rules of the
+        // Dosage box all follow from it.
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(m.combos.isEmpty
-                    ? 'DOSAGE'
-                    : '${m.name.toUpperCase()} — DOSAGE',
-                style: ct(9.5, FontWeight.w600, C2.text2)),
+          Expanded(flex: 2, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('DOSAGE FORM', style: ct(9.5, FontWeight.w600, C2.text2)),
             const SizedBox(height: 3),
-            TextFormField(initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
-              decoration: cInput('e.g. 500 mg/ml').copyWith(
-                errorText: (_showRxErrors && m.dosage.trim().isEmpty) ? 'Required' : null,
-                errorStyle: const TextStyle(fontSize: 11),
-                isDense: true,
-              ),
-              onChanged: (v) => setState(() => m.dosage = v)),
-          ])),
-          const SizedBox(width: 6),
-          SizedBox(width: 100, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('DOSAGE FORM', style: ct(9.5, FontWeight.w600, C2.text2)), const SizedBox(height: 3),
             SizedBox(height: 38, child: SearchDropdown(
               items: kDosageForms,
               value: kDosageForms.contains(m.dosageForm) ? m.dosageForm : null,
               onChanged: (v) => setState(() { m.dosageForm = v ?? ''; _recalcQty(m); }))),
           ])),
-        ]),
-        // Combination partner rows — one per attached ComboMed. Each
-        // shows medicine name header + its own dosage box + an
-        // individual X to remove only that partner (user 2026-09-15
-        // "keep multiple combined medicine option ... remove Vitamin
-        // B how"). Frequency / Duration / Qty / Dosage Form stay
-        // shared with the primary (single strip carrying all).
-        for (final c in List<ComboMed>.from(m.combos)) ...[
-          const SizedBox(height: 8),
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [
-              Expanded(child: Text('${c.name.toUpperCase()} — DOSAGE',
-                  style: ct(9.5, FontWeight.w600, C2.text2))),
-              InkWell(
-                onTap: () => setState(() => m.combos.remove(c)),
-                child: Tooltip(
-                  message: 'Remove ${c.name}',
-                  child: const Icon(Icons.close, size: 16, color: C2.text2),
+          const SizedBox(width: 6),
+          Expanded(flex: 3, child: Builder(builder: (_) {
+            final needsQty = dosageFormNeedsQty(m.dosageForm);
+            final unit = needsQty ? 'MG' : 'ML';
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(m.combos.isEmpty
+                      ? 'DOSAGE ($unit)'
+                      : '${m.name.toUpperCase()} DOSAGE ($unit)',
+                  style: ct(9.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 3),
+              TextFormField(
+                key: ValueKey('dose-${identityHashCode(m)}-$needsQty'),
+                initialValue: m.dosage, style: ct(12.5, FontWeight.w500, C2.text),
+                keyboardType: needsQty
+                    ? TextInputType.number
+                    : const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: needsQty
+                    ? [FilteringTextInputFormatter.digitsOnly,
+                       LengthLimitingTextInputFormatter(4)]
+                    : [LengthLimitingTextInputFormatter(12)],
+                decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml').copyWith(
+                  errorText: (_showRxErrors && m.dosage.trim().isEmpty) ? 'Required' : null,
+                  errorStyle: const TextStyle(fontSize: 11),
+                  isDense: true,
                 ),
-              ),
-            ]),
-            const SizedBox(height: 3),
-            TextFormField(initialValue: c.dosage, style: ct(12.5, FontWeight.w500, C2.text),
-              decoration: cInput('e.g. 400 mg/ml').copyWith(
-                errorText: (_showRxErrors && c.dosage.trim().isEmpty) ? 'Required' : null,
-                errorStyle: const TextStyle(fontSize: 11),
-                isDense: true,
-              ),
-              onChanged: (v) => setState(() => c.dosage = v)),
-          ]),
+                onChanged: (v) => setState(() => m.dosage = v)),
+            ]);
+          })),
+        ]),
+        // Combination partner dosages — one stacked row per attached
+        // ComboMed. No inline X; the pencil edit icon in the header
+        // handles remove. Partners share the primary's dosage form, so
+        // their unit follows it too.
+        for (final c in m.combos) ...[
+          const SizedBox(height: 8),
+          Builder(builder: (_) {
+            final needsQty = dosageFormNeedsQty(m.dosageForm);
+            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('${c.name.toUpperCase()} DOSAGE (${needsQty ? 'MG' : 'ML'})',
+                  style: ct(9.5, FontWeight.w600, C2.text2)),
+              const SizedBox(height: 3),
+              TextFormField(
+                key: ValueKey('combo-${identityHashCode(c)}-$needsQty'),
+                initialValue: c.dosage, style: ct(12.5, FontWeight.w500, C2.text),
+                keyboardType: needsQty
+                    ? TextInputType.number
+                    : const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: needsQty
+                    ? [FilteringTextInputFormatter.digitsOnly,
+                       LengthLimitingTextInputFormatter(4)]
+                    : [LengthLimitingTextInputFormatter(12)],
+                decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml').copyWith(
+                  errorText: (_showRxErrors && c.dosage.trim().isEmpty) ? 'Required' : null,
+                  errorStyle: const TextStyle(fontSize: 11),
+                  isDense: true,
+                ),
+                onChanged: (v) => setState(() => c.dosage = v)),
+            ]);
+          }),
         ],
         const SizedBox(height: 8),
         // Top-align — a "Required" error under Duration makes that
@@ -1847,6 +1879,67 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     });
   }
 
+  /// Manage sheet — currently-attached partners pre-ticked, unticking
+  /// removes; ticking a fresh option adds it. Save applies the diff
+  /// in one setState (user 2026-09-18 "edit icon ... user can remove
+  /// from the list and combine").
+  Future<void> _editCombos(RxItem m) async {
+    _parkFocus();
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    // Options = every medicine in the master EXCEPT this primary and
+    // any drug already sitting on another rx row (primary or combo).
+    final otherRxNames = <String>{
+      for (final x in rx) if (!identical(x, m)) x.name.toLowerCase(),
+      for (final x in rx) if (!identical(x, m))
+        for (final c in x.combos) c.name.toLowerCase(),
+    };
+    otherRxNames.add(m.name.toLowerCase());
+    final seen = <String>{};
+    final opts = <String>[];
+    for (final n in medOptions) {
+      final t = n.trim();
+      if (t.isEmpty) continue;
+      final k = t.toLowerCase();
+      if (otherRxNames.contains(k) || !seen.add(k)) continue;
+      opts.add(t);
+    }
+    final attached = {for (final c in m.combos) c.name};
+    final result = await showModalBottomSheet<List<String>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: C2.white,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _MultiComboEditSheet(
+        title: 'Combination medicines',
+        primaryName: m.name,
+        options: opts,
+        preSelected: attached,
+      ),
+    );
+    if (!mounted || result == null) return;
+    _parkFocus();
+    setState(() {
+      final keepSet = result.toSet();
+      // Keep any existing ComboMed still ticked (preserving its
+      // dosage), drop the rest, and append newly ticked names.
+      final existing = <String, ComboMed>{
+        for (final c in m.combos) c.name: c,
+      };
+      final next = <ComboMed>[
+        for (final name in result)
+          existing[name] ?? ComboMed(name: name),
+      ];
+      m.combos
+        ..clear()
+        ..addAll(next);
+      // Silence a lint about keepSet being unused when the loop above
+      // reads directly from result.
+      keepSet.length;
+    });
+  }
+
   Future<void> _addMed() async {
     print('[JC] Add Medicine TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
     final _tMed0 = DateTime.now().microsecondsSinceEpoch;
@@ -2040,7 +2133,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     final rows = p.previousRx.map((r) => _HistoryRow(cells: [
       r.date,
       r.medicine,
-      r.dosage.isEmpty ? '—' : r.dosage,
+      r.dosage.isEmpty ? '—' : displayDosage(r.dosage),
       r.frequency.isEmpty ? '—' : r.frequency,
       r.duration.isEmpty ? '—' : r.duration,
     ])).toList();
@@ -2317,6 +2410,161 @@ class _MultiPickerSheetState extends State<_MultiPickerSheet> {
 
 /// ICD-11 diagnosis search picker — flat list of Standard Term + ICD-11 code
 /// (no category / sub-category). Matches name, code AND synonyms.
+/// Manage-combos sheet: pre-tick every partner already attached to
+/// the primary, add unticks-as-remove + fresh-ticks-as-add, and
+/// return the full final list on Save. Same look as [_MultiPickerSheet]
+/// with a "Currently attached" section on top (user 2026-09-18).
+/// One line in the combination-medicines sheet — a section header, a
+/// tickable medicine, or the "nothing to add" note. Flattening the two
+/// sections into a single list is what lets one lazy ListView.builder
+/// serve the whole sheet (user 2026-09-22 slow-open fix).
+enum _ComboRowKind { header, medicine, empty }
+
+class _ComboRow {
+  final _ComboRowKind kind;
+  final String text;
+  const _ComboRow(this.kind, this.text);
+}
+
+class _MultiComboEditSheet extends StatefulWidget {
+  final String title;
+  final String primaryName;
+  final List<String> options;
+  final Set<String> preSelected;
+  const _MultiComboEditSheet({
+    required this.title,
+    required this.primaryName,
+    required this.options,
+    required this.preSelected,
+  });
+  @override
+  State<_MultiComboEditSheet> createState() => _MultiComboEditSheetState();
+}
+
+class _MultiComboEditSheetState extends State<_MultiComboEditSheet> {
+  String q = '';
+  late Set<String> _sel = {...widget.preSelected};
+  @override
+  Widget build(BuildContext context) {
+    final query = q.trim();
+    final ql = query.toLowerCase();
+    // Attached list stays at the top even while filtering, so the
+    // doctor can always un-tick a partner to remove it.
+    final attached = widget.preSelected.toList();
+    final addable = widget.options
+        .where((o) => !widget.preSelected.contains(o))
+        .where((o) => query.isEmpty || o.toLowerCase().contains(ql))
+        .toList();
+    // Both sections flattened once per build into the index-addressed
+    // list the ListView.builder below reads. Built here rather than in
+    // itemBuilder — recomputing it per row would be O(n²).
+    final items = _items(attached, addable, query);
+    final media = MediaQuery.of(context);
+    // Cap the sheet so its title never crosses under the status-bar
+    // notch (user 2026-09-18: "combined medicine dropdown is
+    // overlapping"). SafeArea on top does the pixel-perfect part.
+    return SafeArea(
+      top: true,
+      bottom: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: media.size.height * 0.85),
+        child: Padding(
+      padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: media.viewInsets.bottom + 16),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(widget.title,
+              style: ct(15, FontWeight.w700, C2.navy))),
+          Text('with ${widget.primaryName}',
+              style: ct(11.5, FontWeight.w500, C2.text2)),
+        ]),
+        const SizedBox(height: 6),
+        TextField(
+          autofocus: false,
+          decoration: cInput('Search medicines…')
+              .copyWith(prefixIcon: const Icon(Icons.search, size: 18)),
+          onChanged: (v) => setState(() => q = v),
+        ),
+        const SizedBox(height: 8),
+        // ONE lazy list for both sections (user 2026-09-22 "its opening
+        // very slow"). The master carries 253 medicines and every row
+        // holds a Checkbox, so the old SingleChildScrollView + Column
+        // built and laid out all 253 before the sheet could paint — and
+        // did it again on every keystroke and every tick. shrinkWrap
+        // stays lazy here because Flexible hands the list a bounded
+        // height, so only the visible rows are built. Same fix as the
+        // 799-symptom picker got on 2026-08-25.
+        Flexible(child: ListView.builder(
+          shrinkWrap: true,
+          itemCount: items.length,
+          itemBuilder: (_, i) {
+            final row = items[i];
+            return switch (row.kind) {
+              _ComboRowKind.header => Padding(
+                  padding: EdgeInsets.only(top: row.text == 'ADD MORE' ? 10 : 0, bottom: 4),
+                  child: Text(row.text, style: ct(10, FontWeight.w700, C2.text2))),
+              _ComboRowKind.empty => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(row.text, style: ct(13, FontWeight.w400, C2.text2))),
+              _ComboRowKind.medicine =>
+                  _row(row.text, ticked: _sel.contains(row.text)),
+            };
+          },
+        )),
+        const SizedBox(height: 10),
+        SizedBox(width: double.infinity, child: ElevatedButton(
+          onPressed: () => Navigator.pop(context, _sel.toList()),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: C2.navy, foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+          child: Text('Save (${_sel.length} attached)',
+              style: ct(13.5, FontWeight.w700, Colors.white)),
+        )),
+      ]),
+    ),
+      ),
+    );
+  }
+
+  /// Flatten "CURRENTLY ATTACHED" + "ADD MORE" into one indexable list
+  /// so a single lazy ListView can serve both sections.
+  List<_ComboRow> _items(List<String> attached, List<String> addable, String query) => [
+        if (attached.isNotEmpty) ...[
+          const _ComboRow(_ComboRowKind.header, 'CURRENTLY ATTACHED'),
+          for (final name in attached) _ComboRow(_ComboRowKind.medicine, name),
+        ],
+        _ComboRow(_ComboRowKind.header, attached.isEmpty ? 'ADD PARTNERS' : 'ADD MORE'),
+        if (addable.isEmpty)
+          _ComboRow(_ComboRowKind.empty, query.isEmpty
+              ? 'No more medicines to add.'
+              : 'No match in the master list.')
+        else
+          for (final name in addable) _ComboRow(_ComboRowKind.medicine, name),
+      ];
+
+  Widget _row(String name, {required bool ticked}) => InkWell(
+        onTap: () => setState(() {
+          if (ticked) { _sel.remove(name); } else { _sel.add(name); }
+        }),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(children: [
+            Checkbox(
+              value: ticked,
+              onChanged: (v) => setState(() {
+                if (v == true) { _sel.add(name); } else { _sel.remove(name); }
+              }),
+              visualDensity: VisualDensity.compact,
+              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            const SizedBox(width: 6),
+            Expanded(child: Text(name, style: ct(13.5, FontWeight.w500, C2.text))),
+          ]),
+        ),
+      );
+}
+
 class _DiseasePickerSheet extends StatefulWidget {
   const _DiseasePickerSheet();
   @override

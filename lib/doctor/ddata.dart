@@ -134,6 +134,42 @@ const String kDosageFormSep = ' · ';
   if (!kDosageForms.contains(head)) return (form: '', strength: stored);
   return (form: head, strength: stored.substring(ix + kDosageFormSep.length).trim());
 }
+/// The unit a dosage form is measured in. Tab / Cap are counted in mg;
+/// Syp / Gel / Cream are measured in ml.
+String doseUnitFor(String form) => dosageFormNeedsQty(form) ? 'mg' : 'ml';
+
+/// True when [strength] already carries its own unit, so appending one
+/// would read "500 mg mg". Covers rows typed before the unit became
+/// automatic, and master-derived strings like "100 mg".
+final RegExp _kHasUnit = RegExp(r'(mg|ml|mcg|iu|g)', caseSensitive: false);
+
+/// Render a bare strength with the unit its form implies.
+/// ("500", "Tab")   -> "500 mg"
+/// ("100", "Syp")   -> "100 ml"
+/// ("500 mg", "Tab")-> "500 mg"   ← already carries a unit, left alone
+/// ("", anything)   -> ""
+///
+/// The doctor and the pharmacist both type a bare number now — the form
+/// dropdown decides the unit and every screen appends it from here, so
+/// the unit is never stored and never has to be typed (user 2026-09-22
+/// "if we dont take mg or ml we will show automatic mg ml where need").
+String strengthWithUnit(String strength, String form) {
+  final s = strength.trim();
+  if (s.isEmpty) return '';
+  if (_kHasUnit.hasMatch(s)) return s;
+  return '$s ${doseUnitFor(form)}';
+}
+
+/// Render a STORED dosage column ("Tab · 500" or a bare "500") for
+/// display, keeping the form prefix and adding the implied unit:
+/// "Tab · 500" -> "Tab · 500 mg";  "Cream · 20" -> "Cream · 20 ml".
+String displayDosage(String stored) {
+  final parsed = parseDosage(stored);
+  final withUnit = strengthWithUnit(parsed.strength, parsed.form);
+  if (withUnit.isEmpty) return stored.trim();
+  return parsed.form.isEmpty ? withUnit : '${parsed.form}$kDosageFormSep$withUnit';
+}
+
 const List<String> kDurations = ['3','5','7','10 Days','14','30'];
 
 /// Score likely conditions from chosen symptoms + block geo prior.

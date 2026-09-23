@@ -323,6 +323,10 @@ class ReqLine {
   /// Server row id from GET /requisitions/{id} lines — what
   /// PATCH /requisitions/{id}/receive addresses its receipts to.
   final int? backendLineId;
+  /// Lines the pharmacist ordered as ONE combination strip share this
+  /// key, the same way [RxItem.comboKey] groups a doctor's combination
+  /// prescription. Empty for standalone lines (user 2026-09-22).
+  final String comboKey;
   ReqLine({
     required this.name, this.dosage = '', this.unit = 'Strip',
     required this.requested,
@@ -331,6 +335,7 @@ class ReqLine {
     this.isZonalAdded = false,
     this.status = 'Pending',
     this.backendLineId,
+    this.comboKey = '',
   });
 }
 
@@ -924,6 +929,7 @@ class CounsellorState extends ChangeNotifier {
         isZonalAdded: (l['added_by_cmo'] as bool?) ?? false,
         status: (l['status'] ?? 'Pending').toString(),
         backendLineId: (l['requisition_line_id'] as num?)?.toInt(),
+        comboKey: (l['combo_key'] ?? '').toString(),
       );
   final List<DeniedDelivery> deniedDeliveries = [];
   final List<AttendanceRecord> pharmaAttendance = [];

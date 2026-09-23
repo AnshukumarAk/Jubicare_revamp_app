@@ -26,7 +26,7 @@ import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList, kUploadsBase;
 import '../doctor/dshell.dart' show DocHeader, DocBottomNav;
-import '../doctor/ddata.dart' show kMedicineNames, parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty;
+import '../doctor/ddata.dart' show kMedicineNames, parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty, displayDosage, strengthWithUnit;
 import '../services/connectivity_service.dart';
 import '../services/deepgram_stt.dart';
 import '../services/attendance_store.dart';
@@ -565,27 +565,45 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
 /// semi-solid forms, "500 mg" for tablets/capsules. Blank stays blank
 /// so the caller decides how to show missing data (user 2026-09-14
 /// "Cream Clotrimazole showing 20 mg — should be ml").
-String _fmtReqDose(String stored) {
-  final s = stored.trim();
-  if (s.isEmpty) return '';
-  final parsed = parseDosage(s);
-  final strength = parsed.strength;
-  final form = parsed.form;
-  if (strength.isEmpty) return s; // no digits parseable — echo as-is
-  final unit = dosageFormNeedsQty(form) ? 'mg' : 'ml';
-  return form.isEmpty ? '$strength $unit' : '$form · $strength $unit';
+String _fmtReqDose(String stored) => displayDosage(stored);
+
+/// Collapse requisition lines that share a non-empty [ReqLine.comboKey]
+/// into one group; standalone lines come back as single-member groups.
+///
+/// The pharmacist orders a combination strip as N lines under one key
+/// (submit splits them that way), so listing them flat showed a
+/// three-drug strip as three unrelated indents — the same defect the
+/// doctor's prescription had on the Deliver Medicine screen
+/// (user 2026-09-22).
+List<List<ReqLine>> _comboGroups(List<ReqLine> items) {
+  final out = <List<ReqLine>>[];
+  final seen = <int>{};
+  for (var i = 0; i < items.length; i++) {
+    if (seen.contains(i)) continue;
+    final group = <ReqLine>[items[i]];
+    final key = items[i].comboKey.trim();
+    if (key.isNotEmpty) {
+      for (var j = i + 1; j < items.length; j++) {
+        if (!seen.contains(j) && items[j].comboKey.trim() == key) {
+          group.add(items[j]);
+          seen.add(j);
+        }
+      }
+    }
+    out.add(group);
+  }
+  return out;
 }
 
 String _displayNameWithDosage(RxItem m) {
   final form = m.dosageForm.trim();
-  var strength = m.dosage.trim();
   // Append the unit that matches the form so "Cream · 20" reads as
   // "Cream · 20 ml" on Deliver Medicine, not "20 mg" (user
   // 2026-09-14 "cream Clotrimazole showing 20 mg — should be ml").
-  // Skip if the doctor already wrote a unit in the strength.
-  if (strength.isNotEmpty && !RegExp(r'(mg|ml|mcg|iu|g)\b', caseSensitive: false).hasMatch(strength)) {
-    strength = '$strength ${dosageFormNeedsQty(form) ? 'mg' : 'ml'}';
-  }
+  // strengthWithUnit leaves a strength that already carries a unit
+  // alone, so rows typed before the unit became automatic still read
+  // correctly.
+  final strength = strengthWithUnit(m.dosage, form);
   final tail = [
     if (form.isNotEmpty) form,
     if (strength.isNotEmpty) strength,
@@ -850,12 +868,21 @@ class _PharmaDispenseState extends State<PharmaDispense> {
     );
   }
 
-  /// Lay out the prescription list, grouping any two lines that share
-  /// a non-empty [RxItem.comboKey] into ONE combination card — that
-  /// pair was written by the doctor as a single strip (Paracetamol +
-  /// Vitamin C) and the pharmacist should not tick two rows for one
-  /// physical item (user 2026-09-12). Standalone lines fall back to
-  /// the existing single-line renderer.
+  /// Lay out the prescription list, grouping EVERY line that shares a
+  /// non-empty [RxItem.comboKey] into ONE combination card — those
+  /// lines were written by the doctor as a single strip and the
+  /// pharmacist should not tick several rows for one physical item
+  /// (user 2026-09-12).
+  ///
+  /// Originally this took the FIRST matching partner and stopped, which
+  /// was right when a combo was always a pair. The doctor screen went
+  /// multi-combo on 2026-09-15 (N partners on one strip) and this was
+  /// never widened to match: a Paracetamol + Vitamin C + Vitamin B
+  /// Complex prescription grouped the first two and left Vitamin B
+  /// Complex sitting in a card of its own, as if it were a separate
+  /// item to hand over (user 2026-09-22). Now it collects the whole
+  /// group. Standalone lines still fall back to the single-line
+  /// renderer.
   List<Widget> _medRows(List<RxItem> items) {
     final out = <Widget>[];
     final seen = <int>{};
@@ -863,16 +890,15 @@ class _PharmaDispenseState extends State<PharmaDispense> {
       if (seen.contains(i)) continue;
       final m = items[i];
       if (m.comboKey.trim().isNotEmpty) {
-        RxItem? partner;
+        final group = <RxItem>[m];
         for (var j = i + 1; j < items.length; j++) {
           if (!seen.contains(j) && items[j].comboKey == m.comboKey) {
-            partner = items[j];
+            group.add(items[j]);
             seen.add(j);
-            break;
           }
         }
-        if (partner != null) {
-          out.add(_comboMedRow(m, partner));
+        if (group.length > 1) {
+          out.add(_comboMedRow(group));
           continue;
         }
       }
@@ -881,14 +907,18 @@ class _PharmaDispenseState extends State<PharmaDispense> {
     return out;
   }
 
-  /// Card for a combination pair: single title "A + B", shared
-  /// Prescribed line and DELIVERED QTY. The typed qty writes to BOTH
-  /// RxItems so the existing per-line dispense payload stays valid.
-  Widget _comboMedRow(RxItem a, RxItem b) {
+  /// Card for a combination strip of any size: single title
+  /// "A + B + C", shared Prescribed line and DELIVERED QTY. The typed
+  /// qty writes to EVERY RxItem in the group so the existing per-line
+  /// dispense payload stays valid.
+  Widget _comboMedRow(List<RxItem> group) {
+    final a = group.first;
     final changed = a.dispensedQty != a.qty;
-    final stockA = _stockOf(a.name);
-    final stockB = _stockOf(b.name);
-    final short = stockA < a.qty || stockB < b.qty;
+    final stocks = [for (final m in group) _stockOf(m.name)];
+    final short = [
+      for (var i = 0; i < group.length; i++)
+        if (stocks[i] < group[i].qty) true
+    ].isNotEmpty;
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
@@ -896,9 +926,9 @@ class _PharmaDispenseState extends State<PharmaDispense> {
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
           Expanded(child: Text(
-              '${_displayNameWithDosage(a)} + ${_displayNameWithDosage(b)}',
+              group.map(_displayNameWithDosage).join(' + '),
               style: ct(13, FontWeight.w600, C2.text))),
-          CBadge('Stock: $stockA / $stockB',
+          CBadge('Stock: ${stocks.join(' / ')}',
               bg: short ? const Color(0xFFFFE6E6) : const Color(0xFFEDF7E0),
               fg: short ? C2.danger : C2.green),
           const SizedBox(width: 6),
@@ -915,8 +945,7 @@ class _PharmaDispenseState extends State<PharmaDispense> {
               textAlign: TextAlign.center, style: ct(13, FontWeight.w500, C2.text), decoration: cInput(),
               onChanged: (v) => setState(() {
                 final n = int.tryParse(v) ?? 0;
-                a.dispensedQty = n;
-                b.dispensedQty = n;
+                for (final m in group) { m.dispensedQty = n; }
               }))),
           ])),
         ]),
@@ -928,17 +957,19 @@ class _PharmaDispenseState extends State<PharmaDispense> {
             style: ct(12.5, FontWeight.w400, C2.text),
             items: [ for (final o in _kReasonOptions) DropdownMenuItem(value: o, child: Text(o)) ],
             onChanged: (v) => setState(() {
-              _reasonChoice[a] = v;
-              _reasonChoice[b] = v;
               final text = (v == null || v == 'Other') ? '' : v;
-              _reasonCtl(a).text = text;
-              _reasonCtl(b).text = text;
+              for (final m in group) {
+                _reasonChoice[m] = v;
+                _reasonCtl(m).text = text;
+              }
             }),
           )),
           if (_reasonChoice[a] == 'Other')
             Padding(padding: const EdgeInsets.only(top: 6), child: TextField(controller: _reasonCtl(a),
               decoration: cInput('Enter reason *'), style: ct(12.5, FontWeight.w400, C2.text),
-              onChanged: (v) => setState(() { _reasonCtl(b).text = v; }))),
+              onChanged: (v) => setState(() {
+                for (final m in group.skip(1)) { _reasonCtl(m).text = v; }
+              }))),
         ],
       ]),
     );
@@ -1020,8 +1051,26 @@ class _Req {
   /// server payload as part of the `dosage` string ("Tab · 500 mg")
   /// so no requisition schema change is needed.
   String dosageForm;
+  /// Zero, one, or many combination partners — pharmacist can order a
+  /// combination strip (Paracetamol + Vitamin C, both Tab · 500 mg)
+  /// as one deliverable (user 2026-09-18 "pharmacist can also request
+  /// combined medicine in requisition"). Every partner shares this
+  /// row's dosage form + qty; each carries its own strength text.
+  /// Submit splits these into N lines with a shared combo_key so a
+  /// future server-side grouping can pick them up without a mobile
+  /// resubmit.
+  List<_ReqCombo> combos;
   _Req({this.name, this.dosage = '', this.unit = 'Strip', this.qty = '10',
-        this.dosageForm = 'Tab'});
+        this.dosageForm = 'Tab', List<_ReqCombo>? combos})
+      : combos = combos ?? <_ReqCombo>[];
+}
+
+/// One combination partner on a requisition row. Frequency / qty /
+/// dosage form come from the parent; only the strength is per-partner.
+class _ReqCombo {
+  String name;
+  String dosage;
+  _ReqCombo({required this.name, this.dosage = ''});
 }
 
 const List<String> _kMedUnits = ['Tab', 'Strip', 'Bottle', 'Vial', 'Sachet', 'ml', 'Ampoule', 'Tube', 'Piece'];
@@ -1424,11 +1473,32 @@ class _PharmaStockState extends State<PharmaStock> {
     return CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       ...reqItems.asMap().entries.map((e) => Padding(padding: const EdgeInsets.only(bottom: 10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Expanded(child: CField('Medicine', InkWell(
+          Expanded(child: CField(
+              e.value.combos.isEmpty
+                  ? 'Medicine'
+                  : 'Combined: ${e.value.name ?? ''}${e.value.combos.map((c) => ' + ${c.name}').join()}',
+              InkWell(
             onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
             child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
               child: Text(e.value.name ?? 'Select Medicine', overflow: TextOverflow.ellipsis,
                 style: ct(13, e.value.name == null ? FontWeight.w400 : FontWeight.w500, e.value.name == null ? C2.text3 : C2.text)))), required: true)),
+          // Edit combo — bare pencil icon (user 2026-09-18 "remove
+          // rounded circle"). Disabled until a primary is picked.
+          //
+          // 42x42 tap target behind a 20px glyph — the doctor screen's
+          // identical pencil was reported dead (user 2026-09-22) and
+          // measured at a 28x28 hit box, small enough that a finger
+          // aimed at the icon regularly landed beside it. Same fix
+          // here, since this row's pencil was built from the same code.
+          InkWell(
+            onTap: e.value.name == null ? null : () => _editReqCombos(e.value),
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              width: 42, height: 42,
+              child: Icon(Icons.edit, size: 20,
+                  color: e.value.name == null ? C2.text3 : C2.navy),
+            ),
+          ),
           if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key)), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         Row(children: [
@@ -1477,6 +1547,26 @@ class _PharmaStockState extends State<PharmaStock> {
             onChanged: (v) => e.value.qty = v,
           ), required: true)),
         ]),
+        // Combination partner rows — one dosage input per attached
+        // partner. No inline X: the pencil edit icon above owns
+        // add / remove (user 2026-09-18 "dont do option every
+        // medicine cross icon").
+        for (final c in e.value.combos)
+          Padding(padding: const EdgeInsets.only(top: 4),
+            child: CField(
+              '${c.name} Dosage',
+              TextField(
+                controller: TextEditingController(text: c.dosage),
+                decoration: cInput('e.g. 500'),
+                keyboardType: dosageFormNeedsQty(e.value.dosageForm)
+                    ? TextInputType.number
+                    : const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: [LengthLimitingTextInputFormatter(12)],
+                onChanged: (v) => c.dosage = v,
+              ),
+              required: true,
+            ),
+          ),
       ]))),
       COutlineButton('Add More', icon: Icons.add_circle_outline, onTap: () => setState(() => reqItems.add(_Req()))),
       const SizedBox(height: 8),
@@ -1503,6 +1593,16 @@ class _PharmaStockState extends State<PharmaStock> {
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     if (valid.isEmpty) return err('Select at least one medicine + qty');
     if (valid.any((p) => p.draft.dosage.trim().isEmpty)) return err('Enter dosage for every medicine');
+    // Combination partner needs its own dosage — same rule as the
+    // primary row (user 2026-09-18).
+    for (final p in valid) {
+      final missing = p.draft.combos.firstWhere(
+          (c) => c.dosage.trim().isEmpty,
+          orElse: () => _ReqCombo(name: ''));
+      if (missing.name.isNotEmpty) {
+        return err('Enter dosage for ${missing.name}');
+      }
+    }
     setState(() => _submittingReq = true);
     final s = context.read<CounsellorState>();
     final api = context.read<RequisitionsApi>();
@@ -1510,20 +1610,36 @@ class _PharmaStockState extends State<PharmaStock> {
     // items so the requisition list reads back as "Tab · 500" and
     // pharmacist reports can group by form without parsing free
     // text (user 2026-09-14).
-    String _fmtDosage(_Req d) {
-      final s = d.dosage.trim();
+    String _fmt(String form, String strength) {
+      final s = strength.trim();
       if (s.isEmpty) return '';
-      if (d.dosageForm.isEmpty) return s;
-      return '${d.dosageForm}$kDosageFormSep$s';
+      if (form.isEmpty) return s;
+      return '$form$kDosageFormSep$s';
     }
-    final lines = [
-      for (final p in valid)
-        {
-          'medicine_name': p.draft.name,
-          'dosage':        _fmtDosage(p.draft),
+    // Combination strip = N lines that share a combo_key so a future
+    // server-side grouping can pick them up. The key is ignored by
+    // older backends without breaking anything (user 2026-09-18).
+    final lines = <Map<String, dynamic>>[];
+    var comboSeq = 0;
+    for (final p in valid) {
+      final key = p.draft.combos.isEmpty
+          ? ''
+          : 'rc${DateTime.now().millisecondsSinceEpoch}_${comboSeq++}';
+      lines.add({
+        'medicine_name': p.draft.name,
+        'dosage':        _fmt(p.draft.dosageForm, p.draft.dosage),
+        'requested_qty': p.qty,
+        if (key.isNotEmpty) 'combo_key': key,
+      });
+      for (final c in p.draft.combos) {
+        lines.add({
+          'medicine_name': c.name,
+          'dosage':        _fmt(p.draft.dosageForm, c.dosage),
           'requested_qty': p.qty,
-        }
-    ];
+          'combo_key':     key,
+        });
+      }
+    }
     try {
       await api.create(lines: lines);
       if (!mounted) return;
@@ -1557,10 +1673,25 @@ class _PharmaStockState extends State<PharmaStock> {
           id: localId,
           date: fmtDate(now),
           status: 'pending_zi',
-          items: valid.map((p) => ReqLine(
-            name: p.draft.name!, dosage: _fmtDosage(p.draft), unit: p.draft.unit,
-            requested: p.qty, status: 'Pending',
-          )).toList(),
+          items: [
+            for (final p in valid) ...[
+              ReqLine(
+                name: p.draft.name!,
+                dosage: _fmt(p.draft.dosageForm, p.draft.dosage),
+                unit: p.draft.unit,
+                requested: p.qty,
+                status: 'Pending',
+              ),
+              for (final c in p.draft.combos)
+                ReqLine(
+                  name: c.name,
+                  dosage: _fmt(p.draft.dosageForm, c.dosage),
+                  unit: p.draft.unit,
+                  requested: p.qty,
+                  status: 'Pending',
+                ),
+            ],
+          ],
           audit: [AuditEntry(when: now, actor: 'Pharmacist', action: 'Submitted (offline)')],
         ));
         if (!mounted) return;
@@ -1679,6 +1810,196 @@ class _PharmaStockState extends State<PharmaStock> {
   Future<String?> _pickMed() => showModalBottomSheet<String>(context: context, isScrollControlled: true, backgroundColor: C2.white,
     shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
     builder: (_) => const _MedPicker());
+
+  /// Manage combos for a requisition row — pre-tick already attached
+  /// partners, tick more to add, untick to remove, Save applies the
+  /// diff (user 2026-09-18 "pharmacist can also request combined
+  /// medicine in requisition").
+  Future<void> _editReqCombos(_Req r) async {
+    if (r.name == null) return;
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final taken = <String>{
+      r.name!.toLowerCase(),
+      for (final other in reqItems)
+        if (!identical(other, r) && other.name != null) other.name!.toLowerCase(),
+    };
+    final seen = <String>{};
+    final opts = <String>[];
+    for (final n in pool) {
+      final t = n.trim();
+      if (t.isEmpty) continue;
+      final k = t.toLowerCase();
+      if (taken.contains(k) || !seen.add(k)) continue;
+      opts.add(t);
+    }
+    final attached = {for (final c in r.combos) c.name};
+    final result = await showModalBottomSheet<List<String>>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: C2.white,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => _ReqComboEditSheet(
+        title: 'Combination medicines',
+        primaryName: r.name!,
+        options: opts,
+        preSelected: attached,
+      ),
+    );
+    if (!mounted || result == null) return;
+    setState(() {
+      final existing = <String, _ReqCombo>{
+        for (final c in r.combos) c.name: c,
+      };
+      r.combos
+        ..clear()
+        ..addAll([
+          for (final name in result)
+            existing[name] ?? _ReqCombo(name: name),
+        ]);
+    });
+  }
+}
+
+/// Manage-combos sheet for the pharmacist requisition form. Mirrors
+/// the doctor's `_MultiComboEditSheet` in dcase.dart but keeps
+/// pshell.dart self-contained (user 2026-09-18).
+/// One line in the pharmacist's combination-medicines sheet. Mirrors the
+/// doctor screen's `_ComboRow`; kept local so pshell.dart stays
+/// self-contained.
+enum _PComboRowKind { header, medicine, empty }
+
+class _PComboRow {
+  final _PComboRowKind kind;
+  final String text;
+  const _PComboRow(this.kind, this.text);
+}
+
+class _ReqComboEditSheet extends StatefulWidget {
+  final String title;
+  final String primaryName;
+  final List<String> options;
+  final Set<String> preSelected;
+  const _ReqComboEditSheet({
+    required this.title,
+    required this.primaryName,
+    required this.options,
+    required this.preSelected,
+  });
+  @override
+  State<_ReqComboEditSheet> createState() => _ReqComboEditSheetState();
+}
+
+class _ReqComboEditSheetState extends State<_ReqComboEditSheet> {
+  String q = '';
+  late Set<String> _sel = {...widget.preSelected};
+  @override
+  Widget build(BuildContext context) {
+    final query = q.trim();
+    final ql = query.toLowerCase();
+    final attached = widget.preSelected.toList();
+    final addable = widget.options
+        .where((o) => !widget.preSelected.contains(o))
+        .where((o) => query.isEmpty || o.toLowerCase().contains(ql))
+        .toList();
+    // Flattened once per build — see the doctor sheet's copy of this
+    // comment. Recomputing it inside itemBuilder would be O(n²).
+    final items = <_PComboRow>[
+      if (attached.isNotEmpty) ...[
+        const _PComboRow(_PComboRowKind.header, 'CURRENTLY ATTACHED'),
+        for (final name in attached) _PComboRow(_PComboRowKind.medicine, name),
+      ],
+      _PComboRow(_PComboRowKind.header, attached.isEmpty ? 'ADD PARTNERS' : 'ADD MORE'),
+      if (addable.isEmpty)
+        _PComboRow(_PComboRowKind.empty, query.isEmpty
+            ? 'No more medicines to add.'
+            : 'No match in the master list.')
+      else
+        for (final name in addable) _PComboRow(_PComboRowKind.medicine, name),
+    ];
+    final media = MediaQuery.of(context);
+    return SafeArea(
+      top: true,
+      bottom: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: media.size.height * 0.85),
+        child: Padding(
+      padding: EdgeInsets.only(left: 16, right: 16, top: 14,
+          bottom: media.viewInsets.bottom + 16),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text(widget.title,
+              style: ct(15, FontWeight.w700, C2.navy))),
+          Text('with ${widget.primaryName}',
+              style: ct(11.5, FontWeight.w500, C2.text2)),
+        ]),
+        const SizedBox(height: 6),
+        TextField(
+          decoration: cInput('Search medicines…')
+              .copyWith(prefixIcon: const Icon(Icons.search, size: 18)),
+          onChanged: (v) => setState(() => q = v),
+        ),
+        const SizedBox(height: 8),
+        // Lazy — the medicine master is 253 rows and each carries a
+        // Checkbox; building them all up front is what made this sheet
+        // slow to open (user 2026-09-22).
+        Flexible(child: ListView.builder(
+          shrinkWrap: true,
+          itemCount: items.length,
+          itemBuilder: (_, i) {
+            final row = items[i];
+            return switch (row.kind) {
+              _PComboRowKind.header => Padding(
+                  padding: EdgeInsets.only(top: row.text == 'ADD MORE' ? 10 : 0, bottom: 4),
+                  child: Text(row.text, style: ct(10, FontWeight.w700, C2.text2))),
+              _PComboRowKind.empty => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  child: Text(row.text, style: ct(13, FontWeight.w400, C2.text2))),
+              _PComboRowKind.medicine => _row(row.text),
+            };
+          },
+        )),
+        const SizedBox(height: 10),
+        SizedBox(width: double.infinity, child: ElevatedButton(
+          onPressed: () => Navigator.pop(context, _sel.toList()),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: C2.navy, foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+          child: Text('Save (${_sel.length} attached)',
+              style: ct(13.5, FontWeight.w700, Colors.white)),
+        )),
+      ]),
+    ),
+      ),
+    );
+  }
+
+  Widget _row(String name) {
+    final ticked = _sel.contains(name);
+    return InkWell(
+      onTap: () => setState(() {
+        if (ticked) { _sel.remove(name); } else { _sel.add(name); }
+      }),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(children: [
+          Checkbox(
+            value: ticked,
+            onChanged: (v) => setState(() {
+              if (v == true) { _sel.add(name); } else { _sel.remove(name); }
+            }),
+            visualDensity: VisualDensity.compact,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          const SizedBox(width: 6),
+          Expanded(child: Text(name, style: ct(13.5, FontWeight.w500, C2.text))),
+        ]),
+      ),
+    );
+  }
 }
 
 /// Requisition detail — four stacked sections (Requested / Approved / Zonal Incharge
@@ -1745,7 +2066,8 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
             const SizedBox(height: 12),
             Text('Requested Medicines', style: ct(12.5, FontWeight.w700, C2.navy)),
             const SizedBox(height: 2),
-            ...[...req.requestedItems, ...req.zonalAddedItems].map(_mergedRow),
+            ..._comboGroups([...req.requestedItems, ...req.zonalAddedItems])
+                .map(_mergedRow),
           ])),
 
           // ── Section: Received / verification ─────────
@@ -1836,14 +2158,18 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           Expanded(flex: 2, child: Text('APPROVED', textAlign: TextAlign.center, style: ct(10, FontWeight.w700, Colors.white))),
           Expanded(flex: 3, child: Text('RECEIVED', textAlign: TextAlign.center, style: ct(10, FontWeight.w700, Colors.white))),
         ])),
-      ...rows.map((i) => Container(
+      // Same grouping as the Requested list — a combination strip is one
+      // physical delivery, so it gets ONE received box (user 2026-09-22).
+      ..._comboGroups(rows).map((group) { final i = group.first; return Container(
         padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
         decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.border))),
         child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
           Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(i.name + (i.isZonalAdded ? '  ★' : ''), style: ct(12, FontWeight.w700, C2.text)),
-            if (i.dosage.isNotEmpty)
-              Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
+            Text(group.map((l) => l.name).join(' + ') + (i.isZonalAdded ? '  ★' : ''),
+                style: ct(12, FontWeight.w700, C2.text)),
+            if (group.any((l) => l.dosage.isNotEmpty))
+              Text(group.map((l) => _fmtReqDose(l.dosage)).join(' + '),
+                  style: ct(10.5, FontWeight.w400, C2.text2)),
           ])),
           Expanded(flex: 2, child: Text('${i.approvedQty > 0 ? i.approvedQty : i.requested}', textAlign: TextAlign.center, style: ct(11.5, FontWeight.w700, C2.text))),
           Expanded(flex: 3, child: SizedBox(height: 34, child: TextFormField(
@@ -1853,10 +2179,14 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
             inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)],
             style: ct(12, FontWeight.w700, C2.text),
             decoration: cInput().copyWith(contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6)),
-            onChanged: (v) { i.received = int.tryParse(v) ?? 0; s.updateRequisitions(); },
+            onChanged: (v) {
+              final n = int.tryParse(v) ?? 0;
+              for (final l in group) { l.received = n; }
+              s.updateRequisitions();
+            },
           ))),
         ]),
-      )),
+      ); }),
       const SizedBox(height: 10),
       // Invoice attachment. The button flips label + colour once a file is
       // captured so the pharmacist can tell verification is unblocked. On a
@@ -1989,7 +2319,10 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
   /// approvedQty semantics: -1 = no per-line decision recorded (web-portal
   /// approvals often skip per-line qtys) -> show '—', NOT "Rejected"
   /// (display bug fixed 2026-08-21); 0 = rejected; >0 = approved qty.
-  Widget _mergedRow(ReqLine i) {
+  /// One row per deliverable. [group] is a combination strip's lines
+  /// (they share qty and approval) or a single standalone line.
+  Widget _mergedRow(List<ReqLine> group) {
+    final i = group.first;
     final pending = req.status == 'pending_zi';
     // Web-portal approvals often record NO per-line quantity (0 / null on
     // every line). When the requisition as a whole is approved and no line
@@ -2018,10 +2351,11 @@ class _RequisitionDetailState extends State<_RequisitionDetail> {
           border: Border(bottom: BorderSide(color: C2.border))),
       child: Row(children: [
         Expanded(flex: 4, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(i.name + (i.isZonalAdded ? '  ★' : ''),
+          Text(group.map((l) => l.name).join(' + ') + (i.isZonalAdded ? '  ★' : ''),
               style: ct(12.5, FontWeight.w700, C2.text)),
-          if (i.dosage.isNotEmpty)
-            Text(_fmtReqDose(i.dosage), style: ct(10.5, FontWeight.w400, C2.text2)),
+          if (group.any((l) => l.dosage.isNotEmpty))
+            Text(group.map((l) => _fmtReqDose(l.dosage)).join(' + '),
+                style: ct(10.5, FontWeight.w400, C2.text2)),
           if (i.zonalRemark.isNotEmpty)
             Text('Note: ${i.zonalRemark}', style: ct(10.5, FontWeight.w500, C2.text2)),
         ])),
@@ -2263,7 +2597,7 @@ class _PharmaReportState extends State<PharmaReport> {
   Future<void> _exportPatientPdf(List<CPatient> dispensed, int denied) async {
     // One row per dispensed medicine: Date, Patient, Diagnosis, Medicine, Dosage, Frequency, Qty.
     String dose(RxItem m) {
-      if (m.dosage.trim().isNotEmpty) return m.dosage;
+      if (m.dosage.trim().isNotEmpty) return displayDosage(m.dosage);
       final (_, d) = splitMedicine(m.name); // derive strength from the name if missing
       return d.isEmpty ? '-' : d;
     }

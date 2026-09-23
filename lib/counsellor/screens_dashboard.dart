@@ -12,6 +12,10 @@ import '../api/sync_service.dart';
 import 'cw.dart';
 import 'cdata.dart';
 import 'cstate.dart';
+// displayDosage: renders a stored dosage with the unit its form
+// implies, so this screen shows "Tab · 500 mg" for a doctor who only
+// typed 500 (user 2026-09-22).
+import '../doctor/ddata.dart' show displayDosage;
 
 class CounDashboard extends StatelessWidget {
   final VoidCallback onRegister;
@@ -417,7 +421,10 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                   child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     const Padding(padding: EdgeInsets.only(top: 4, right: 6), child: Icon(Icons.medication_outlined, size: 14, color: C2.cyan)),
                     Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(m.dosage.isEmpty ? m.name : '${m.name} · ${m.dosage}', style: ct(13, FontWeight.w600, C2.text)),
+                      Text(displayDosage(m.dosage).isEmpty
+                              ? m.name
+                              : '${m.name} · ${displayDosage(m.dosage)}',
+                          style: ct(13, FontWeight.w600, C2.text)),
                       Text('${m.interval} · ${m.days} · Qty ${m.qty}', style: ct(11.5, FontWeight.w400, C2.text2)),
                     ])),
                   ]))),

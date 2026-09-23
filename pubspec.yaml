@@ -1,7 +1,7 @@
 name: jubicare_mmu
 description: JubiCare MMU mobile prototype — Counselor, Doctor, Pharmacist workflow with modernized UI, simulated voice capture and AI clinical decision support.
 publish_to: 'none'
-version: 0.23.0+50
+version: 0.24.0+51
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
