@@ -14,7 +14,9 @@ import '../api/attendance_api.dart';
 import '../api/auth_api.dart';
 import '../api/camps_api.dart';
 import '../api/masters_store.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
@@ -386,8 +388,11 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     if (state == AppLifecycleState.resumed) _refreshFromBackend();
   }
 
-  /// Pull-to-refresh from the shell. Always fetches.
-  Future<void> refreshNow() => _refreshFromBackend(immediate: true);
+  /// Pull-to-refresh from the shell. Always fetches, and always fetches
+  /// EVERYTHING — this is the doctor asking directly, and it should be the
+  /// one gesture that cannot leave anything behind. Deltas resume from the
+  /// result.
+  Future<void> refreshNow() => _refreshFromBackend(immediate: true, full: true);
 
   /// Home tab re-selected. Throttled — tapping between tabs shouldn't hammer
   /// the API.
@@ -440,7 +445,15 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     } catch (_) {/* first run — nothing cached yet */}
   }
 
-  Future<void> _refreshFromBackend({bool immediate = false}) async {
+  /// Where the next delta starts, as the server's own `cursor` string.
+  ///
+  /// Null means "load the whole thing". Deliberately NOT persisted: every
+  /// app start therefore begins with a full load, so anything a delta could
+  /// get wrong cannot outlive one session. It does survive tab switches,
+  /// because the shell keeps these pages in an IndexedStack.
+  String? _cursor;
+
+  Future<void> _refreshFromBackend({bool immediate = false, bool full = false}) async {
     if (_refreshing || !mounted) return;
     final last = _lastFetchAt;
     if (!immediate && last != null && DateTime.now().difference(last) < _minGap) {
@@ -449,38 +462,97 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     _lastFetchAt = DateTime.now();
     setState(() { _refreshing = true; _lastError = null; });
     try {
-      final api = context.read<QueuesApi>();
-      // Silent-on-failure (user 2026-08-26: banner didn't clear even
-      // after server came back). Cached list stays on screen; retry is
-      // one tap away. Primary queue failure returns early — banner was
-      // already cleared at start.
-      QueueList queue;
-      try {
-        queue = await api.doctorQueue(limit: 200);
-      } catch (_) {
-        return;
-      }
-      Future<QueueList> safe(Future<QueueList> f) =>
-          f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
-      final results = await Future.wait([
-        safe(api.doctorAttended(limit: 200)),
-        safe(api.pendingPayment(limit: 200)),
-        safe(api.labQueue(limit: 200)),
-      ]);
-      if (!mounted) return;
-      final store = context.read<CounsellorState>();
-      final combined = [
-        ...queue.items,
-        for (final r in results) ...r.items,
-      ];
-      store.mergeBackendPatients(combined);
-      try {
-        final cache = await PatientsCacheStore.open();
-        await cache.save(_doctorCacheKey, combined);
-      } catch (_) {/* best-effort */}
+      if (!full && _cursor != null && await _refreshDelta()) return;
+      await _refreshEverything();
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The four queue endpoints together return up to 800 rows, on a thirty
+  /// second timer and again on every FCM ping, to answer "did anything
+  /// happen" — and usually nothing did. This asks the question directly and
+  /// most of the time gets an empty list back.
+  ///
+  /// `/mobile/sync/pull` rather than `updated_since` on the queues: the queue
+  /// views filter by status BEFORE the timestamp, so a visit that moves on
+  /// simply stops appearing and the handset never learns to drop it. The sync
+  /// view filters only by team, so a visit that moves comes back wearing its
+  /// new status and mergeBackendPatients re-files it. Rows in statuses this
+  /// screen doesn't show are kept rather than filtered out, for exactly that
+  /// reason — dropping them here is how a patient gets stuck in the queue.
+  ///
+  /// Returns false to mean "fall back to a full load", which is the answer to
+  /// anything unexpected: the full path is bounded and known-good.
+  Future<bool> _refreshDelta() async {
+    final cursor = _cursor;
+    if (cursor == null) return false;
+    final PullResponse res;
+    try {
+      res = await context.read<SyncApi>()
+          .pull(updatedSinceRaw: cursor, perPage: 200);
+    } catch (_) {
+      return false;
+    }
+    if (!mounted) return true;
+    // A full page means more is waiting. Paging through it would be slower
+    // than the full load and has more ways to go wrong, so hand over.
+    if (res.hasMore) return false;
+    if (res.appointments.isNotEmpty) {
+      context.read<CounsellorState>().mergeBackendPatients(
+            [for (final r in res.appointments) queueShapeFromSyncRow(r)],
+            // Update in place and insert what's new — never wipe. The delta
+            // only carries what changed, so clearing first would empty the
+            // screen.
+            additive: true,
+          );
+    }
+    if (res.cursor.isNotEmpty) _cursor = res.cursor;
+    return true;
+  }
+
+  /// The whole picture: four status-scoped queues, bounded and known-good.
+  ///
+  /// Runs at app start, on pull-to-refresh, and whenever a delta declines.
+  /// Also what re-seeds the cursor — and what quietly repairs anything the
+  /// deltas missed, such as a visit soft-deleted on the server, which by
+  /// definition never comes back in a list of changed rows.
+  Future<void> _refreshEverything() async {
+    final api = context.read<QueuesApi>();
+    // Silent-on-failure (user 2026-08-26: banner didn't clear even
+    // after server came back). Cached list stays on screen; retry is
+    // one tap away. Primary queue failure returns early — banner was
+    // already cleared at start.
+    QueueList queue;
+    try {
+      queue = await api.doctorQueue(limit: 200);
+    } catch (_) {
+      return;
+    }
+    Future<QueueList> safe(Future<QueueList> f) =>
+        f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    final results = await Future.wait([
+      safe(api.doctorAttended(limit: 200)),
+      safe(api.pendingPayment(limit: 200)),
+      safe(api.labQueue(limit: 200)),
+    ]);
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final combined = [
+      ...queue.items,
+      for (final r in results) ...r.items,
+    ];
+    store.mergeBackendPatients(combined);
+    // Start the next delta from the newest row we were actually given, never
+    // from this handset's clock — a cursor running ahead of the server skips
+    // rows permanently, one running behind costs a few duplicates.
+    _cursor = newestUpdatedAt(combined);
+    try {
+      final cache = await PatientsCacheStore.open();
+      await cache.save(_doctorCacheKey, combined);
+    } catch (_) {/* best-effort */}
   }
 
   @override

@@ -58,6 +58,11 @@ dependencies:
   timezone: ^0.11.1
   firebase_messaging: ^15.2.10
 dev_dependencies:
+  # Dev only — nothing here is compiled into the APK. Added 2026-09-26 so the
+  # sync-row adapter has tests; the two test files under test/ predate it and
+  # could not run without it.
+  flutter_test:
+    sdk: flutter
   flutter_lints: ^3.0.0
   # Generates the Android launcher icon from a single source PNG. Run after
   # every icon change:  flutter pub run flutter_launcher_icons
