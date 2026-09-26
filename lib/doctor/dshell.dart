@@ -445,13 +445,11 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     } catch (_) {/* first run — nothing cached yet */}
   }
 
-  /// Where the next delta starts, as the server's own `cursor` string.
-  ///
-  /// Null means "load the whole thing". Deliberately NOT persisted: every
-  /// app start therefore begins with a full load, so anything a delta could
-  /// get wrong cannot outlive one session. It does survive tab switches,
-  /// because the shell keeps these pages in an IndexedStack.
-  String? _cursor;
+  /// Where the next delta starts. Deliberately NOT persisted: every app start
+  /// therefore begins with a full load, so anything a delta could get wrong
+  /// cannot outlive one session. It does survive tab switches, because the
+  /// shell keeps these pages in an IndexedStack.
+  final _delta = QueueDelta();
 
   Future<void> _refreshFromBackend({bool immediate = false, bool full = false}) async {
     if (_refreshing || !mounted) return;
@@ -462,7 +460,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     _lastFetchAt = DateTime.now();
     setState(() { _refreshing = true; _lastError = null; });
     try {
-      if (!full && _cursor != null && await _refreshDelta()) return;
+      if (!full && await _refreshDelta()) return;
       await _refreshEverything();
     } finally {
       if (mounted) setState(() => _refreshing = false);
@@ -487,29 +485,15 @@ class _DoctorDashboardState extends State<DoctorDashboard>
   /// Returns false to mean "fall back to a full load", which is the answer to
   /// anything unexpected: the full path is bounded and known-good.
   Future<bool> _refreshDelta() async {
-    final cursor = _cursor;
-    if (cursor == null) return false;
-    final PullResponse res;
-    try {
-      res = await context.read<SyncApi>()
-          .pull(updatedSinceRaw: cursor, perPage: 200);
-    } catch (_) {
-      return false;
-    }
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
     if (!mounted) return true;
-    // A full page means more is waiting. Paging through it would be slower
-    // than the full load and has more ways to go wrong, so hand over.
-    if (res.hasMore) return false;
-    if (res.appointments.isNotEmpty) {
-      context.read<CounsellorState>().mergeBackendPatients(
-            [for (final r in res.appointments) queueShapeFromSyncRow(r)],
-            // Update in place and insert what's new — never wipe. The delta
-            // only carries what changed, so clearing first would empty the
-            // screen.
-            additive: true,
-          );
+    if (rows.isNotEmpty) {
+      // Update in place and insert what's new — never wipe. The delta only
+      // carries what changed, so clearing first would empty the screen.
+      context.read<CounsellorState>()
+          .mergeBackendPatients(rows, additive: true);
     }
-    if (res.cursor.isNotEmpty) _cursor = res.cursor;
     return true;
   }
 
@@ -545,10 +529,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       for (final r in results) ...r.items,
     ];
     store.mergeBackendPatients(combined);
-    // Start the next delta from the newest row we were actually given, never
-    // from this handset's clock — a cursor running ahead of the server skips
-    // rows permanently, one running behind costs a few duplicates.
-    _cursor = newestUpdatedAt(combined);
+    _delta.seedFrom(combined);
     try {
       final cache = await PatientsCacheStore.open();
       await cache.save(_doctorCacheKey, combined);
@@ -568,7 +549,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       if (!_refreshing && _lastError != null)
         Padding(padding: const EdgeInsets.only(bottom: 6),
           child: InkWell(
-            onTap: _refreshFromBackend,
+            onTap: () => _refreshFromBackend(full: true),
             child: Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),

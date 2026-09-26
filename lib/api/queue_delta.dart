@@ -19,6 +19,58 @@
 /// difference.
 library;
 
+import 'sync_api.dart';
+
+/// One screen's place in the stream of changes.
+///
+/// Shared by all three role shells so the rules below are written once
+/// rather than three times, each drifting on its own.
+class QueueDelta {
+  String? _cursor;
+
+  /// False until a full load has seeded a starting point.
+  bool get isReady => _cursor != null;
+
+  /// Forget where we were — the next refresh loads everything. Called when a
+  /// screen wants a clean slate, and implied at app start because this object
+  /// is never persisted.
+  void reset() => _cursor = null;
+
+  /// Start the next delta from the newest row a full load actually returned.
+  ///
+  /// Never from the handset's clock: a cursor running behind the server costs
+  /// a few duplicate rows, one running ahead skips rows permanently. When no
+  /// row carries a stamp this stays unseeded and the caller keeps doing full
+  /// loads — the safe direction.
+  void seedFrom(Iterable<Map<String, dynamic>> rows) =>
+      _cursor = newestUpdatedAt(rows);
+
+  /// The rows that changed, already in queue shape.
+  ///
+  /// Returns null to mean "load everything instead", which is the answer to
+  /// anything unexpected: no cursor yet, the request failed, or a full page
+  /// came back meaning more is waiting. Paging through a large backlog would
+  /// be slower than the full load and has more ways to go wrong.
+  ///
+  /// An empty list is a real answer — nothing changed — and is the common
+  /// case. Measured on live, that response is 192 bytes against the 168 KB a
+  /// full doctor refresh costs.
+  Future<List<Map<String, dynamic>>?> changedRows(SyncApi api,
+      {int perPage = 200}) async {
+    final cursor = _cursor;
+    if (cursor == null) return null;
+    final PullResponse res;
+    try {
+      res = await api.pull(updatedSinceRaw: cursor, perPage: perPage);
+    } catch (_) {
+      return null;
+    }
+    if (res.hasMore) return null;
+    if (res.cursor.isNotEmpty) _cursor = res.cursor;
+    return [for (final r in res.appointments) queueShapeFromSyncRow(r)];
+  }
+}
+
 /// One `/mobile/sync/pull` appointment row, in the shape the `/queues/*`
 /// endpoints return — which is what `CounsellorState.mergeBackendPatients`
 /// reads.

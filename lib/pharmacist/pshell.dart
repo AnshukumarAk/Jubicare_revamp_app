@@ -18,8 +18,10 @@ import '../api/appointments_api.dart';
 import '../api/attendance_api.dart';
 import '../api/camps_api.dart';
 import '../api/masters_store.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
 import '../api/requisitions_api.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
 import '../api/uploads_api.dart';
 import '../counsellor/cw.dart';
@@ -203,7 +205,11 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
 
   /// Public hook for the shell's app-bar refresh button (user rule
   /// 2026-08-16).
-  Future<void> refreshNow() => _refreshFromBackend();
+  ///
+  /// Always loads EVERYTHING. This is the pharmacist asking directly, and it
+  /// should be the one gesture that cannot leave anything behind. Deltas
+  /// resume from the result.
+  Future<void> refreshNow() => _refreshFromBackend(full: true);
 
   @override
   void initState() {
@@ -260,43 +266,81 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     }
   }
 
-  Future<void> _refreshFromBackend() async {
+  /// Where the next delta starts. Not persisted, so every app start loads
+  /// everything and nothing a delta gets wrong can outlive one session.
+  final _delta = QueueDelta();
+
+  Future<void> _refreshFromBackend({bool full = false}) async {
     if (_refreshing || !mounted) return;
     setState(() { _refreshing = true; _lastError = null; });
     try {
-      final api = context.read<QueuesApi>();
-      // Fetch the primary queue. ANY failure here is silent — cached
-      // list is already on screen and the retry button is one tap away
-      // (user 2026-08-26: "server started but red banner not going" —
-      // the banner survived until every conceivable throw path was
-      // treated silent). Once this succeeds we know the server is
-      // reachable, so a stale error is cleared unconditionally.
-      QueueList queue;
-      try {
-        queue = await api.pharmaQueue(limit: 200);
-      } catch (_) {
-        return; // banner already cleared at start; retry will run again
-      }
-      final week = await api.pharmaPast7Days(limit: 200)
-          .catchError((_) => QueueList(items: const [], total: 0, count: 0));
-      if (!mounted) return;
-      final store = context.read<CounsellorState>();
-      final queueIds = {
-        for (final r in queue.items) r['appointment_id'],
-      };
-      final combined = [
-        for (final r in queue.items) {...r, 'status': 'with_pharma'},
-        for (final r in week.items)
-          if (!queueIds.contains(r['appointment_id'])) r,
-      ];
-      store.mergeBackendPatients(combined);
-      try {
-        final cache = await PatientsCacheStore.open();
-        await cache.save(_pharmaCacheKey, combined);
-      } catch (_) {}
+      if (!full && await _refreshDelta()) return;
+      await _refreshEverything();
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The two queue calls below return up to 400 rows every refresh to answer
+  /// "did anything happen", and usually nothing did. False means "load
+  /// everything instead".
+  ///
+  /// Note what is NOT done here: the full path stamps the primary queue's
+  /// rows with 'with_pharma', because that list is the pharmacist's queue by
+  /// definition. A delta carries every status, so stamping it would mark
+  /// completed and cancelled visits as waiting for the pharmacist. The rows
+  /// already carry the right status — both endpoints run through the same
+  /// appointment_row(), which maps with_pharmacist to with_pharma — so they
+  /// are taken as they come.
+  Future<bool> _refreshDelta() async {
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
+    if (!mounted) return true;
+    if (rows.isNotEmpty) {
+      context.read<CounsellorState>()
+          .mergeBackendPatients(rows, additive: true);
+    }
+    return true;
+  }
+
+  /// The whole picture. Runs at app start, on pull-to-refresh, and whenever a
+  /// delta declines. Also re-seeds the cursor, and quietly repairs anything
+  /// the deltas missed — a visit soft-deleted on the server never appears in
+  /// a list of changed rows.
+  Future<void> _refreshEverything() async {
+    final api = context.read<QueuesApi>();
+    // Fetch the primary queue. ANY failure here is silent — cached
+    // list is already on screen and the retry button is one tap away
+    // (user 2026-08-26: "server started but red banner not going" —
+    // the banner survived until every conceivable throw path was
+    // treated silent). Once this succeeds we know the server is
+    // reachable, so a stale error is cleared unconditionally.
+    QueueList queue;
+    try {
+      queue = await api.pharmaQueue(limit: 200);
+    } catch (_) {
+      return; // banner already cleared at start; retry will run again
+    }
+    final week = await api.pharmaPast7Days(limit: 200)
+        .catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final queueIds = {
+      for (final r in queue.items) r['appointment_id'],
+    };
+    final combined = [
+      for (final r in queue.items) {...r, 'status': 'with_pharma'},
+      for (final r in week.items)
+        if (!queueIds.contains(r['appointment_id'])) r,
+    ];
+    store.mergeBackendPatients(combined);
+    _delta.seedFrom(combined);
+    try {
+      final cache = await PatientsCacheStore.open();
+      await cache.save(_pharmaCacheKey, combined);
+    } catch (_) {}
   }
 
   @override
@@ -309,7 +353,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
       if (!_refreshing && _lastError != null)
         Padding(padding: const EdgeInsets.only(bottom: 6),
           child: InkWell(
-            onTap: _refreshFromBackend,
+            onTap: () => _refreshFromBackend(full: true),
             child: Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),

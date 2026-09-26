@@ -6,8 +6,10 @@ import 'package:provider/provider.dart';
 import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../api/auth_api.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
 import '../api/masters_store.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
 import '../screens/unified_login.dart';
 import '../services/location_service.dart';
@@ -178,11 +180,56 @@ class _ShellState extends State<_Shell> {
     } catch (_) {/* first run — nothing cached yet */}
   }
 
-  Future<void> _refreshFromBackend() async {
+  /// Where the next delta starts. Not persisted, so every app start loads
+  /// everything and nothing a delta gets wrong can outlive one session.
+  final _delta = QueueDelta();
+
+  Future<void> _refreshFromBackend({bool full = false}) async {
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    store.setRefreshState(loading: true);
+    if (!full && await _refreshDelta()) {
+      if (mounted) store.setRefreshState(loading: false);
+      return;
+    }
+    await _refreshEverything();
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The two list calls below fetch up to 400 rows every refresh to answer
+  /// "did anything happen", and usually nothing did — measured on live, the
+  /// past-7-days list alone averages 20 KB a call.
+  ///
+  /// The tiles come along anyway: they are 0.12 KB, and they are the server's
+  /// own counts, which is what the dashboard shows in preference to the local
+  /// list length. Skipping them to save a tenth of a kilobyte would mean
+  /// showing stale numbers.
+  ///
+  /// False means "load everything instead".
+  Future<bool> _refreshDelta() async {
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
+    if (!mounted) return true;
+    final store = context.read<CounsellorState>();
+    if (rows.isNotEmpty) {
+      store.mergeBackendPatients(rows, additive: true);
+    }
+    try {
+      final tiles = await context.read<QueuesApi>().tiles();
+      if (mounted) store.applyTiles(tiles);
+    } catch (_) {/* counts stay as they were — the list is already right */}
+    return true;
+  }
+
+  /// The whole picture. Runs at app start, on pull-to-refresh, and whenever a
+  /// delta declines. Also re-seeds the cursor, and quietly repairs anything
+  /// the deltas missed — a visit soft-deleted on the server never appears in
+  /// a list of changed rows.
+  Future<void> _refreshEverything() async {
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final api = context.read<QueuesApi>();
-    store.setRefreshState(loading: true);
     try {
       // Silent-on-failure (user 2026-08-26: banner stuck even after
       // server came back). Both calls independent + swallow errors;
@@ -212,6 +259,9 @@ class _ShellState extends State<_Shell> {
           await cache.save(_patientsCacheKey, list.items);
         } catch (_) {/* best-effort */}
       }
+      // Seed from BOTH lists: whichever carries the newer row decides where
+      // the next delta starts, and starting too early only costs duplicates.
+      _delta.seedFrom([...?list?.items, ...?attended?.items]);
       if (attended != null) {
         // Additive — attended only ADDS its rows (WITH_PHARMACIST + COMPLETED)
         // to the primary past-7-days snapshot. Non-additive would wipe every
@@ -255,7 +305,9 @@ class _ShellState extends State<_Shell> {
       context.read<AppState>().applyBackendUser(freshUser);
     }
     unawaited(context.read<TerminologyStore>().refresh());
-    await _refreshFromBackend();
+    // Everything, not a delta — this is the counsellor asking directly, and
+    // it should be the one gesture that cannot leave anything behind.
+    await _refreshFromBackend(full: true);
     switch (_tab) {
       case 3: _campsRefresh.value++; break;
       case 4: _devicesRefresh.value++; break;
@@ -329,7 +381,7 @@ class _ShellState extends State<_Shell> {
     }
     final initials = widget.userName.isEmpty ? 'C' : widget.userName[0].toUpperCase();
     final pages = [
-      CounDashboard(onRegister: () => _go(2), name: widget.userName, onRefresh: _refreshFromBackend),
+      CounDashboard(onRegister: () => _go(2), name: widget.userName, onRefresh: () => _refreshFromBackend(full: true)),
       // Status → Register tab jump for the Re-Appointment button. Uses the
       // shared CounsellorState.setPrefill so the Register form picks it up on
       // the next frame.
