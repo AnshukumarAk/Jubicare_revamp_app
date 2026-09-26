@@ -510,19 +510,25 @@ class _CounRegisterState extends State<CounRegister> {
     setState(() => _submitting = true);
     try {
       final uploads = context.read<UploadsApi>();
-      for (var i = 0; i < _attachments.length; i++) {
-        if (_attachments[i].serverPath != null) continue;
-        try {
-          final res = await uploads
-              .uploadImage(_attachments[i].path)
-              .timeout(const Duration(seconds: 25));
-          final name = (res['file_name'] as String?) ?? '';
-          if (name.isNotEmpty) {
-            _attachments[i] = _attachments[i].copyWith(serverPath: name);
-          }
-        } catch (_) {
-          // Offline or server hiccup — keep the phone-local path.
-        }
+      if (_attachments.isNotEmpty) {
+        await Future.wait([
+          for (var i = 0; i < _attachments.length; i++)
+            if (_attachments[i].serverPath == null)
+              (() async {
+                try {
+                  final res = await uploads
+                      .uploadImage(_attachments[i].path)
+                      .timeout(const Duration(seconds: 3));
+                  final name = (res['file_name'] as String?) ?? '';
+                  if (name.isNotEmpty) {
+                    _attachments[i] = _attachments[i].copyWith(serverPath: name);
+                  }
+                } catch (_) {
+                  // Offline, slow network, or timeout — keep the phone-local path.
+                  // SyncService._liftPhotos will automatically lift it in the background when online.
+                }
+              })(),
+        ]);
       }
       if (!mounted) return;
       await _submitAfterUploads(s);
@@ -597,7 +603,7 @@ class _CounRegisterState extends State<CounRegister> {
     if (remarksHi.isNotEmpty) {
       try {
         remarksEn = await TranslationService.hiToEn(remarksHi)
-            .timeout(const Duration(seconds: 8));
+            .timeout(const Duration(seconds: 2));
       } catch (_) {/* capped — raw text in both columns */}
     }
 
@@ -740,7 +746,7 @@ class _CounRegisterState extends State<CounRegister> {
     // duplicate (user rule 2026-08-16).
     final reappointmentPatientId = _reAppointmentSource?.backendPatientId;
     final sync = context.read<SyncService>();
-    final _clientActionId = await sync.enqueue(kind: 'patient.register', payload: {
+    await sync.enqueue(kind: 'patient.register', payload: {
       if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
       // Basic identity
       'patient_name':      p.name,
@@ -815,16 +821,8 @@ class _CounRegisterState extends State<CounRegister> {
       if (diagnoses.isNotEmpty)   'diagnoses':   diagnoses,
       if (attachments.isNotEmpty) 'attachments': attachments,
     });
-    // Wait until THIS action leaves the queue — plain `sync.drain()`
-    // returns immediately when a drain is already in flight (user
-    // 2026-09-10 "still going first on sync, then after some time
-    // shows sent"). waitUntilDrained polls the queue for this
-    // clientActionId so the snackbar + redirect only fire once the
-    // server has acknowledged the row. 8 s cap keeps offline / slow
-    // networks non-blocking — a timeout leaves the row queued for the
-    // next drain, same as before.
-    await sync.waitUntilDrained(_clientActionId,
-        timeout: const Duration(seconds: 8));
+    // Action is safely persisted in the offline sync queue and drain() runs
+    // in the background. Redirect immediately without blocking the UI.
     // Redirect FIRST, then show the snackbar. Any unexpected throw between
     // enqueue and this line was leaving the counsellor stranded on the
     // register form with the patient already saved (user 2026-08-20:

@@ -73,6 +73,7 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
         source: ImageSource.camera,
         preferredCameraDevice: CameraDevice.rear,
         maxWidth: 1280,
+        maxHeight: 1280,
         imageQuality: 70,
       );
       if (shot == null) return;
@@ -89,11 +90,18 @@ class _AttachmentsFieldState extends State<AttachmentsField> {
         if (perm == LocationPermission.denied) perm = await Geolocator.requestPermission();
         if (perm == LocationPermission.always || perm == LocationPermission.whileInUse) {
           if (await Geolocator.isLocationServiceEnabled()) {
-            final pos = await Geolocator.getCurrentPosition(
-                    desiredAccuracy: LocationAccuracy.medium)
-                .timeout(const Duration(seconds: 6));
-            lat = pos.latitude;
-            lng = pos.longitude;
+            final last = await Geolocator.getLastKnownPosition();
+            if (last != null &&
+                DateTime.now().difference(last.timestamp).inMinutes < 5) {
+              lat = last.latitude;
+              lng = last.longitude;
+            } else {
+              final pos = await Geolocator.getCurrentPosition(
+                      desiredAccuracy: LocationAccuracy.medium)
+                  .timeout(const Duration(seconds: 3));
+              lat = pos.latitude;
+              lng = pos.longitude;
+            }
           }
         }
       } catch (_) { /* timeout / denied — stamp will show date-time only */ }

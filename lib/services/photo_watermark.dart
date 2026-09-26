@@ -67,7 +67,7 @@ class PhotoWatermark {
     // Some Android cameras write huge 4000x3000 shots — cap the long
     // edge at 1600px so upload is under ~500 KB and the strip text
     // stays readable on a phone.
-    const maxEdge = 1600;
+    const maxEdge = 1200;
     final longEdge = math.max(im.width, im.height);
     if (longEdge > maxEdge) {
       final scale = maxEdge / longEdge;
@@ -75,7 +75,7 @@ class PhotoWatermark {
         im,
         width: (im.width * scale).round(),
         height: (im.height * scale).round(),
-        interpolation: img.Interpolation.average,
+        interpolation: img.Interpolation.linear,
       );
     }
 
@@ -154,7 +154,7 @@ class PhotoWatermark {
       y += font.lineHeight + 6;
     }
 
-    return img.encodeJpg(im, quality: 82);
+    return img.encodeJpg(im, quality: 72);
   }
 
   /// Pick the closest built-in bitmap font — the image package ships

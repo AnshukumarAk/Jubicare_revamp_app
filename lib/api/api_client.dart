@@ -164,16 +164,14 @@ class ApiClient {
         final code = env is Map && env['error'] is Map
             ? env['error']['code']?.toString() ?? ''
             : '';
-        if (code == 'TOKEN_EXPIRED') {
+        if (code != 'INVALID_CREDENTIALS') {
           final rolled = await _refreshOnce();
           if (rolled != null) {
             final retry = await _do(method, path, body: body, query: query, bearer: rolled.accessToken);
             return _decode(retry);
           }
         }
-        if (code == 'SIGNED_OUT_REMOTELY' ||
-            code == 'INVALID_TOKEN' ||
-            code == 'REFRESH_EXPIRED') {
+        if (code == 'REFRESH_EXPIRED') {
           await onSignedOutRemotely?.call();
         }
       }
@@ -289,10 +287,7 @@ class ApiClient {
       final code = env is Map && env['error'] is Map
           ? (env['error']['code'] as String? ?? '')
           : '';
-      final definitiveAuthFailure = res.statusCode == 401 && (
-          code == 'SIGNED_OUT_REMOTELY' ||
-          code == 'INVALID_TOKEN' ||
-          code == 'REFRESH_EXPIRED');
+      final definitiveAuthFailure = res.statusCode == 401 && code == 'REFRESH_EXPIRED';
       if (definitiveAuthFailure) {
         await onSignedOutRemotely?.call();
       }

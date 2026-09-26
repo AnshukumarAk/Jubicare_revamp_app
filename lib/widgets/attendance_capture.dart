@@ -75,11 +75,18 @@ class _AttendanceCaptureState extends State<AttendanceCapture> {
             perm == LocationPermission.whileInUse) {
           final serviceOn = await Geolocator.isLocationServiceEnabled();
           if (serviceOn) {
-            final pos = await Geolocator.getCurrentPosition(
-                    desiredAccuracy: LocationAccuracy.high)
-                .timeout(const Duration(seconds: 6));
-            lat = pos.latitude;
-            lng = pos.longitude;
+            final last = await Geolocator.getLastKnownPosition();
+            if (last != null &&
+                DateTime.now().difference(last.timestamp).inMinutes < 5) {
+              lat = last.latitude;
+              lng = last.longitude;
+            } else {
+              final pos = await Geolocator.getCurrentPosition(
+                      desiredAccuracy: LocationAccuracy.medium)
+                  .timeout(const Duration(seconds: 3));
+              lat = pos.latitude;
+              lng = pos.longitude;
+            }
           }
         }
       } catch (_) {
@@ -91,17 +98,21 @@ class _AttendanceCaptureState extends State<AttendanceCapture> {
       // Now the camera — its permission popup (first launch) fires
       // BEFORE the photo is taken, so the user only sees one prompt at
       // a time.
-      final shot = await _picker.pickImage(source: ImageSource.camera, maxWidth: 1280, imageQuality: 70);
+      final shot = await _picker.pickImage(
+        source: ImageSource.camera,
+        maxWidth: 960,
+        maxHeight: 960,
+        imageQuality: 70,
+      );
       if (shot == null) {
         setState(() => _busy = false);
         return;
       }
-      _photoPath = shot.path;
       // Bake the watermark strip BEFORE handing the file off. The result
       // file is what uploads, so the Place/GPS/Date-Time proof is stuck
       // to the pixels forever (user rule 2026-08-16).
       final stamped = await PhotoWatermark.stamp(
-        File(_photoPath!),
+        File(shot.path),
         place: widget.placeLabel,
         latitude: lat,
         longitude: lng,
