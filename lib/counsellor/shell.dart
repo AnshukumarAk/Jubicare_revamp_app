@@ -364,12 +364,11 @@ class _ShellState extends State<_Shell> {
 
   @override
   Widget build(BuildContext context) {
-    // Watch state so the Re-Appointment signal fired from the Patient
-    // Detail screen reaches us. When set, jump to Register on the next
-    // frame (setState during build is forbidden) — the Register form's
-    // build then consumes the pending prefill.
-    final s = context.watch<CounsellorState>();
-    if (s.consumeSwitchToRegister()) {
+    // Granular selection: rebuild ONLY when the Re-Appointment tab-switch signal
+    // fires, preventing unneeded rebuilds of all 6 tabs on general state updates.
+    final shouldSwitch = context.select<CounsellorState, bool>((s) => s.hasSwitchToRegister);
+    if (shouldSwitch) {
+      context.read<CounsellorState>().consumeSwitchToRegister();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _go(2);

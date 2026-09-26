@@ -34,6 +34,7 @@ import 'state/auth_persistence.dart';
 import 'theme/app_theme.dart';
 import 'counsellor/cstate.dart';
 import 'counsellor/shell.dart';
+import 'doctor/doctor_db_loader.dart';
 import 'doctor/dshell.dart';
 import 'pharmacist/pshell.dart';
 import 'screens/splash.dart';
@@ -64,20 +65,13 @@ void main() async {
   // google-services.json is missing the LocationService just buffers locally
   // and the app runs otherwise normally.
   final firebase = FirebaseService();
-  await firebase.ensureInitialized();
+
   // FCM background/killed-state hook (ATTEND task D1) — must be a
   // top-level function registered before runApp. Notification messages
   // themselves are displayed by the OS; this keeps data messages alive.
   try {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   } catch (_) {/* Firebase not initialised — push simply stays off */}
-
-  // Load the stored login flag (rule 2026-08-05) so the shell can render
-  // before we round-trip /auth/me on the network.
-  StoredSession? session;
-  try {
-    session = await AuthPersistence.load();
-  } catch (_) { session = null; }
 
   // Build the API layer once — the client is stateless w.r.t. the user
   // (tokens live in TokenStore, session in AuthPersistence) so a single
@@ -114,43 +108,45 @@ void main() async {
   final staffApi         = StaffApi(apiClient);
   final uploadsApi       = UploadsApi(apiClient);
 
-  // Three cached blobs get read off disk and jsonDecoded here. Measured on
-  // a CPH2119: the whole cold start was 717 ms, of which ~350 ms was this
-  // Dart work, and they were being done strictly one after another though
-  // none depends on another. Started together now, and only the one the
-  // first screen actually reads is waited for.
   final mastersStore = MastersStore(bootstrapApi);
-  final mastersReady = mastersStore.hydrate();
-
-  // Master medical terminology (disease list sheet) — cached copy loads
-  // instantly for offline matching; a fresh copy downloads in the
-  // background whenever a session exists.
-  //
-  // Not awaited: it is the largest of the three, and nothing on the login
-  // screen or any Home tab reads it — it is the doctor's symptom matching,
-  // several taps into a case. It is a ChangeNotifier, so whatever is on
-  // screen when it lands picks it up.
   final terminologyStore = TerminologyStore(apiClient);
-  unawaited(terminologyStore.loadCache());
-  if (session != null) unawaited(terminologyStore.refresh());
-
-  // Pass UploadsApi so drain() can lift local /data/user/…/wm_*.jpg
-  // paths that offline registrations left in the queue (bug 2026-08-20).
   final syncService = SyncService(syncApi, uploads: uploadsApi);
-  // drain() hydrates the queue itself before touching it, so awaiting
-  // hydrate() here as well was reading the same file twice. Hydrate anyway
-  // when signed out, so the pending count is right if they sign back in.
-  //
+
+  // Prewarm the doctor's clinical decision-support DB in the background so
+  // Case Details opens with no lag when a case is tapped.
+  unawaited(DoctorDbLoader.load());
+
+  // Neither of these is read before the first frame, so neither is waited
+  // for. The clinical sheet is the doctor's symptom matching, several taps
+  // into a case, and it is the largest blob of the set. Both stores are
+  // ChangeNotifiers, so whatever is on screen when they land picks them up.
+  unawaited(terminologyStore.loadCache());
+
+  // The three the first frame DOES depend on, started together so their
+  // platform-channel round trips overlap instead of queueing. Worth being
+  // precise about what that buys: an isolate runs one thing at a time, so
+  // this overlaps the WAITING, not the jsonDecode. Measured on a CPH2119,
+  // cold start was 717 ms with these done strictly in turn.
+  final initResults = await Future.wait([
+    firebase.ensureInitialized().catchError((_) {}),
+    AuthPersistence.load().catchError((_) => null),
+    mastersStore.hydrate().catchError((_) {}),
+  ]);
+  final StoredSession? session = initResults[1] as StoredSession?;
+
   // If the app opens online with pending offline actions, drain right
   // away — this is safest even when the user hasn't signed in yet
   // (SyncService will no-op on 401 SIGNED_OUT_REMOTELY).
-  unawaited(syncService.hydrate().then((_) {
-    if (session != null) syncService.drain();
-  }));
-
-  // Waited for: the restored shell and every form read the masters the
-  // moment they build.
-  await mastersReady;
+  //
+  // drain() hydrates the queue itself before touching it, so hydrating
+  // separately would read the same file twice. Signed out there is no drain,
+  // so hydrate alone keeps the pending count honest for the next sign-in.
+  if (session != null) {
+    syncService.drain();
+    unawaited(terminologyStore.refresh());
+  } else {
+    unawaited(syncService.hydrate());
+  }
   // D1: an already-logged-in user re-registers their FCM token at every
   // app start (covers token rotation + fresh installs restoring session).
   if (session != null) unawaited(FcmService.instance.register(apiClient));

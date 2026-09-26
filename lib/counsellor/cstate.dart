@@ -512,6 +512,7 @@ class CounsellorState extends ChangeNotifier {
   // watches state, consumes the flag on its next build, and jumps to the
   // Register tab so the prefill flows in.
   bool _switchToRegister = false;
+  bool get hasSwitchToRegister => _switchToRegister;
   void startReAppointmentFor(CPatient p) {
     setPrefill(p);
     _switchToRegister = true;
@@ -522,6 +523,7 @@ class CounsellorState extends ChangeNotifier {
     _switchToRegister = false;
     return v;
   }
+
 
   static List<CPatient> _initialPatientSeed() {
     final base = <CPatient>[
@@ -1207,7 +1209,20 @@ class CounsellorState extends ChangeNotifier {
   String nextId() => 'P${_seq++}';
   String nextUniqueCode() => 'GN-${(_seq).toString().padLeft(4, '0')}';
 
-  String addPatient(CPatient p) { patients.insert(0, p); notifyListeners(); return p.id; }
+  String addPatient(CPatient p) {
+    patients.insert(0, p);
+    if (backendRegisteredToday != null) {
+      backendRegisteredToday = backendRegisteredToday! + 1;
+    }
+    if (backendPast7DaysTotal != null) {
+      backendPast7DaysTotal = backendPast7DaysTotal! + 1;
+    }
+    if (backendDoctorQueue != null) {
+      backendDoctorQueue = backendDoctorQueue! + 1;
+    }
+    notifyListeners();
+    return p.id;
+  }
 
   /// Merge a batch of patients from an /api/queues/* endpoint into the
   /// local patient list. Backend rows are tagged with an id prefix of
