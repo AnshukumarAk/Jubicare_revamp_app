@@ -164,14 +164,35 @@ class ApiClient {
         final code = env is Map && env['error'] is Map
             ? env['error']['code']?.toString() ?? ''
             : '';
-        if (code != 'INVALID_CREDENTIALS') {
+        // Only TOKEN_EXPIRED is worth a refresh. Trying one on
+        // SIGNED_OUT_REMOTELY or INVALID_TOKEN just spends a round trip to
+        // be told the same thing again -- the refresh token is dead for
+        // exactly the reasons the access token is.
+        if (code == 'TOKEN_EXPIRED') {
           final rolled = await _refreshOnce();
           if (rolled != null) {
             final retry = await _do(method, path, body: body, query: query, bearer: rolled.accessToken);
             return _decode(retry);
           }
         }
-        if (code == 'REFRESH_EXPIRED') {
+        // These three mean the session is over, so the app has to leave.
+        //
+        // They were narrowed to REFRESH_EXPIRED alone on 2026-09-26 to stop
+        // one phone's logout throwing the other phone out -- a real bug, but
+        // this was the wrong end of it. Ignoring the server also meant an
+        // account DEACTIVATED by an admin kept its shell open, patient data
+        // and all, with every request failing and no way back to the login
+        // screen. Same for a password change, and for a corrupt token.
+        //
+        // The cause is fixed where it belongs: logout now names its own
+        // refresh token and the server ends that session alone. Measured on
+        // live the same day -- token_version held at 2, live sessions went
+        // 2 to 1, and the second handset carried on working. So the server
+        // no longer says this to a phone that is still signed in, and the
+        // app can go back to believing it when it does.
+        if (code == 'SIGNED_OUT_REMOTELY' ||
+            code == 'INVALID_TOKEN' ||
+            code == 'REFRESH_EXPIRED') {
           await onSignedOutRemotely?.call();
         }
       }
@@ -287,7 +308,13 @@ class ApiClient {
       final code = env is Map && env['error'] is Map
           ? (env['error']['code'] as String? ?? '')
           : '';
-      final definitiveAuthFailure = res.statusCode == 401 && code == 'REFRESH_EXPIRED';
+      // Same three as above — a refresh that comes back with any of them is
+      // definitive, and pretending otherwise leaves the shell mounted on a
+      // session the server has already ended (2026-09-26).
+      final definitiveAuthFailure = res.statusCode == 401 && (
+          code == 'SIGNED_OUT_REMOTELY' ||
+          code == 'INVALID_TOKEN' ||
+          code == 'REFRESH_EXPIRED');
       if (definitiveAuthFailure) {
         await onSignedOutRemotely?.call();
       }
