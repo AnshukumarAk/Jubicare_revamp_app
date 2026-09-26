@@ -1531,15 +1531,35 @@ class _PharmaStockState extends State<PharmaStock> {
     return CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       ...reqItems.asMap().entries.map((e) => Padding(padding: const EdgeInsets.only(bottom: 10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Expanded(child: CField(
-              e.value.combos.isEmpty
-                  ? 'Medicine'
-                  : 'Combination: ${e.value.name ?? ''}${e.value.combos.map((c) => ' + ${c.name}').join()}',
-              InkWell(
-            onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
-            child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
-              child: Text(e.value.name ?? 'Select Medicine', overflow: TextOverflow.ellipsis,
-                style: ct(13, e.value.name == null ? FontWeight.w400 : FontWeight.w500, e.value.name == null ? C2.text3 : C2.text)))), required: true)),
+          // The picker disappears once partners are attached. It could only
+          // ever show the primary, and beside a heading already reading
+          // "COMBINATION: PARACETAMOL + VITAMIN A + VITAMIN C" a box saying
+          // just "Paracetamol" read as though one medicine had been chosen
+          // and the rest forgotten (user 2026-09-26).
+          //
+          // The cost, stated plainly: the primary can no longer be changed
+          // once it has partners — the combo sheet edits partners around a
+          // fixed primary. Changing it means removing the row and starting
+          // again. Accepted deliberately; a combination is built once and
+          // rebuilt rarely.
+          if (e.value.combos.isEmpty)
+            Expanded(child: CField(
+                'Medicine',
+                InkWell(
+              onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
+              child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
+                child: Text(e.value.name ?? 'Select Medicine', overflow: TextOverflow.ellipsis,
+                  style: ct(13, e.value.name == null ? FontWeight.w400 : FontWeight.w500, e.value.name == null ? C2.text3 : C2.text)))), required: true))
+          else
+            Expanded(child: Padding(
+              padding: const EdgeInsets.only(bottom: 10, top: 2),
+              child: RichText(text: TextSpan(
+                text: 'COMBINATION: ${(e.value.name ?? '').toUpperCase()}'
+                    '${e.value.combos.map((c) => ' + ${c.name.toUpperCase()}').join()}',
+                style: ct(11.5, FontWeight.w600, C2.text2),
+                children: [TextSpan(text: ' *', style: ct(11.5, FontWeight.w700, C2.danger))],
+              )),
+            )),
           // Edit combo — bare pencil icon (user 2026-09-18 "remove
           // rounded circle"). Disabled until a primary is picked.
           //
@@ -1560,32 +1580,61 @@ class _PharmaStockState extends State<PharmaStock> {
           if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key)), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         Row(children: [
-          // Dosage Form first (user 2026-09-14) — picking Tab vs Syp
-          // decides the label + input rules of the Dosage box beside
-          // it, so the form belongs upstream in the reading order.
+          // Dosage Form first (user 2026-09-14, restated 2026-09-26) —
+          // picking Tab vs Syp decides whether every dosage box below asks
+          // for mg or ml, so it has to be answered before any of them.
           Expanded(flex: 2, child: CField('Dosage Form', SearchDropdown(
             items: kDosageForms,
             value: kDosageForms.contains(e.value.dosageForm) ? e.value.dosageForm : null,
             onChanged: (v) => setState(() { e.value.dosageForm = v ?? ''; }),
           ), required: true)),
           const SizedBox(width: 8),
-          Expanded(flex: 2, child: () {
+          // Qty is always asked on a requisition — even for creams /
+          // gels / syrups the pharmacist orders N tubes or bottles,
+          // not a bare volume (user 2026-09-14).
+          Expanded(flex: 2, child: CField('Qty', TextField(
+            controller: TextEditingController(text: e.value.qty),
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)],
+            decoration: cInput(),
+            onChanged: (v) => e.value.qty = v,
+          ), required: true)),
+        ]),
+        // Every dosage box full width, one under the other, in the order the
+        // combination names them: the primary first, then each partner.
+        //
+        // The primary used to sit squeezed between Dosage Form and Qty, and
+        // once it was labelled with its medicine's name that label wrapped to
+        // two lines and dropped its box below the other two — three inputs on
+        // one row, none of them aligned (user 2026-09-26, screenshot). The
+        // partners were already stacked full width, so the first one being
+        // different was the odd one out rather than the rule.
+        //
+        // No inline X on any of them: the pencil edit icon above owns
+        // add / remove (user 2026-09-18 "dont do option every medicine
+        // cross icon").
+        for (final d in [
+          (name: e.value.name, get: () => e.value.dosage, set: (String v) => e.value.dosage = v),
+          for (final c in e.value.combos)
+            (name: c.name, get: () => c.dosage, set: (String v) => c.dosage = v),
+        ])
+          Padding(padding: const EdgeInsets.only(top: 4), child: () {
             // Solid forms are counted in mg; syrups / gels / creams are
-            // measured by ml, so widen the label + allow decimal input
-            // for those (user 2026-09-14).
+            // measured by ml, so the label, placeholder, keyboard and input
+            // rules all follow the dosage form picked above — for the
+            // partners too, since they share the primary's form
+            // (user 2026-09-14, extended to partners 2026-09-26).
             final needsQty = dosageFormNeedsQty(e.value.dosageForm);
             final unit = needsQty ? 'mg' : 'ML';
             return CField(
-              // Name the medicine once partners are attached, so the three
-              // dosage boxes read as a list of named strengths the way the
-              // doctor's prescribe card does (user 2026-09-26). A plain
-              // "Dosage" above the first one left it ambiguous which of the
-              // combined medicines it belonged to.
+              // Named once partners are attached, so the boxes read as a list
+              // of named strengths the way the doctor's prescribe card does.
+              // A bare "Dosage" left it ambiguous which medicine it meant.
               e.value.combos.isEmpty
                   ? 'Dosage ($unit)'
-                  : '${e.value.name ?? 'Medicine'} Dosage ($unit)',
+                  : '${d.name ?? 'Medicine'} Dosage ($unit)',
               TextField(
-                controller: TextEditingController(text: e.value.dosage),
+                controller: TextEditingController(text: d.get()),
                 decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
                 keyboardType: needsQty
                     ? TextInputType.number
@@ -1599,57 +1648,11 @@ class _PharmaStockState extends State<PharmaStock> {
                         LengthLimitingTextInputFormatter(4),
                       ]
                     : [LengthLimitingTextInputFormatter(12)],
-                onChanged: (v) => e.value.dosage = v,
+                onChanged: d.set,
               ),
               required: true,
             );
           }()),
-          const SizedBox(width: 8),
-          // Qty is always asked on a requisition — even for creams /
-          // gels / syrups the pharmacist orders N tubes or bottles,
-          // not a bare volume (user 2026-09-14).
-          Expanded(flex: 1, child: CField('Qty', TextField(
-            controller: TextEditingController(text: e.value.qty),
-            keyboardType: TextInputType.number,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)],
-            decoration: cInput(),
-            onChanged: (v) => e.value.qty = v,
-          ), required: true)),
-        ]),
-        // Combination partner rows — one dosage input per attached
-        // partner. No inline X: the pencil edit icon above owns
-        // add / remove (user 2026-09-18 "dont do option every
-        // medicine cross icon").
-        for (final c in e.value.combos)
-          Padding(padding: const EdgeInsets.only(top: 4),
-            child: () {
-              // Partners share the primary's dosage form, so they share its
-              // unit — label, placeholder, keyboard and input rules all
-              // follow it, exactly as the primary's box above does. They
-              // carried none of that before: the label said "Dosage" with no
-              // unit and the box accepted letters even under Tab
-              // (user 2026-09-26, parity with the doctor's prescribe card).
-              final needsQty = dosageFormNeedsQty(e.value.dosageForm);
-              return CField(
-                '${c.name} Dosage (${needsQty ? 'mg' : 'ML'})',
-                TextField(
-                  controller: TextEditingController(text: c.dosage),
-                  decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
-                  keyboardType: needsQty
-                      ? TextInputType.number
-                      : const TextInputType.numberWithOptions(decimal: true),
-                  inputFormatters: needsQty
-                      ? [
-                          FilteringTextInputFormatter.digitsOnly,
-                          LengthLimitingTextInputFormatter(4),
-                        ]
-                      : [LengthLimitingTextInputFormatter(12)],
-                  onChanged: (v) => c.dosage = v,
-                ),
-                required: true,
-              );
-            }(),
-          ),
       ]))),
       COutlineButton('Add More', icon: Icons.add_circle_outline, onTap: () => setState(() => reqItems.add(_Req()))),
       const SizedBox(height: 8),
