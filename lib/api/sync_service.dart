@@ -115,7 +115,6 @@ class SyncService extends ChangeNotifier {
   /// Drain the queue. Safe to call any number of times — a single
   /// drain runs at a time; overlapping calls no-op.
   Future<void> drain() async {
-    print('[JC] sync.drain start, pending=' + _queue.length.toString());
     await hydrate();
     if (_draining || _queue.isEmpty) return;
     _draining = true;

@@ -114,24 +114,43 @@ void main() async {
   final staffApi         = StaffApi(apiClient);
   final uploadsApi       = UploadsApi(apiClient);
 
+  // Three cached blobs get read off disk and jsonDecoded here. Measured on
+  // a CPH2119: the whole cold start was 717 ms, of which ~350 ms was this
+  // Dart work, and they were being done strictly one after another though
+  // none depends on another. Started together now, and only the one the
+  // first screen actually reads is waited for.
   final mastersStore = MastersStore(bootstrapApi);
-  await mastersStore.hydrate();
+  final mastersReady = mastersStore.hydrate();
 
   // Master medical terminology (disease list sheet) — cached copy loads
   // instantly for offline matching; a fresh copy downloads in the
   // background whenever a session exists.
+  //
+  // Not awaited: it is the largest of the three, and nothing on the login
+  // screen or any Home tab reads it — it is the doctor's symptom matching,
+  // several taps into a case. It is a ChangeNotifier, so whatever is on
+  // screen when it lands picks it up.
   final terminologyStore = TerminologyStore(apiClient);
-  await terminologyStore.loadCache();
+  unawaited(terminologyStore.loadCache());
   if (session != null) unawaited(terminologyStore.refresh());
 
   // Pass UploadsApi so drain() can lift local /data/user/…/wm_*.jpg
   // paths that offline registrations left in the queue (bug 2026-08-20).
   final syncService = SyncService(syncApi, uploads: uploadsApi);
-  await syncService.hydrate();
+  // drain() hydrates the queue itself before touching it, so awaiting
+  // hydrate() here as well was reading the same file twice. Hydrate anyway
+  // when signed out, so the pending count is right if they sign back in.
+  //
   // If the app opens online with pending offline actions, drain right
   // away — this is safest even when the user hasn't signed in yet
   // (SyncService will no-op on 401 SIGNED_OUT_REMOTELY).
-  if (session != null) syncService.drain();
+  unawaited(syncService.hydrate().then((_) {
+    if (session != null) syncService.drain();
+  }));
+
+  // Waited for: the restored shell and every form read the masters the
+  // moment they build.
+  await mastersReady;
   // D1: an already-logged-in user re-registers their FCM token at every
   // app start (covers token rotation + fresh installs restoring session).
   if (session != null) unawaited(FcmService.instance.register(apiClient));
