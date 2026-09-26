@@ -32,6 +32,11 @@ class FcmService {
   StreamSubscription<String>? _tokenSub;
   StreamSubscription<RemoteMessage>? _msgSub;
 
+  /// The push token this handset last registered. register() runs at app
+  /// start whenever a session exists and again at login, so by the time
+  /// anybody signs out this is set.
+  String? _registeredToken;
+
   /// Fires once per foreground FCM message. The Attend screens listen and
   /// re-hydrate from the server, so a counsellor's mark shows up WITHOUT a
   /// re-login (user bug 2026-08-18).
@@ -49,6 +54,9 @@ class FcmService {
 
       Future<void> upload(String? token) async {
         if (token == null || token.isEmpty) return;
+        // Remembered so unregister() can name the row to delete instead of
+        // asking the server to drop every registration on the account.
+        _registeredToken = token;
         try {
           await client.post('/users/fcm-token', body: {'token': token});
         } catch (_) {/* offline — retried on next register/refresh */}
@@ -207,7 +215,14 @@ class FcmService {
       // delays the login screen.
       if (left.inMilliseconds < 150) break;
       try {
-        await client.delete('/users/fcm-token').timeout(left);
+        // Naming the token scopes the delete to THIS handset. Without it
+        // the server drops every registration the account holds, so a
+        // doctor carrying two phones who signs out of one loses push on
+        // both (user 2026-09-26).
+        await client.delete('/users/fcm-token', body: {
+          if (_registeredToken != null) 'token': _registeredToken,
+        }).timeout(left);
+        _registeredToken = null;
         return true;
       } catch (_) {
         // Brief pause so an instant failure doesn't spin three attempts

@@ -33,12 +33,22 @@ class AuthApi {
     return (res as Map).cast<String, dynamic>();
   }
 
-  /// Ends every session for this account on the server. The client-side
-  /// cleanup (clearing TokenStore + AuthPersistence) is the caller's
-  /// job — this method just informs the server.
+  /// Ends THIS device's session on the server. The client-side cleanup
+  /// (clearing TokenStore + AuthPersistence) is the caller's job — this
+  /// method just informs the server.
+  ///
+  /// The refresh token goes in the body because it is the only thing that
+  /// identifies which handset is signing out. Without it the server falls
+  /// back to ending every session on the account, and a counsellor signing
+  /// out here would sign themselves out of their other phone too — mid-form,
+  /// with "This session was ended elsewhere" and whatever they had typed
+  /// gone (user 2026-09-26, camp form).
   Future<void> logout() async {
     try {
-      await client.post('/auth/logout');
+      final t = await TokenStore.load();
+      await client.post('/auth/logout', body: {
+        if (t != null) 'refresh_token': t.refreshToken,
+      });
     } finally {
       await TokenStore.clear();
     }
