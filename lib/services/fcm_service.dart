@@ -142,42 +142,80 @@ class FcmService {
 
   /// Logout hook — the OS keeps pushing to whatever token was last
   /// registered, so the previous user still gets Check-out / Devices
-  /// notifications on this handset (user bug 2026-08-20). Steps:
-  ///   1. Delete the FCM token on-device — the next user login will
-  ///      request a fresh one.
-  ///   2. Best-effort DELETE on backend (`/users/fcm-token`). The
-  ///      server also auto-cleans a token on the first push that comes
-  ///      back UnregisteredError, so failure here is not fatal.
-  ///   3. Clear the persisted active-user key so the background isolate
+  /// notifications on this handset (user bug 2026-08-20).
+  ///
+  /// The server row is what decides whether a push is sent at all, so it
+  /// goes first, and the on-device token is only surrendered once that row
+  /// is confirmed gone. The reverse order — which is what this did until
+  /// 2026-09-26 — spent up to 800 ms inside deleteToken() before the DELETE
+  /// was even issued, and the logout sites fire AuthApi.logout() alongside
+  /// this, whose `finally` clears TokenStore. So the DELETE frequently
+  /// reached for its bearer token a moment after it had been wiped, failed
+  /// with signedOutRemotely, and left the row behind: the user kept getting
+  /// pushes for a shift they had signed out of.
+  ///
+  /// Steps:
+  ///   1. DELETE `/users/fcm-token`, retried within one shared 1.4 s budget
+  ///      — an offline failure comes back in milliseconds, and giving up on
+  ///      it is what stranded the row.
+  ///   2. Only if that succeeded, delete the token on-device; the next
+  ///      login requests a fresh one.
+  ///   3. If it did NOT succeed, keep the on-device token deliberately.
+  ///      The backend upserts on the token value, so the next login on this
+  ///      handset POSTs this same token and the row moves to whoever signed
+  ///      in. Deleting it here instead would leave a row nobody can reach
+  ///      and nothing can reassign — the server would go on pushing to the
+  ///      signed-out user until some later push happened to come back
+  ///      UnregisteredError.
+  ///   4. Clear the persisted active-user key so the background isolate
   ///      doesn't append notifications to the logged-out user's bell.
   Future<void> unregister(ApiClient client) async {
-    try {
-      if (Firebase.apps.isNotEmpty) {
-        try {
+    final serverCleared = await _deleteServerRegistration(client);
+    if (serverCleared) {
+      try {
+        if (Firebase.apps.isNotEmpty) {
           // Capped: on a phone that cannot reach Firebase this sits there
           // for as long as the plugin feels like, and the user is staring
-          // at a spinner on the Logout they already confirmed. Failing to
-          // delete the token locally costs nothing — the server drops the
-          // row on the first UnregisteredError push (user 2026-09-26).
+          // at a spinner on the Logout they already confirmed.
           await FirebaseMessaging.instance
               .deleteToken()
               .timeout(const Duration(milliseconds: 800));
-        } catch (_) {}
-      }
-    } catch (_) {}
-    try {
-      // Backend endpoint accepts DELETE; a POST with empty token also
-      // upserts to a no-op row. DELETE is cleaner — matches the intent.
-      //
-      // 1.2 s rather than 4: this is best-effort cleanup, and the caller
-      // is holding a signed-out user on screen while it runs. On a working
-      // network it answers in a few hundred milliseconds; on a broken one,
-      // waiting four seconds does not make it likelier to arrive.
-      await client.delete('/users/fcm-token').timeout(
-          const Duration(milliseconds: 1200));
-    } catch (_) {/* offline / not deployed — the token dies locally anyway */}
+        }
+      } catch (_) {/* the row is already gone; a stale local token is inert */}
+    }
     await NotificationsStore.setCurrentUser(null);
     await dispose();
+  }
+
+  /// Ask the backend to forget this handset's push registration. True only
+  /// when the server actually confirmed it.
+  ///
+  /// Retries, but inside one fixed budget rather than per attempt: the whole
+  /// call cannot outlive [_unregisterBudget] however many attempts fit. That
+  /// matters because a logout is waiting on it. The retry is worth having
+  /// precisely because the common failure is instant — a dropped radio
+  /// raises SocketException in a few milliseconds, so the old single-shot
+  /// version burned its whole allowance in no time and then gave up with a
+  /// second of budget still unspent.
+  static const Duration _unregisterBudget = Duration(milliseconds: 1400);
+
+  Future<bool> _deleteServerRegistration(ApiClient client) async {
+    final deadline = DateTime.now().add(_unregisterBudget);
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      final left = deadline.difference(DateTime.now());
+      // Under 150 ms left is not enough for a round trip; spending it only
+      // delays the login screen.
+      if (left.inMilliseconds < 150) break;
+      try {
+        await client.delete('/users/fcm-token').timeout(left);
+        return true;
+      } catch (_) {
+        // Brief pause so an instant failure doesn't spin three attempts
+        // through the same dead socket inside one millisecond.
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+    }
+    return false;
   }
 }
 

@@ -2635,12 +2635,28 @@ class CounProfile extends StatelessWidget {
                 // local session, land on the login screen with no back
                 // stack.
                 context.read<LocationService>().stop();
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
+                // Center loader while FCM DELETE + auth logout finish.
+                showDialog<void>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (_) => const Center(child: CircularProgressIndicator()),
+                );
                 // Kill FCM so pushes stop coming for the old user
-                // (bug 2026-08-20).
-                unawaited(FcmService.instance
-                    .unregister(context.read<ApiClient>())
-                    .catchError((_) {}));
+                // (bug 2026-08-20) — and BEFORE AuthApi.logout(), whose
+                // `finally` clears TokenStore. This site had the two the
+                // other way round and both unawaited, so the DELETE went
+                // out with no bearer token essentially every time: of the
+                // four logout buttons in the app this was the one that
+                // never actually unregistered, and the profile screen is
+                // where a counsellor signs out from (user 2026-09-26).
+                try {
+                  await FcmService.instance
+                      .unregister(context.read<ApiClient>())
+                      .timeout(const Duration(seconds: 2));
+                } catch (_) {/* offline — server auto-cleans on next
+                                UnregisteredError push */}
+                if (!context.mounted) return;
+                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
                 // Wipe cached patient/requisition/attendance lists so
                 // the next user doesn't see this one's data (user rule
                 // 2026-08-16). Same lines in every logout site.
