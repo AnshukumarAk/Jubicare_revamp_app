@@ -642,23 +642,28 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
               onChanged: (v) => setState(() => _q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(q.isEmpty ? 'No patients' : 'No patient matches "$_q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [
-                CCard(child: Column(children: list.map((p) => InkWell(
-                  onTap: () => _openPatient(context, p),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                    child: Row(children: [
-                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                        const SizedBox(height: 1),
-                        Text(p.symptoms.isEmpty ? '${p.age}y · —' : '${p.age}y · ${p.symptoms.join(', ')}',
-                          maxLines: 1, overflow: TextOverflow.ellipsis, style: ct(11.5, FontWeight.w400, C2.text2)),
-                      ])),
-                      _statusBadge(p.status),
-                    ]),
-                  ))).toList())),
-              ])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => _openPatient(context, p),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          const SizedBox(height: 1),
+                          Text(p.symptoms.isEmpty ? '${p.age}y · —' : '${p.age}y · ${p.symptoms.join(', ')}',
+                            maxLines: 1, overflow: TextOverflow.ellipsis, style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        _statusBadge(p.status),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );

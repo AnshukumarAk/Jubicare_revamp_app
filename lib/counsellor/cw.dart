@@ -49,6 +49,70 @@ class CCard extends StatelessWidget {
   }
 }
 
+/// A card of rows that only builds the rows you can actually see.
+///
+/// The patient-list screens all wrote `ListView(children: [CCard(Column(...))])`
+/// — a lazy list with exactly one child, which is not lazy at all. Every row
+/// was constructed and laid out on every rebuild, and these screens rebuild on
+/// every keystroke of their search box.
+///
+/// That is invisible on a small team and brutal on a large one. Measured on
+/// live 2026-09-26: the test team carries 12 visits with the pharmacist, but
+/// team 100 carries 140,104 and the queue endpoint returns 200 of them — so a
+/// pharmacist there was rebuilding ~200 rows, seven-odd widgets apiece, per
+/// character typed.
+///
+/// Short lists keep the old widget exactly. They are cheap to build, they hug
+/// their content, and a card that suddenly filled the screen for three rows
+/// would look wrong. Past [_lazyFrom] rows the card already runs off the
+/// bottom of the screen, so a full-height card that scrolls inside itself
+/// looks the same and builds only what is on screen.
+class CLazyRowCard extends StatelessWidget {
+  /// Below this the eager version is used. Roughly a screenful — beyond it
+  /// the card's lower edge is off-screen anyway.
+  static const _lazyFrom = 20;
+
+  final int itemCount;
+  final IndexedWidgetBuilder itemBuilder;
+  final EdgeInsets padding;
+  const CLazyRowCard({
+    super.key,
+    required this.itemCount,
+    required this.itemBuilder,
+    this.padding = const EdgeInsets.fromLTRB(14, 6, 14, 20),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (itemCount <= _lazyFrom) {
+      return ListView(padding: padding, children: [
+        CCard(child: Column(children: [
+          for (var i = 0; i < itemCount; i++) itemBuilder(context, i),
+        ])),
+      ]);
+    }
+    // Same decoration as CCard, minus the bottom margin it uses to space
+    // itself from the next card — there is no next card here.
+    return Padding(
+      padding: padding,
+      child: Container(
+        decoration: BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: C2.cyanLight),
+          boxShadow: C2.shadow,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ListView.builder(
+          padding: const EdgeInsets.all(14),
+          itemCount: itemCount,
+          itemBuilder: itemBuilder,
+        ),
+      ),
+    );
+  }
+}
+
 /// Section header: cyan dot + navy bold title + cyan-light underline.
 /// [required] appends an inline red asterisk to the title, kept on the same
 /// baseline as the text so it does not drift below (user 2026-09-02).

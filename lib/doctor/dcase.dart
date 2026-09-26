@@ -173,13 +173,18 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           for (var j = i + 1; j < p.prescription.length; j++) {
             if (p.prescription[j].comboKey == key) {
               final pp = parseDosage(p.prescription[j].dosage);
-              partners.add(ComboMed(name: p.prescription[j].name, dosage: pp.strength));
+              partners.add(ComboMed(
+                  name: p.prescription[j].name,
+                  dosage: bareStrength(pp.strength)));
             }
           }
         }
         rx.add(RxItem(
           name: m.name,
-          dosage: parsed.strength,
+          // Rows written before the unit became automatic carry it in the
+          // text ("100 mg"); the box below is captioned with the unit
+          // already (user 2026-09-26).
+          dosage: bareStrength(parsed.strength),
           dosageForm: m.dosageForm.isNotEmpty ? m.dosageForm : parsed.form,
           days: m.days, interval: m.interval, qty: m.qty,
           comboKey: key,
@@ -585,7 +590,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     final newTests = List<String>.from(plan.tests);
     final newRxItems = plan.rx.map((r) {
       final (mn, md) = splitMedicine(r.name);
-      return RxItem(name: mn, dosage: md, days: r.days, interval: r.interval, qty: r.qty);
+      // splitMedicine returns the strength WITH its unit — right for the
+      // dispense report that also calls it, wrong for an input box that
+      // already says MG above it (user 2026-09-26).
+      return RxItem(name: mn, dosage: bareStrength(md),
+          days: r.days, interval: r.interval, qty: r.qty);
     }).toList();
     setState(() {
       // 1. Drop the PREVIOUS auto-applied items (only if they are still
@@ -958,7 +967,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                         borderRadius: BorderRadius.circular(12),
                         onTap: () => setState(() {
                           if (rx.any((x) => x.name == f.name)) return;
-                          rx.add(RxItem(name: f.name, dosage: f.dosage));
+                          // The chip SHOWS "Paracetamol · 100 mg" because
+                          // that reads well on a chip. The Dosage box is
+                          // captioned (MG) and filters to digits, so only
+                          // the number goes in (user 2026-09-26).
+                          rx.add(RxItem(name: f.name, dosage: bareStrength(f.dosage)));
                         }),
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),

@@ -160,6 +160,27 @@ String strengthWithUnit(String strength, String form) {
   return '$s ${doseUnitFor(form)}';
 }
 
+/// The inverse: the number on its own, for putting INTO the Dosage box.
+/// "100 mg" -> "100";  "2.5 ml" -> "2.5";  "500" -> "500";  "" -> ""
+///
+/// Everything above renders a bare strength for DISPLAY. The box the doctor
+/// types into is the other direction and had nothing doing it, so a strength
+/// that arrived carrying its unit went straight in as text: a Frequently
+/// Prescribed chip is built from past prescriptions and offers "Paracetamol ·
+/// 100 mg", an advisory plan's splitMedicine() returns "100 mg", and older
+/// rows were stored that way. The result read "100 mg" inside a box captioned
+/// DOSAGE (MG) — which also refuses non-digits as you type, so the doctor had
+/// to clear it before they could correct it (user 2026-09-26: "i choose tab,
+/// in dosage why taking 100 mg").
+///
+/// Anything with no number in it is handed back untouched rather than
+/// emptied, so a free-text strength is not silently thrown away.
+String bareStrength(String strength) {
+  final s = strength.trim();
+  if (s.isEmpty) return '';
+  return RegExp(r'\d+(?:\.\d+)?').firstMatch(s)?.group(0) ?? s;
+}
+
 /// Render a STORED dosage column ("Tab · 500" or a bare "500") for
 /// display, keeping the form prefix and adding the implied unit:
 /// "Tab · 500" -> "Tab · 500 mg";  "Cream · 20" -> "Cream · 20 ml".

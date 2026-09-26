@@ -444,19 +444,26 @@ class _PharmaQueueListState extends State<PharmaQueueList> {
               onChanged: (v) => setState(() => q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(query.isEmpty ? 'No patients in queue' : 'No patient matches "$q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [CCard(child: Column(children: list.map((p) => InkWell(
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientDetail(p: p, showReAppointment: false))),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                  child: Row(children: [
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
-                    ])),
-                    const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
-                  ]),
-                ))).toList()))])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientDetail(p: p, showReAppointment: false))),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );
@@ -491,20 +498,27 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
               onChanged: (v) => setState(() => q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(query.isEmpty ? 'No dispensed patients' : 'No patient matches "$q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [CCard(child: Column(children: list.map((p) => InkWell(
-                onTap: () => _showDispensedMeds(context, p),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                  child: Row(children: [
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
-                    ])),
-                    const CBadge('Dispensed', bg: Color(0xFFEDF7E0), fg: C2.green),
-                    const SizedBox(width: 6), const Icon(Icons.chevron_right, color: C2.text3, size: 18),
-                  ]),
-                ))).toList()))])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => _showDispensedMeds(context, p),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        const CBadge('Dispensed', bg: Color(0xFFEDF7E0), fg: C2.green),
+                        const SizedBox(width: 6), const Icon(Icons.chevron_right, color: C2.text3, size: 18),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );
@@ -1520,7 +1534,7 @@ class _PharmaStockState extends State<PharmaStock> {
           Expanded(child: CField(
               e.value.combos.isEmpty
                   ? 'Medicine'
-                  : 'Combined: ${e.value.name ?? ''}${e.value.combos.map((c) => ' + ${c.name}').join()}',
+                  : 'Combination: ${e.value.name ?? ''}${e.value.combos.map((c) => ' + ${c.name}').join()}',
               InkWell(
             onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
             child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
@@ -1560,8 +1574,16 @@ class _PharmaStockState extends State<PharmaStock> {
             // measured by ml, so widen the label + allow decimal input
             // for those (user 2026-09-14).
             final needsQty = dosageFormNeedsQty(e.value.dosageForm);
+            final unit = needsQty ? 'mg' : 'ML';
             return CField(
-              needsQty ? 'Dosage (mg)' : 'Dosage (ML)',
+              // Name the medicine once partners are attached, so the three
+              // dosage boxes read as a list of named strengths the way the
+              // doctor's prescribe card does (user 2026-09-26). A plain
+              // "Dosage" above the first one left it ambiguous which of the
+              // combined medicines it belonged to.
+              e.value.combos.isEmpty
+                  ? 'Dosage ($unit)'
+                  : '${e.value.name ?? 'Medicine'} Dosage ($unit)',
               TextField(
                 controller: TextEditingController(text: e.value.dosage),
                 decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
@@ -1571,7 +1593,10 @@ class _PharmaStockState extends State<PharmaStock> {
                 inputFormatters: needsQty
                     ? [
                         FilteringTextInputFormatter.digitsOnly,
-                        LengthLimitingTextInputFormatter(3),
+                        // 4, not 3: a 1000 mg strength exists and could not
+                        // be requested at all, while the doctor's identical
+                        // box has always allowed it (user 2026-09-26).
+                        LengthLimitingTextInputFormatter(4),
                       ]
                     : [LengthLimitingTextInputFormatter(12)],
                 onChanged: (v) => e.value.dosage = v,
@@ -1597,19 +1622,33 @@ class _PharmaStockState extends State<PharmaStock> {
         // medicine cross icon").
         for (final c in e.value.combos)
           Padding(padding: const EdgeInsets.only(top: 4),
-            child: CField(
-              '${c.name} Dosage',
-              TextField(
-                controller: TextEditingController(text: c.dosage),
-                decoration: cInput('e.g. 500'),
-                keyboardType: dosageFormNeedsQty(e.value.dosageForm)
-                    ? TextInputType.number
-                    : const TextInputType.numberWithOptions(decimal: true),
-                inputFormatters: [LengthLimitingTextInputFormatter(12)],
-                onChanged: (v) => c.dosage = v,
-              ),
-              required: true,
-            ),
+            child: () {
+              // Partners share the primary's dosage form, so they share its
+              // unit — label, placeholder, keyboard and input rules all
+              // follow it, exactly as the primary's box above does. They
+              // carried none of that before: the label said "Dosage" with no
+              // unit and the box accepted letters even under Tab
+              // (user 2026-09-26, parity with the doctor's prescribe card).
+              final needsQty = dosageFormNeedsQty(e.value.dosageForm);
+              return CField(
+                '${c.name} Dosage (${needsQty ? 'mg' : 'ML'})',
+                TextField(
+                  controller: TextEditingController(text: c.dosage),
+                  decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
+                  keyboardType: needsQty
+                      ? TextInputType.number
+                      : const TextInputType.numberWithOptions(decimal: true),
+                  inputFormatters: needsQty
+                      ? [
+                          FilteringTextInputFormatter.digitsOnly,
+                          LengthLimitingTextInputFormatter(4),
+                        ]
+                      : [LengthLimitingTextInputFormatter(12)],
+                  onChanged: (v) => c.dosage = v,
+                ),
+                required: true,
+              );
+            }(),
           ),
       ]))),
       COutlineButton('Add More', icon: Icons.add_circle_outline, onTap: () => setState(() => reqItems.add(_Req()))),

@@ -959,9 +959,10 @@ class _CounPatientsListState extends State<CounPatientsList> {
                 widget.patients.isEmpty ? 'No records'
                   : (q.isEmpty ? 'No records' : 'No patient matches "$_q"'),
                 style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [
-                CCard(child: Column(children: list.map((p) => _PatientRow(p)).toList())),
-              ])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) => _PatientRow(list[i]),
+              )),
         ]),
       ),
     );
