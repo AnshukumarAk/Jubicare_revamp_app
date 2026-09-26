@@ -8,10 +8,7 @@ import 'package:provider/provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
-import '../api/api_client.dart';
-import '../api/api_errors.dart';
 import '../api/attendance_api.dart';
-import '../api/auth_api.dart';
 import '../api/camps_api.dart';
 import '../api/masters_store.dart';
 import '../api/queue_delta.dart';
@@ -22,6 +19,7 @@ import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show kUploadsBase;
 import '../counsellor/shell.dart' show SyncStatusIcon, ShellRefreshButton, NotificationsBell;
+import '../services/logout_flow.dart';
 import '../services/attendance_store.dart';
 import '../services/patients_cache_store.dart';
 import '../services/connectivity_service.dart';
@@ -30,7 +28,6 @@ import '../services/fcm_service.dart';
 import '../services/notification_router.dart';
 import '../services/terminology_store.dart';
 import '../services/notifications_service.dart';
-import '../screens/unified_login.dart';
 import '../state/app_state.dart';
 import '../widgets/pending_alert.dart';
 import '../widgets/attendance_capture.dart';
@@ -249,43 +246,7 @@ class DocHeader extends StatelessWidget {
               title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
               onTap: () async {
                 Navigator.pop(context);
-                if (!await confirmLogout(context)) return;
-                if (!context.mounted) return;
-                // Center loader while FCM DELETE + auth logout finish.
-                showDialog<void>(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (_) => const Center(child: CircularProgressIndicator()),
-                );
-                // FCM unregister FIRST so the DELETE call still has a
-                // valid access token — parity with the counsellor
-                // shell fix (user 2026-09-10: logout was racing token
-                // clear vs DELETE, leaving the server-side FCM row
-                // alive and pushes kept arriving).
-                try {
-                  await FcmService.instance
-                      .unregister(context.read<ApiClient>())
-                      // 2 s, not 5. This is best-effort cleanup and the
-                      // user has already confirmed Logout; holding them
-                      // five seconds on a bad network to tidy up a push
-                      // registration is the wrong trade (2026-09-26).
-                      // It cannot simply move to the background: the
-                      // AuthApi.logout() below clears the very token this
-                      // DELETE needs, and if the user signs back in within
-                      // that window it would clear the NEW session's token.
-                      .timeout(const Duration(seconds: 2));
-                } catch (_) {/* offline — server auto-cleans on next
-                                UnregisteredError push */}
-                if (!context.mounted) return;
-                // Best-effort backend logout (v2 §1.3).
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                // Wipe user-scoped lists (user rule 2026-08-16).
-                context.read<CounsellorState>().resetForNewUser();
-                context.read<AppState>().logout();
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                  (route) => false,
-                );
+                await performLogout(context);
               }),
           ])),
         ),
@@ -1782,46 +1743,9 @@ class SimpleProfile extends StatelessWidget {
               _kv('Status', status),
             ])),
             SizedBox(width: double.infinity, child: OutlinedButton.icon(
-              onPressed: () async {
-                if (!await confirmLogout(context)) return;
-                if (!context.mounted) return;
-                // REAL logout (user 2026-08-26: Yes was just popping back
-                // to Home while the session stayed alive). Same lines as
-                // the shell menu's logout — end the server session, stop
-                // pushes, wipe user-scoped state, land on Login with no
-                // back stack. Serves BOTH doctor and pharmacist (the
-                // pharmacist shell reuses this SimpleProfile).
-                // Center loader while FCM DELETE + auth logout finish
-                // (user 2026-09-10).
-                showDialog<void>(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (_) => const Center(child: CircularProgressIndicator()),
-                );
-                // FCM unregister FIRST — DELETE needs the still-valid
-                // access token (user 2026-09-10 fix).
-                try {
-                  await FcmService.instance
-                      .unregister(context.read<ApiClient>())
-                      // 2 s, not 5. This is best-effort cleanup and the
-                      // user has already confirmed Logout; holding them
-                      // five seconds on a bad network to tidy up a push
-                      // registration is the wrong trade (2026-09-26).
-                      // It cannot simply move to the background: the
-                      // AuthApi.logout() below clears the very token this
-                      // DELETE needs, and if the user signs back in within
-                      // that window it would clear the NEW session's token.
-                      .timeout(const Duration(seconds: 2));
-                } catch (_) {}
-                if (!context.mounted) return;
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                context.read<CounsellorState>().resetForNewUser();
-                context.read<AppState>().logout();
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                  (route) => false,
-                );
-              },
+              // Serves BOTH doctor and pharmacist — the pharmacist shell
+              // reuses this SimpleProfile.
+              onPressed: () => performLogout(context),
               icon: const Icon(Icons.logout, color: C2.danger),
               label: Text('Log out', style: ct(14, FontWeight.w600, C2.danger)),
               style: OutlinedButton.styleFrom(

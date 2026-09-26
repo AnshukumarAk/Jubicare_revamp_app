@@ -3,17 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:provider/provider.dart';
-import '../api/api_client.dart';
-import '../api/api_errors.dart';
-import '../api/auth_api.dart';
 import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
 import '../api/masters_store.dart';
 import '../api/sync_api.dart';
 import '../api/sync_service.dart';
-import '../screens/unified_login.dart';
+import '../services/logout_flow.dart';
 import '../services/location_service.dart';
-import '../services/fcm_service.dart';
 import '../services/notification_router.dart';
 import '../services/notifications_store.dart';
 import '../services/patients_cache_store.dart';
@@ -533,52 +529,7 @@ class _ShellState extends State<_Shell> {
             title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
             onTap: () async {
               Navigator.pop(context);
-              if (!await confirmLogout(context)) return;
-              if (!mounted) return;
-              // Center loader so the user sees progress while the
-              // FCM DELETE + auth logout round-trips run — up to a
-              // few seconds on a slow network (user 2026-09-10).
-              showDialog<void>(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => const Center(child: CircularProgressIndicator()),
-              );
-              // Stop location tracking BEFORE clearing session — otherwise the
-              // sampler keeps firing after logout.
-              context.read<LocationService>().stop();
-              // Kill the FCM registration FIRST so the DELETE call still
-              // carries a valid access token (user 2026-09-10: logout was
-              // racing token-clear vs fcm DELETE; DELETE 401'd and the
-              // server-side FCM row survived, so notifications kept
-              // arriving after logout). AWAIT it with a short cap so a
-              // slow network never blocks the logout tap.
-              try {
-                await FcmService.instance
-                    .unregister(context.read<ApiClient>())
-                    // 2 s, not 5. This is best-effort cleanup and the
-                    // user has already confirmed Logout; holding them
-                    // five seconds on a bad network to tidy up a push
-                    // registration is the wrong trade (2026-09-26).
-                    // It cannot simply move to the background: the
-                    // AuthApi.logout() below clears the very token this
-                    // DELETE needs, and if the user signs back in within
-                    // that window it would clear the NEW session's token.
-                    .timeout(const Duration(seconds: 2));
-              } catch (_) {/* offline — the server auto-cleans on the
-                              next UnregisteredError push */}
-              if (!mounted) return;
-              // Best-effort backend logout (v2 §1.3 — ends every session
-              // for this account on the server). Fire-and-forget after
-              // fcm unregister has finished.
-              unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-              // Wipe user-scoped lists (user rule 2026-08-16).
-              context.read<CounsellorState>().resetForNewUser();
-              context.read<AppState>().logout();
-              // Replace the whole navigation stack with the unified login.
-              Navigator.of(context).pushAndRemoveUntil(
-                MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                (route) => false,
-              );
+              await performLogout(context);
             },
           ),
         ])),

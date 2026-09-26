@@ -13,26 +13,22 @@ import 'cw.dart';
 import 'cdata.dart';
 import 'cstate.dart';
 import 'screens_dashboard.dart' show kUploadsBase;
-import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../config/app_config.dart';
 import '../api/attendance_api.dart';
-import '../api/auth_api.dart';
 import '../api/camps_api.dart';
 import '../api/devices_api.dart';
 import '../api/masters_store.dart';
 import '../api/sync_service.dart';
 import '../api/uploads_api.dart';
+import '../services/logout_flow.dart';
 import '../services/deepgram_stt.dart';
-import '../screens/unified_login.dart';
 import '../services/attendance_store.dart';
 import '../services/devices_store.dart';
-import '../services/fcm_service.dart';
 import '../services/back_form_registry.dart';
 import '../widgets/pending_alert.dart';
 import '../widgets/photo_lightbox.dart';
 import '../services/camps_store.dart';
-import '../services/location_service.dart';
 import '../services/photo_watermark.dart';
 import '../services/notifications_service.dart';
 import '../state/app_state.dart';
@@ -2626,47 +2622,7 @@ class CounProfile extends StatelessWidget {
               _kv('Status', status),
             ])),
             SizedBox(width: double.infinity, child: OutlinedButton.icon(
-              onPressed: () async {
-                if (!await confirmLogout(context)) return;
-                if (!context.mounted) return;
-                // Real logout (was popUntil → just went Home while the
-                // session stayed alive). Mirrors the shell menu's logout:
-                // stop the GPS sampler, end the server session, clear the
-                // local session, land on the login screen with no back
-                // stack.
-                context.read<LocationService>().stop();
-                // Center loader while FCM DELETE + auth logout finish.
-                showDialog<void>(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (_) => const Center(child: CircularProgressIndicator()),
-                );
-                // Kill FCM so pushes stop coming for the old user
-                // (bug 2026-08-20) — and BEFORE AuthApi.logout(), whose
-                // `finally` clears TokenStore. This site had the two the
-                // other way round and both unawaited, so the DELETE went
-                // out with no bearer token essentially every time: of the
-                // four logout buttons in the app this was the one that
-                // never actually unregistered, and the profile screen is
-                // where a counsellor signs out from (user 2026-09-26).
-                try {
-                  await FcmService.instance
-                      .unregister(context.read<ApiClient>())
-                      .timeout(const Duration(seconds: 2));
-                } catch (_) {/* offline — server auto-cleans on next
-                                UnregisteredError push */}
-                if (!context.mounted) return;
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                // Wipe cached patient/requisition/attendance lists so
-                // the next user doesn't see this one's data (user rule
-                // 2026-08-16). Same lines in every logout site.
-                context.read<CounsellorState>().resetForNewUser();
-                context.read<AppState>().logout();
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                  (route) => false,
-                );
-              },
+              onPressed: () => performLogout(context),
               icon: const Icon(Icons.logout, color: C2.danger),
               label: Text('Log out', style: ct(14, FontWeight.w600, C2.danger)),
               style: OutlinedButton.styleFrom(side: const BorderSide(color: C2.danger), padding: const EdgeInsets.symmetric(vertical: 13), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))))),
