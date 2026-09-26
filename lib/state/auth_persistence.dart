@@ -63,6 +63,24 @@ class AuthPersistence {
     }
   }
 
+  /// Is anybody signed in on this handset?
+  ///
+  /// Just the flag, so a push handler can ask without paying for the rest
+  /// of the session. It reads from disk each time rather than caching,
+  /// because the background isolate has its own memory and would otherwise
+  /// answer from a copy made before the user signed out.
+  static Future<bool> hasSession() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.reload();
+      return (p.getString(_kLoggedIn) ?? 'no') == 'yes';
+    } catch (_) {
+      // Unreadable prefs: say yes. A missed notification is worse than a
+      // stray one, and every other guard still applies below.
+      return true;
+    }
+  }
+
   /// Read the stored session. Returns null when the flag is unset or the
   /// stored role can't be matched to a known Role — main.dart treats that
   /// as "not logged in" and falls back to the splash / login flow.

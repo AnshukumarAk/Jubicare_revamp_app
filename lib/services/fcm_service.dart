@@ -4,6 +4,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 
 import '../api/api_client.dart';
+import '../state/auth_persistence.dart';
 import 'notifications_service.dart';
 import 'notifications_store.dart';
 
@@ -65,7 +66,14 @@ class FcmService {
         fm.getInitialMessage().then((m) {
           if (m != null) _persistOnly(m);
         });
-        _msgSub = FirebaseMessaging.onMessage.listen((RemoteMessage m) {
+        _msgSub = FirebaseMessaging.onMessage.listen((RemoteMessage m) async {
+          // Nobody is signed in on this handset, so there is nobody to
+          // notify. Asked first, and of the stored flag rather than of
+          // currentUserKey, because the cross-user check below reads that
+          // key and logout empties it — the guard switched itself off in
+          // exactly the state it was needed for, which is why pushes kept
+          // arriving after sign-out (user 2026-09-26).
+          if (!await AuthPersistence.hasSession()) return;
           // A push addressed to a DIFFERENT user of this handset (uid in
           // the data payload) is dropped outright — neither banner nor
           // bell history (user 2026-08-26 cross-user leak).
@@ -98,7 +106,11 @@ class FcmService {
     } catch (_) {/* push is a courtesy — never break the app for it */}
   }
 
-  void _persistOnly(RemoteMessage m) {
+  Future<void> _persistOnly(RemoteMessage m) async {
+    // Same guard as the foreground listener: with nobody signed in there is
+    // no bell to append to, and appending anyway is how a previous user's
+    // notifications turned up for the next one (user 2026-09-26).
+    if (!await AuthPersistence.hasSession()) return;
     final n = m.notification;
     final title = n?.title ?? (m.data['title'] as String? ?? '');
     final body = n?.body ?? (m.data['body'] as String? ?? '');
@@ -142,15 +154,27 @@ class FcmService {
     try {
       if (Firebase.apps.isNotEmpty) {
         try {
-          await FirebaseMessaging.instance.deleteToken();
+          // Capped: on a phone that cannot reach Firebase this sits there
+          // for as long as the plugin feels like, and the user is staring
+          // at a spinner on the Logout they already confirmed. Failing to
+          // delete the token locally costs nothing — the server drops the
+          // row on the first UnregisteredError push (user 2026-09-26).
+          await FirebaseMessaging.instance
+              .deleteToken()
+              .timeout(const Duration(milliseconds: 800));
         } catch (_) {}
       }
     } catch (_) {}
     try {
       // Backend endpoint accepts DELETE; a POST with empty token also
       // upserts to a no-op row. DELETE is cleaner — matches the intent.
+      //
+      // 1.2 s rather than 4: this is best-effort cleanup, and the caller
+      // is holding a signed-out user on screen while it runs. On a working
+      // network it answers in a few hundred milliseconds; on a broken one,
+      // waiting four seconds does not make it likelier to arrive.
       await client.delete('/users/fcm-token').timeout(
-          const Duration(seconds: 4));
+          const Duration(milliseconds: 1200));
     } catch (_) {/* offline / not deployed — the token dies locally anyway */}
     await NotificationsStore.setCurrentUser(null);
     await dispose();
@@ -173,6 +197,18 @@ Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
     if (Firebase.apps.isEmpty) {
       await Firebase.initializeApp();
     }
+    // Nobody signed in: drop it. This isolate has its own memory, so it
+    // cannot consult currentUserKey — it reads the stored flag straight
+    // off disk, which is the one thing logout reliably clears
+    // (user 2026-09-26).
+    //
+    // Worth being honest about the limit: a push carrying a `notification`
+    // block is drawn by Android itself before this runs, and no app code
+    // can unring that. What this does prevent is the bell filling up with
+    // a signed-out user's messages, and every data-only push getting
+    // through. Stopping the banner needs the server to stop sending —
+    // that is the FCM registration being deleted at logout.
+    if (!await AuthPersistence.hasSession()) return;
     final n = message.notification;
     final title = n?.title ?? (message.data['title'] as String? ?? '');
     final body = n?.body ?? (message.data['body'] as String? ?? '');

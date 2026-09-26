@@ -503,7 +503,15 @@ class _ShellState extends State<_Shell> {
               try {
                 await FcmService.instance
                     .unregister(context.read<ApiClient>())
-                    .timeout(const Duration(seconds: 5));
+                    // 2 s, not 5. This is best-effort cleanup and the
+                    // user has already confirmed Logout; holding them
+                    // five seconds on a bad network to tidy up a push
+                    // registration is the wrong trade (2026-09-26).
+                    // It cannot simply move to the background: the
+                    // AuthApi.logout() below clears the very token this
+                    // DELETE needs, and if the user signs back in within
+                    // that window it would clear the NEW session's token.
+                    .timeout(const Duration(seconds: 2));
               } catch (_) {/* offline — the server auto-cleans on the
                               next UnregisteredError push */}
               if (!mounted) return;

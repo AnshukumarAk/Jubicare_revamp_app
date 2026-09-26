@@ -263,7 +263,15 @@ class DocHeader extends StatelessWidget {
                 try {
                   await FcmService.instance
                       .unregister(context.read<ApiClient>())
-                      .timeout(const Duration(seconds: 5));
+                      // 2 s, not 5. This is best-effort cleanup and the
+                      // user has already confirmed Logout; holding them
+                      // five seconds on a bad network to tidy up a push
+                      // registration is the wrong trade (2026-09-26).
+                      // It cannot simply move to the background: the
+                      // AuthApi.logout() below clears the very token this
+                      // DELETE needs, and if the user signs back in within
+                      // that window it would clear the NEW session's token.
+                      .timeout(const Duration(seconds: 2));
                 } catch (_) {/* offline — server auto-cleans on next
                                 UnregisteredError push */}
                 if (!context.mounted) return;
@@ -1742,7 +1750,15 @@ class SimpleProfile extends StatelessWidget {
                 try {
                   await FcmService.instance
                       .unregister(context.read<ApiClient>())
-                      .timeout(const Duration(seconds: 5));
+                      // 2 s, not 5. This is best-effort cleanup and the
+                      // user has already confirmed Logout; holding them
+                      // five seconds on a bad network to tidy up a push
+                      // registration is the wrong trade (2026-09-26).
+                      // It cannot simply move to the background: the
+                      // AuthApi.logout() below clears the very token this
+                      // DELETE needs, and if the user signs back in within
+                      // that window it would clear the NEW session's token.
+                      .timeout(const Duration(seconds: 2));
                 } catch (_) {}
                 if (!context.mounted) return;
                 unawaited(context.read<AuthApi>().logout().catchError((_) {}));
