@@ -1057,12 +1057,61 @@ class CounsellorState extends ChangeNotifier {
   }
   void addPharmaAttendance(AttendanceRecord r) { pharmaAttendance.insert(0, r); notifyListeners(); }
 
+  // ----- Derived views over `patients` -----
+  //
+  // Each of these was a fresh scan of the whole list on EVERY read, and the
+  // Home screens read two or three of them per rebuild across eighteen
+  // widgets. On a 2,000-row list that is fifty-odd full scans plus several
+  // n-log-n sorts per frame — which is what made scrolling and typing
+  // stutter (user 2026-09-26). They are computed once now and held until
+  // the next notification.
+  //
+  // Invalidation lives in exactly one place, the notifyListeners() override
+  // below, and NOT in the eight methods that mutate `patients`. That is the
+  // whole safety argument: Provider rebuilds only on notifyListeners(), so a
+  // value held between two notifications cannot be staler than what the
+  // screen is already displaying. There is no invalidation to forget,
+  // because nothing can change what the user sees without notifying.
+  //
+  // The one thing worth knowing: the past-7-day getters close over
+  // DateTime.now(), so their window advances on the next notification rather
+  // than the next read. With a 30-second queue poll that is not a window
+  // anybody can observe.
+  int? _registeredToday;
+  int? _visitsCompleted;
+  List<CPatient>? _doctorQueue;
+  List<CPatient>? _doctorAttended;
+  List<CPatient>? _doctorPast7Days;
+  List<CPatient>? _pharmaQueue;
+  List<CPatient>? _dispensedPatients;
+  List<CPatient>? _counsellorPast7Days;
+  List<CPatient>? _pharmaPast7Days;
+
+  @override
+  void notifyListeners() {
+    _registeredToday      = null;
+    _visitsCompleted      = null;
+    _doctorQueue          = null;
+    _doctorAttended       = null;
+    _doctorPast7Days      = null;
+    _pharmaQueue          = null;
+    _dispensedPatients    = null;
+    _counsellorPast7Days  = null;
+    _pharmaPast7Days      = null;
+    _cutoff               = null;
+    super.notifyListeners();
+  }
+
   // ----- Counsellor views -----
-  int get registeredToday => patients.where((p) => p.registeredOn == 'Today').length;
-  int get visitsCompleted => patients.where((p) => p.status == 'completed').length;
+  int get registeredToday => _registeredToday ??=
+      patients.where((p) => p.registeredOn == 'Today').length;
+  int get visitsCompleted => _visitsCompleted ??=
+      patients.where((p) => p.status == 'completed').length;
 
   // ----- Doctor views -----
-  List<CPatient> get doctorQueue => patients.where((p) => p.status == 'registered' || p.status == 'with_doctor').toList();
+  List<CPatient> get doctorQueue => _doctorQueue ??= patients
+      .where((p) => p.status == 'registered' || p.status == 'with_doctor')
+      .toList();
   /// Cases the doctor has finished consulting on.
   ///
   /// Deliberately wider than with_pharma/completed. The status ladder (§6.2)
@@ -1076,31 +1125,21 @@ class CounsellorState extends ChangeNotifier {
   };
   /// Latest action first (user 2026-08-22): newest appointment id leads;
   /// local rows still syncing (no id yet) sit on top.
-  List<CPatient> get doctorAttended =>
+  List<CPatient> get doctorAttended => _doctorAttended ??=
       patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList()
         ..sort((a, b) => (b.backendAppointmentId ?? 1 << 30)
             .compareTo(a.backendAppointmentId ?? 1 << 30));
+  // Free now that doctorAttended is held: the tile used to build and sort
+  // the entire list just to read .length off it.
   int get doctorCompleted => doctorAttended.length;
 
   /// Every patient the doctor has interacted with in the last 7 days —
   /// queue + attended — sorted newest first. Filters by CPatient.regDate
   /// (format "dd-Mon-yyyy" per fmtDate).
-  List<CPatient> get doctorPast7Days {
-    final cutoff = DateTime.now().subtract(const Duration(days: 7));
-    bool within(String s) {
-      final d = _parseFmtDate(s);
-      return d != null && !d.isBefore(cutoff);
-    }
-    final list = [
-      ...doctorQueue.where((p) => within(p.regDate)),
-      ...doctorAttended.where((p) => within(p.regDate)),
-    ]..sort((a, b) {
-        final da = _parseFmtDate(a.regDate) ?? DateTime(1970);
-        final db = _parseFmtDate(b.regDate) ?? DateTime(1970);
-        return db.compareTo(da);
-      });
-    return list;
-  }
+  List<CPatient> get doctorPast7Days => _doctorPast7Days ??= _byRegDateDesc([
+        ...doctorQueue.where((p) => _within7Days(p.regDate)),
+        ...doctorAttended.where((p) => _within7Days(p.regDate)),
+      ]);
 
   static const _months = {
     'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
@@ -1118,43 +1157,52 @@ class CounsellorState extends ChangeNotifier {
   }
 
   // ----- Pharmacist views -----
-  List<CPatient> get pharmaQueue => patients.where((p) => p.status == 'with_pharma').toList();
-  List<CPatient> get dispensedPatients => patients.where((p) => p.status == 'completed').toList();
+  List<CPatient> get pharmaQueue => _pharmaQueue ??=
+      patients.where((p) => p.status == 'with_pharma').toList();
+  List<CPatient> get dispensedPatients => _dispensedPatients ??=
+      patients.where((p) => p.status == 'completed').toList();
   int get pharmaDispensed => dispensedPatients.length;
 
   // ----- Past-7-day KPI feeds (rule 2026-07-31, parity with doctor) -----
   bool _within7Days(String regDate) {
     final d = _parseFmtDate(regDate);
     if (d == null) return false;
-    final cutoff = DateTime.now().subtract(const Duration(days: 7));
-    return !d.isBefore(cutoff);
+    return !d.isBefore(_sevenDaysAgo);
   }
 
-  /// Every patient the counsellor registered in the last 7 days, newest first.
-  List<CPatient> get counsellorPast7Days {
-    final list = patients.where((p) => _within7Days(p.regDate)).toList()
-      ..sort((a, b) {
-        final da = _parseFmtDate(a.regDate) ?? DateTime(1970);
-        final db = _parseFmtDate(b.regDate) ?? DateTime(1970);
-        return db.compareTo(da);
-      });
-    return list;
+  /// One cutoff per notification instead of one per element. This used to
+  /// call DateTime.now() inside the filter, so a 2,000-row list built two
+  /// thousand DateTimes and did two thousand subtractions to answer a
+  /// question with a single answer.
+  DateTime get _sevenDaysAgo =>
+      _cutoff ??= DateTime.now().subtract(const Duration(days: 7));
+  DateTime? _cutoff;
+
+  /// Newest registration first, parsing each regDate ONCE.
+  ///
+  /// The comparator these getters shared called _parseFmtDate on both sides
+  /// of every comparison — a split('-') and three int.tryParse calls, O(n log
+  /// n) times over, for dates that cannot change while the sort runs. Same
+  /// comparison result, so the ordering is unchanged.
+  List<CPatient> _byRegDateDesc(Iterable<CPatient> src) {
+    final keyed = [
+      for (final p in src) (_parseFmtDate(p.regDate) ?? _epoch, p),
+    ]..sort((a, b) => b.$1.compareTo(a.$1));
+    return [for (final e in keyed) e.$2];
   }
+
+  static final DateTime _epoch = DateTime(1970);
+
+  /// Every patient the counsellor registered in the last 7 days, newest first.
+  List<CPatient> get counsellorPast7Days => _counsellorPast7Days ??=
+      _byRegDateDesc(patients.where((p) => _within7Days(p.regDate)));
 
   /// Every patient the pharmacist has seen (queue + dispensed) in the last
   /// 7 days, newest first.
-  List<CPatient> get pharmaPast7Days {
-    final list = patients
-        .where((p) => p.status == 'with_pharma' || p.status == 'completed')
-        .where((p) => _within7Days(p.regDate))
-        .toList()
-      ..sort((a, b) {
-        final da = _parseFmtDate(a.regDate) ?? DateTime(1970);
-        final db = _parseFmtDate(b.regDate) ?? DateTime(1970);
-        return db.compareTo(da);
-      });
-    return list;
-  }
+  List<CPatient> get pharmaPast7Days => _pharmaPast7Days ??= _byRegDateDesc(
+      patients
+          .where((p) => p.status == 'with_pharma' || p.status == 'completed')
+          .where((p) => _within7Days(p.regDate)));
 
   String nextId() => 'P${_seq++}';
   String nextUniqueCode() => 'GN-${(_seq).toString().padLeft(4, '0')}';
