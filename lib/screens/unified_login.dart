@@ -218,6 +218,20 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
                 ),
               ]),
             ),
+            const SizedBox(height: 18),
+            // Who built this. Asked for on the login screen specifically
+            // (user 2026-09-28) — it is the one screen every user sees
+            // before they are anybody in particular.
+            Text(
+              'Indev Consultancy Pvt. Ltd.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: Colors.black.withValues(alpha: 0.45),
+              ),
+            ),
+            const SizedBox(height: 6),
           ]),
         ),
       ),

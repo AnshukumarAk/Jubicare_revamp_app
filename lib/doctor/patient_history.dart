@@ -436,44 +436,29 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   /// Blank values still render a row so the record reads as "nothing recorded"
   /// rather than silently omitting a field the doctor expects to see.
-  /// Past this many characters the value stops sharing a line with its
-  /// label and takes the full width beneath it. Roughly one line's worth in
-  /// the space left beside a 108px label — so anything that would have
-  /// wrapped gets the whole width instead (user 2026-09-28).
-  static const int _stackOver = 40;
-
-  /// A label/value row — or a stacked block when the value is a paragraph.
+  /// Label above, value beneath, the full width — every row.
   ///
-  /// The fixed 108px label column suits "Seen by · Noida Doctor". It was
-  /// wrong for a dictated remark: twenty lines squeezed down 60% of the
-  /// screen with the other 40% sitting empty beside the label
-  /// (user 2026-09-28, screenshot). Long values now get the whole width.
+  /// It was a 108px label column with the value beside it, which left a
+  /// dictated remark running twenty lines down 60% of the screen with the
+  /// rest empty. The first pass stacked only the long ones, which read worse:
+  /// Diagnosis sat beside its label while Symptoms above it did not
+  /// (user 2026-09-28). One rule for the whole card now.
   ///
-  /// [value] replaces the plain Text, for rows that need more than one --
-  /// the remarks carry a "Show original" toggle. A row with one always
-  /// stacks, since the toggle needs somewhere to sit.
-  Widget _kv(String k, String v, {Widget? value}) {
-    final text = v.trim();
-    final body = value ??
-        Text(text.isEmpty ? '—' : text, style: ct(12.5, FontWeight.w400, C2.text));
-    if (value == null && text.length <= _stackOver) {
-      return Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          SizedBox(width: 108, child: Text(k, style: ct(11.5, FontWeight.w500, C2.text2))),
-          Expanded(child: body),
+  /// [value] replaces the plain Text for rows that need more than one --
+  /// the vitals grid, and the remarks with their "Show original" toggle.
+  Widget _kv(String k, String v, {Widget? value}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(k, style: ct(11.5, FontWeight.w500, C2.text2)),
+          const SizedBox(height: 3),
+          SizedBox(
+            width: double.infinity,
+            child: value ??
+                Text(v.trim().isEmpty ? '—' : v.trim(),
+                    style: ct(12.5, FontWeight.w400, C2.text)),
+          ),
         ]),
       );
-    }
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(k, style: ct(11.5, FontWeight.w500, C2.text2)),
-        const SizedBox(height: 3),
-        SizedBox(width: double.infinity, child: body),
-      ]),
-    );
-  }
 
   Widget _statusChip(String status) {
     final (label, bg, fg) = switch (status) {
