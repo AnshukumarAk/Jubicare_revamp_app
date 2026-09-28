@@ -342,6 +342,14 @@ class _SymptomFieldState extends State<SymptomField> {
       btns);
   }
 
+  /// Both suggestion cards wear one skin (user 2026-09-28: "change the
+  /// related symptoms card same as Common in village"). They answer the same
+  /// question — what else might this patient have — so two different
+  /// gradients read as two different kinds of thing. The icons still differ,
+  /// because a village trend and a symptom link are not the same evidence.
+  static const _kSuggestionSkin =
+      LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]);
+
   Widget _loadingPanel(String title, Gradient g) => Container(
         width: double.infinity,
         padding: const EdgeInsets.all(10),
@@ -391,11 +399,11 @@ class _SymptomFieldState extends State<SymptomField> {
     // for the previous chip while a fresh preview request is in flight.
     if (widget.loading) {
       return _loadingPanel('Related symptoms',
-          const LinearGradient(colors: [C2.cyan, C2.green]));
+          _kSuggestionSkin);
     }
     if (widget.error) {
       return _errorPanel('Related symptoms',
-          const LinearGradient(colors: [C2.cyan, C2.green]));
+          _kSuggestionSkin);
     }
     // Server-computed list wins when available (see field docstring).
     if (widget.serverRelated != null && widget.serverRelated!.isNotEmpty) {
@@ -405,7 +413,7 @@ class _SymptomFieldState extends State<SymptomField> {
       ];
       if (rel.isEmpty) return const SizedBox.shrink();
       return _panel(
-        const LinearGradient(colors: [C2.cyan, C2.green]),
+        _kSuggestionSkin,
         Icons.link, 'Related symptoms', rel.take(5).toList());
     }
     // Downloaded terminology JSON — the input (incl. Hindi/Roman-Hindi,
@@ -433,7 +441,7 @@ class _SymptomFieldState extends State<SymptomField> {
     }
     if (rel.isEmpty) return const SizedBox.shrink();
     return _panel(
-      const LinearGradient(colors: [C2.cyan, C2.green]),
+      _kSuggestionSkin,
       Icons.link, 'Related symptoms', rel.take(5).toList());
   }
 

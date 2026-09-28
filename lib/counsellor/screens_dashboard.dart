@@ -395,7 +395,12 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                 // (user 2026-08-14). The map KEYS stay canonical — the
                 // doctor's editable card and re-appointment prefill
                 // match on them.
-                ...p.vitals.entries.map((e) => _kv(_kVitalUnitLabel[e.key] ?? e.key, e.value)),
+                // Two per row (user 2026-09-28). Nine vitals stacked one to a
+                // line pushed the remarks and photos below the fold; paired
+                // up they fit a screen. Label above value rather than beside
+                // it, because "Systolic BP (mmHg)" has no room to sit beside
+                // anything in half a phone's width.
+                ..._vitalRows(p.vitals),
               ])),
             if (p.remarks.isNotEmpty)
               CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -484,6 +489,39 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       ),
     );
   }
+
+  /// The vitals map laid out two to a row, in the order it was built.
+  /// An odd count leaves the last cell empty rather than stretching the
+  /// value across the full width, so the columns stay aligned.
+  List<Widget> _vitalRows(Map<String, String> vitals) {
+    final e = vitals.entries.toList();
+    return [
+      for (var i = 0; i < e.length; i += 2)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 5),
+          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(child: _vitalCell(
+                _kVitalUnitLabel[e[i].key] ?? e[i].key, e[i].value)),
+            const SizedBox(width: 12),
+            Expanded(
+              child: i + 1 < e.length
+                  ? _vitalCell(_kVitalUnitLabel[e[i + 1].key] ?? e[i + 1].key,
+                      e[i + 1].value)
+                  : const SizedBox.shrink(),
+            ),
+          ]),
+        ),
+    ];
+  }
+
+  Widget _vitalCell(String k, String v) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(k, style: ct(11, FontWeight.w400, C2.text2)),
+          const SizedBox(height: 2),
+          Text(v, style: ct(13.5, FontWeight.w600, C2.text)),
+        ],
+      );
 
   Widget _kv(String k, String v) => Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),

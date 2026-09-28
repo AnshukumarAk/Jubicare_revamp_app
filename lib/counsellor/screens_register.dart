@@ -1323,7 +1323,7 @@ class _CounRegisterState extends State<CounRegister> {
         // with_login deploy lands) keep the picker so nothing breaks.
         CField('Doctor Assignment',
             _doctorNames.length == 1
-                ? _lockedField(doctor ?? _doctorNames.first)
+                ? _lockedField(doctor ?? _doctorNames.first, showLock: false)
                 : _dd(_doctorNames, doctor, (v) => setState(() => doctor = v), hint: 'Select Doctor'),
             required: true),
         // Patient Remarks — Deepgram STT (nova-2 + language=hi, locked
@@ -1461,9 +1461,16 @@ class _CounRegisterState extends State<CounRegister> {
   /// (State / District). Renders with the same border/padding as every
   /// other field, a lock suffix instead of a dropdown arrow, and no tap
   /// handler — visibly a field, visibly not editable.
-  Widget _lockedField(String v) => InputDecorator(
+  /// [showLock] false drops the padlock while keeping the read-only look.
+  /// State and District are assigned by the web admin and the padlock says
+  /// so usefully. A single-doctor MMU is not the same thing — there is
+  /// simply nobody else to pick, and a padlock made it read as a permission
+  /// the counsellor lacks (user 2026-09-28).
+  Widget _lockedField(String v, {bool showLock = true}) => InputDecorator(
         decoration: cInput().copyWith(
-          suffixIcon: const Icon(Icons.lock_outline, size: 16, color: C2.text3),
+          suffixIcon: showLock
+              ? const Icon(Icons.lock_outline, size: 16, color: C2.text3)
+              : null,
         ),
         child: Text(
           v.isEmpty ? '—' : v,
