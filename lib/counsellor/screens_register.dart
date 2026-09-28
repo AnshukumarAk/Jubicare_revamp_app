@@ -95,6 +95,27 @@ double? _asDouble(TextEditingController c) {
 }
 
 /// Same for ints. Backend vitals like systolic_bp / blood_sugar are int.
+/// "100.0" -> "100"; "98.6" stays "98.6"; anything unparseable is returned
+/// untouched.
+///
+/// Numeric columns come back from the server carrying their decimal part,
+/// and Blood Sugar is the only one of them read back with int.tryParse --
+/// which returns null for "100.0". So a re-appointment prefilled with last
+/// visit's reading dropped that one field on submit while every other vital
+/// carried over: BP, pulse and SpO2 are integer columns, and temperature and
+/// haemoglobin are parsed as doubles. Confirmed on live 2026-09-28 --
+/// appointment 1828880 recorded blood_sugar 100.0, its re-appointment
+/// 1828894 recorded null, and nothing else differed.
+///
+/// It was visible as well as broken: the box is digits-only with a
+/// three-character limit, and it was being handed five characters, two of
+/// them ones it would refuse to accept if typed.
+String _wholeNumber(String s) {
+  final d = double.tryParse(s);
+  if (d == null) return s;
+  return d == d.roundToDouble() ? d.toInt().toString() : s;
+}
+
 int? _asInt(TextEditingController c) {
   final s = c.text.trim();
   if (s.isEmpty) return null;
@@ -940,7 +961,7 @@ class _CounRegisterState extends State<CounRegister> {
       String vital(List<String> keys) {
         for (final k in keys) {
           final v = p.vitals[k];
-          if (v != null && v.trim().isNotEmpty) return v.trim();
+          if (v != null && v.trim().isNotEmpty) return _wholeNumber(v.trim());
         }
         return '';
       }
@@ -970,8 +991,8 @@ class _CounRegisterState extends State<CounRegister> {
       // blood group, category, PwD flag, pincode, address. Section is
       // auto-expanded so the counsellor sees the values right away.
       _aadhar.text = p.aadhar;
-      _height.text = p.heightCm;
-      _weight.text = p.weightKg;
+      _height.text = _wholeNumber(p.heightCm);
+      _weight.text = _wholeNumber(p.weightKg);
       bloodGroup   = p.bloodGroup;
       category     = p.category;
       pwd          = p.pwd.isEmpty ? 'No' : p.pwd;

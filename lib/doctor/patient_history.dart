@@ -205,8 +205,25 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
               _vitalsLine(v),
               _testsBlock(v, advised),
               _rxBlock(v),
-              _kv('Observation', en('observation_english', 'observation')),
-              _kv('Doctor Remarks', remarks),
+              // Observation and Doctor Remarks are dictated and translated
+              // the same way the patient's own words are, so they get the
+              // same way back to the original (user 2026-09-28).
+              _kv('Observation', en('observation_english', 'observation'),
+                  value: CTranslatedText(
+                    en('observation_english', 'observation'),
+                    original: '${v['observation'] ?? ''}',
+                    style: ct(12.5, FontWeight.w400, C2.text),
+                  )),
+              // `remarks` is the doctor's text with its "Tests advised:"
+              // line already split off, so the original is split the same
+              // way before being offered — otherwise the toggle would put
+              // the test list back.
+              _kv('Doctor Remarks', remarks,
+                  value: CTranslatedText(
+                    remarks,
+                    original: _splitAdvisedTests('${v['doctor_remarks'] ?? ''}').$2,
+                    style: ct(12.5, FontWeight.w400, C2.text),
+                  )),
               // Label renamed Counsellor → Patient Remarks (user 2026-08-22).
               // English leads, as asked, but the words the patient actually
               // said are one tap away — a translation of a dictated complaint
@@ -243,34 +260,59 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   /// Vitals render as one wrapped line — seven separate rows pushed the
   /// prescription off the screen on a phone.
+  /// Vitals laid out the way Patient Details lays them out: each reading
+  /// labelled above its value, two to a row (user 2026-09-28).
+  ///
+  /// It used to be one joined string — "BP 280/150 · Sugar 100 · Temp 86 ·
+  /// …" — which broke wherever the width ran out, so a line could open with
+  /// an orphaned separator, and "Wt 999" gave no clue what it was measuring.
   Widget _vitalsLine(Map<String, dynamic> v) {
     const specs = [
-      ('BP', 'systolic_bp', 'diastolic_bp'),
-      ('Sugar', 'blood_sugar', null),
-      ('Temp', 'body_temp', null),
-      ('SpO₂', 'oxygen', null),
-      ('Hb', 'hemoglobin', null),
-      ('Ht', 'height', null),
-      ('Wt', 'weight', null),
+      ('BP (mmHg)', 'systolic_bp', 'diastolic_bp'),
+      ('Blood Sugar (mg/dl)', 'blood_sugar', null),
+      ('Body Temp (°F)', 'body_temp', null),
+      ('SpO₂ (%)', 'oxygen', null),
+      ('Hemoglobin (g/dL)', 'hemoglobin', null),
+      ('Height (cm)', 'height', null),
+      ('Weight (kg)', 'weight', null),
     ];
-    final parts = <String>[];
+    final cells = <(String, String)>[];
     for (final (label, a, b) in specs) {
       final va = _num(v[a]);
       if (va.isEmpty) continue;
       final vb = b == null ? '' : _num(v[b]);
-      parts.add(vb.isEmpty ? '$label $va' : '$label $va/$vb');
+      cells.add((label, vb.isEmpty ? va : '$va/$vb'));
     }
-    if (parts.isEmpty) return _kv('Vitals', '');
-    // Wrap rather than one joined string: joining put the separator at the
-    // start of the next line ("· Ht 160 · Wt 999") whenever the text broke
-    // on a space around a dot. Each reading is now its own atom and cannot
-    // be split (user 2026-09-28, screenshot).
-    return _kv('Vitals', parts.join(' '),
-        value: Wrap(spacing: 14, runSpacing: 3, children: [
-          for (final p in parts)
-            Text(p, style: ct(12.5, FontWeight.w400, C2.text)),
+    if (cells.isEmpty) return _kv('Vitals', '');
+    return _kv('Vitals', ' ',
+        value: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          for (var i = 0; i < cells.length; i += 2)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: _vitalCell(cells[i])),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: i + 1 < cells.length
+                        ? _vitalCell(cells[i + 1])
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
+            ),
         ]));
   }
+
+  Widget _vitalCell((String, String) c) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(c.$1, style: ct(10.5, FontWeight.w400, C2.text2)),
+          const SizedBox(height: 2),
+          Text(c.$2, style: ct(13, FontWeight.w600, C2.text)),
+        ],
+      );
 
   /// Split a "Tests advised: A, B" line out of the doctor's remarks.
   ///

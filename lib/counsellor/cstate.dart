@@ -145,6 +145,10 @@ class CPatient {
   /// fields prefill from this, never from the English display copy
   /// (user 2026-08-22 "dont show english version in inputs").
   String remarksOriginal;
+
+  /// The doctor's remarks as dictated, before translation — the twin of
+  /// [remarksOriginal] for the other author on the visit (2026-09-28).
+  String doctorRemarksOriginal;
   String pastHistory; // chronic illness / surgeries / ongoing treatment
   String uploadedRx; // prescription file/image uploaded by counsellor (filename)
   List<Attachment> attachments; // multi-attachment (Prescription/Report/Other)
@@ -203,6 +207,7 @@ class CPatient {
     this.eddDate = '',
     this.remarks = '',
     this.remarksOriginal = '',
+    this.doctorRemarksOriginal = '',
     this.pastHistory = '',
     this.uploadedRx = '',
     List<Attachment>? attachments,

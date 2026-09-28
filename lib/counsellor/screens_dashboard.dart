@@ -225,6 +225,7 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       // Original as dictated — inputs (Re-Appointment prefill) use this.
       p.remarksOriginal = (d['counsellor_remarks'] ?? '').toString();
       p.doctorRemarks = eng('doctor_remarks_english', 'doctor_remarks');
+      p.doctorRemarksOriginal = (d['doctor_remarks'] ?? '').toString();
       p.observations = eng('observation_english', 'observation');
       p.pregnant = (d['pregnant'] as bool?) ?? p.pregnant;
       // Pregnancy dates ride along so Re-Appointment can re-select the
@@ -445,18 +446,25 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
             // it renders under its own "Tests Advised" card instead, and
             // an empty remainder hides the Doctor Remarks card entirely.
             Builder(builder: (_) {
-              final lines = p.doctorRemarks.split('\n');
-              final tests = <String>[];
-              final rest = <String>[];
-              for (final l in lines) {
-                final t = l.trim();
-                if (t.toLowerCase().startsWith('tests advised:')) {
-                  final v = t.substring('tests advised:'.length).trim();
-                  if (v.isNotEmpty) tests.add(v);
-                } else if (t.isNotEmpty) {
-                  rest.add(t);
+              // Split the tests line off BOTH copies, so the "Show original"
+              // toggle swaps remarks for remarks and never puts the test list
+              // back (user 2026-09-28).
+              (List<String>, List<String>) splitRemarks(String src) {
+                final tests = <String>[];
+                final rest = <String>[];
+                for (final l in src.split('\n')) {
+                  final t = l.trim();
+                  if (t.toLowerCase().startsWith('tests advised:')) {
+                    final v = t.substring('tests advised:'.length).trim();
+                    if (v.isNotEmpty) tests.add(v);
+                  } else if (t.isNotEmpty) {
+                    rest.add(t);
+                  }
                 }
+                return (tests, rest);
               }
+              final (tests, rest) = splitRemarks(p.doctorRemarks);
+              final (_, restOriginal) = splitRemarks(p.doctorRemarksOriginal);
               return Column(crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                 if (rest.isNotEmpty)
@@ -464,7 +472,8 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                     const SecBar('Doctor Remarks'),
-                    Text(rest.join('\n'),
+                    CTranslatedText(rest.join('\n'),
+                        original: restOriginal.join('\n'),
                         style: ct(13, FontWeight.w400, C2.text)),
                   ])),
                 if (tests.isNotEmpty)
