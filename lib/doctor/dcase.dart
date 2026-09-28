@@ -394,6 +394,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ? cRemarksEn
           : (d['counsellor_remarks'] ?? '').toString().trim();
       if (cRemarks.isNotEmpty) p.remarks = cRemarks;
+      // As dictated. Kept so the card below can offer it back — a
+      // translation of a complaint is worth reading against the words the
+      // patient actually used (user 2026-09-28).
+      p.remarksOriginal = (d['counsellor_remarks'] ?? '').toString();
       if (freshVitals.isNotEmpty) {
         p.vitals = {...p.vitals, ...freshVitals};
         for (final e in freshVitals.entries) {
@@ -754,7 +758,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // p.remarks is set by _applyRegistrationDetail with the English
             // version preferred (counsellor_remarks_english), falling back
             // to the original counsellor_remarks only when English is empty.
-            if (p.remarks.isNotEmpty) _kv('Patient Remarks', p.remarks),
+            if (p.remarks.isNotEmpty)
+              _kv('Patient Remarks', p.remarks,
+                  value: CTranslatedText(p.remarks,
+                      original: p.remarksOriginal,
+                      style: ct(13, FontWeight.w500, C2.text))),
           ])),
           // Editable Vitals card (rule 2026-07-31). Collapsible — same
           // switch pattern as the Counsellor Register form's Vitals section.
@@ -2037,10 +2045,27 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     ));
   }
 
-  Widget _kv(String k, String v) => Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(width: 90, child: Text(k, style: ct(12, FontWeight.w400, C2.text2))),
-        Expanded(child: Text(v, style: ct(13, FontWeight.w500, C2.text))),
-      ]));
+  /// Label above value, each taking the full width.
+  ///
+  /// It was a 90px label column with the value beside it, which left a
+  /// dictated remark running twenty lines down 65% of the screen while the
+  /// column beside it sat empty — and wrapped a five-symptom list onto two
+  /// lines for no reason (user 2026-09-28, screenshot). Only two rows use
+  /// this and both are long, so both stack.
+  ///
+  /// [value] replaces the plain Text for rows that need more than one — the
+  /// remarks carry a "Show original" toggle.
+  Widget _kv(String k, String v, {Widget? value}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(k, style: ct(12, FontWeight.w400, C2.text2)),
+          const SizedBox(height: 3),
+          SizedBox(
+            width: double.infinity,
+            child: value ?? Text(v, style: ct(13, FontWeight.w500, C2.text)),
+          ),
+        ]),
+      );
 
   // ═════════════ Px + Rx history (rule 2026-08-05) ═════════════
   // Prescription & Reports section renders two chip buttons; tapping each

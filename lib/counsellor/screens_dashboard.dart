@@ -405,7 +405,11 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
             if (p.remarks.isNotEmpty)
               CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 const SecBar('Patient Remarks'),
-                Text(p.remarks, style: ct(13, FontWeight.w400, C2.text)),
+                // English leads (user 2026-08-22), with the words the
+                // patient actually said one tap away (user 2026-09-28).
+                CTranslatedText(p.remarks,
+                    original: p.remarksOriginal,
+                    style: ct(13, FontWeight.w400, C2.text)),
               ])),
             // Prescription / report photos. Server-named rows render over
             // the network from uploads/patient_docs/; rows that only have

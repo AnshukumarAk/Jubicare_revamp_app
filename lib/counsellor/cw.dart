@@ -240,6 +240,64 @@ class CBadge extends StatelessWidget {
 }
 
 /// Labelled form field wrapper (uppercase muted label, optional required *).
+/// Text with its pre-translation wording one tap away.
+///
+/// Patient remarks are dictated in Hindi and translated to English when the
+/// registration is submitted, and every screen shows the English — that was
+/// asked for (user 2026-08-22, "still remarks showing hindi"). The original
+/// is kept on the server all the same, and a counsellor or doctor re-reading
+/// what the patient actually said needs the words they said, not a machine's
+/// rendering of them. So it is a tap away rather than gone
+/// (user 2026-09-28).
+///
+/// The toggle only appears when there IS an original and it differs from
+/// what is already on screen. A row typed in English, or one written before
+/// translation existed, shows nothing extra.
+class CTranslatedText extends StatefulWidget {
+  /// What to show first — normally the English.
+  final String text;
+
+  /// As dictated. Empty, or equal to [text], hides the toggle.
+  final String original;
+  final TextStyle? style;
+  const CTranslatedText(this.text,
+      {super.key, this.original = '', this.style});
+
+  @override
+  State<CTranslatedText> createState() => _CTranslatedTextState();
+}
+
+class _CTranslatedTextState extends State<CTranslatedText> {
+  bool _showOriginal = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = widget.text.trim();
+    final original = widget.original.trim();
+    final canFlip = original.isNotEmpty && original != shown;
+    final body = (_showOriginal && canFlip) ? original : shown;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(body.isEmpty ? '—' : body,
+          style: widget.style ?? _t(13, FontWeight.w400, C2.text)),
+      if (canFlip)
+        InkWell(
+          onTap: () => setState(() => _showOriginal = !_showOriginal),
+          borderRadius: BorderRadius.circular(4),
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2, right: 6),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(_showOriginal ? Icons.translate : Icons.record_voice_over_outlined,
+                  size: 13, color: C2.cyan),
+              const SizedBox(width: 4),
+              Text(_showOriginal ? 'Show translation' : 'Show original',
+                  style: _t(11.5, FontWeight.w600, C2.cyan)),
+            ]),
+          ),
+        ),
+    ]);
+  }
+}
+
 class CField extends StatelessWidget {
   final String label;
   final Widget child;
