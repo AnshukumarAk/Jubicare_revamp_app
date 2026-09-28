@@ -463,6 +463,7 @@ class _CounRegisterState extends State<CounRegister> {
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     if (_name.text.trim().isEmpty) return err('Enter patient name');
     if (knowAge && _age.text.trim().isEmpty) return err('Enter age');
+    if (knowAge && _ageErr() != null) return err('Age must be $_maxAgeYears or under');
     if (!knowAge && _dob == null) return err('Select date of birth');
     final ce = _contactError(_contact.text.trim());
     // Contact is required now that Unique Code is removed (rule 2026-07-29).
@@ -1083,7 +1084,7 @@ class _CounRegisterState extends State<CounRegister> {
         ],
         CField('Know', _radios(['Age','Date of Birth'], knowAge ? 'Age' : 'Date of Birth', (v) => setState(() => knowAge = v == 'Age')), required: true),
         if (knowAge)
-          CField('Age (in years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput('e.g. 28')), required: true)
+          CField('Age (Years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 28').copyWith(errorText: _ageErr())), required: true)
         else
           CField('Date of Birth', DateField(hint: 'Pick date of birth', first: DateTime(1920), last: DateTime.now(), initial: _dob, onPicked: (d) => setState(() => _dob = d)), required: true),
         CField('Contact Number', TextField(controller: _contact, keyboardType: TextInputType.phone,
@@ -1417,14 +1418,37 @@ class _CounRegisterState extends State<CounRegister> {
     _spo2:  (50, 100, 'Allowed 50–100%'),
     _hr:    (30, 220, 'Allowed 30–220'),
     _hb:    (3, 25, 'Allowed 3–25'),
+    // Weight had only the shared "Min 2 digits" floor, so 999.9 kg went
+    // through. 300 is well past any patient an MMU will weigh; the floor is
+    // kept where it already was, at 10, so nothing that used to be accepted
+    // stops being accepted (user 2026-09-28).
+    _weight: (10, 300, 'Allowed 10–300 kg'),
   };
+
+  /// Age is typed from memory, not measured, so it gets its own bound rather
+  /// than a _vitalRanges entry — that map feeds the vitals section.
+  ///
+  /// No lower bound: an infant's age in years is 0 and the MMU registers
+  /// infants. The ceiling is 120 because the field accepted three digits and
+  /// nothing else, so a slipped keystroke could register a 999-year-old
+  /// (user 2026-09-28).
+  static const int _maxAgeYears = 120;
+
+  String? _ageErr() {
+    final t = _age.text.trim();
+    if (t.isEmpty) return null;
+    final v = int.tryParse(t);
+    if (v == null || v > _maxAgeYears) return 'Max $_maxAgeYears years';
+    return null;
+  }
 
   String? _vitalMinErr(TextEditingController c) {
     final t = c.text.trim();
     if (t.isEmpty) return null;
     final r = _vitalRanges[c];
     if (r == null) {
-      // Height / weight — unchanged digit floor.
+      // Height only, now that weight carries a range of its own — the
+      // unchanged digit floor.
       if (t.split('.').first.length < 2) return 'Min 2 digits';
       return null;
     }
