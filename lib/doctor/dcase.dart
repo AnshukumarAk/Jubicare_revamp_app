@@ -1187,13 +1187,14 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                 for (var i = 0; i < diagnoses.length; i++)
                   {'diagnosis_text': diagnoses[i], 'is_primary': i == 0},
               ],
-              // lab_test_ids is deliberately NOT sent. This MMU runs
-              // Counsellor -> Doctor -> Pharmacist with no lab desk and no test
-              // payment, but the server routes any formally-ordered test to
-              // 'with_counsellor' to collect a fee — a state nothing in this app
-              // can clear, which stranded the patient short of the pharmacist.
-              // The doctor only *advises* tests here, so they ride along as text
-              // (see _remarksWithTests) and the case routes on medicines alone.
+              // Tests are recorded as ADVISED (not billed) — the patient
+              // goes straight to the pharmacist. lab_test_ids carries the
+              // master ids so the server creates structured LabTestOrder
+              // rows; lab_test_names is the text fallback.
+              'lab_test_ids': [
+                for (final t in tests)
+                  if (context.read<MastersStore>().labTestIdOf(t) case final id?) id,
+              ],
               'lab_test_names': [ for (final t in tests) t ],
               'prescription': () {
                 // Resolve master ids on the mobile side so the server

@@ -92,6 +92,35 @@ class MastersStore extends ChangeNotifier {
     return null;
   }
 
+  /// Resolve a lab test name to its master id.
+  /// Tries `standard_name` first (the advisory's masterName), then falls
+  /// back to `name` (the original DB name). Returns null when no match.
+  int? labTestIdOf(String testName) {
+    if (testName.trim().isEmpty) return null;
+    final target = testName.trim().toLowerCase();
+    for (final r in masterRows('lab_tests')) {
+      final sn = (r['standard_name'] ?? '').toString().trim().toLowerCase();
+      if (sn.isNotEmpty && sn == target) {
+        return _extractId(r);
+      }
+    }
+    // Fallback: match by the original test name.
+    for (final r in masterRows('lab_tests')) {
+      final n = (r['name'] ?? '').toString().trim().toLowerCase();
+      if (n.isNotEmpty && n == target) {
+        return _extractId(r);
+      }
+    }
+    return null;
+  }
+
+  static int? _extractId(Map<String, dynamic> r) {
+    final id = r['id'];
+    if (id is int) return id;
+    if (id is num) return id.toInt();
+    return int.tryParse(id?.toString() ?? '');
+  }
+
   /// Medicine names from the server master (bootstrap). The requisition
   /// and prescription pickers MUST offer only names the backend can match
   /// — a hardcoded name the master lacks fails with
