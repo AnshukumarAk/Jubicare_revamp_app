@@ -8,9 +8,21 @@ class DRx {
   const DRx(this.name, this.days, this.interval, this.qty);
 }
 
+/// A test from the clinical database.
+/// [sourceText] is the advisory's own phrasing (shown in the card).
+/// [masterName] is the DB-master display name (used when Apply adds to
+/// Investigations). Empty [masterName] → this test is skipped on Apply.
+class DTest {
+  final String sourceText;
+  final String masterName;
+  const DTest(this.sourceText, this.masterName);
+  /// Convenience for the built-in fallback where both names are the same.
+  const DTest.same(String name) : sourceText = name, masterName = name;
+}
+
 class DPlan {
   final Map<String, int> symptoms;
-  final List<String> tests;
+  final List<DTest> tests;
   final List<DRx> rx;
   final List<String> redFlags;
   final String firstLine;
@@ -20,67 +32,67 @@ class DPlan {
 const Map<String, DPlan> kDoctorDb = {
   'Dengue Fever': DPlan(
     symptoms: {'Fever':3,'Headache':2,'Retro-orbital pain':3,'Rash':2,'Joint pain':2,'Platelet drop':3,'Nausea':1,'Vomiting':1,'Body ache':2,'Fatigue':1},
-    tests: ['CBC with Platelet count','NS1 Antigen','Dengue IgM/IgG'],
+    tests: [DTest.same('CBC with Platelet count'),DTest.same('NS1 Antigen'),DTest.same('Dengue IgM/IgG')],
     rx: [DRx('Paracetamol 500mg','5','TDS',15), DRx('ORS Sachets','5','TDS',15), DRx('Domperidone 10mg','3','BD',6)],
     redFlags: ['Platelet <20,000','Persistent vomiting','Mucosal bleeding'],
     firstLine: 'Supportive care. Paracetamol for fever. Avoid NSAIDs.'),
   'Malaria': DPlan(
     symptoms: {'Fever':3,'Chills':3,'Sweating':3,'Headache':2,'Body ache':2,'Nausea':1,'Fatigue':2,'Jaundice':2},
-    tests: ['Malaria Smear','RDT','CBC'],
+    tests: [DTest.same('Malaria Smear'),DTest.same('RDT'),DTest.same('CBC')],
     rx: [DRx('ACT (Artesunate+Lumefantrine)','3','BD',6), DRx('Paracetamol 500mg','3','TDS',9), DRx('Primaquine 15mg','14','OD',14)],
     redFlags: ['Altered consciousness','Severe anaemia','Respiratory distress'],
     firstLine: 'ACT first-line. Primaquine for P.vivax.'),
   'Typhoid': DPlan(
     symptoms: {'Fever':3,'Headache':2,'Abdominal pain':3,'Diarrhoea':2,'Loss of appetite':2,'Fatigue':2,'Nausea':1,'Body ache':1},
-    tests: ['Widal Test','Blood Culture','CBC'],
+    tests: [DTest.same('Widal Test'),DTest.same('Blood Culture'),DTest.same('CBC')],
     rx: [DRx('Azithromycin 500mg','7','OD',7), DRx('Paracetamol 500mg','5','TDS',15), DRx('ORS Sachets','5','TDS',15)],
     redFlags: ['GI perforation','Persistent high fever >7 days'],
     firstLine: 'Azithromycin first-line. Adequate hydration.'),
   'Viral Fever': DPlan(
     symptoms: {'Fever':3,'Headache':2,'Body ache':2,'Fatigue':2,'Runny nose':1,'Sore throat':1,'Cough':1,'Chills':1,'Weakness':1},
-    tests: ['CBC','CRP'],
+    tests: [DTest.same('CBC'),DTest.same('CRP')],
     rx: [DRx('Paracetamol 500mg','3','TDS',9), DRx('Cetirizine 10mg','3','OD',3), DRx('ORS Sachets','3','BD',6)],
     redFlags: ['Fever >5 days','Rash development','Platelet drop'],
     firstLine: 'Symptomatic. Paracetamol, rest, fluids.'),
   'URTI': DPlan(
     symptoms: {'Cough':3,'Sore throat':3,'Runny nose':3,'Fever':2,'Headache':1,'Body ache':1,'Fatigue':1},
-    tests: ['Throat swab','CBC'],
+    tests: [DTest.same('Throat swab'),DTest.same('CBC')],
     rx: [DRx('Cetirizine 10mg','5','OD',5), DRx('Paracetamol 500mg','3','TDS',9), DRx('Ambroxol 30mg','5','BD',10)],
     redFlags: ['Stridor','Unable to swallow','Neck stiffness'],
     firstLine: 'Antihistamine, warm fluids, steam inhalation.'),
   'Pneumonia': DPlan(
     symptoms: {'Fever':3,'Cough':3,'Shortness of breath':3,'Chest pain':2,'Fatigue':2,'Chills':2,'Wheezing':1},
-    tests: ['Chest X-ray','CBC','Sputum culture'],
+    tests: [DTest.same('Chest X-ray'),DTest.same('CBC'),DTest.same('Sputum culture')],
     rx: [DRx('Amoxicillin 500mg','7','TDS',21), DRx('Paracetamol 500mg','5','TDS',15)],
     redFlags: ['SpO2 <92%','Resp rate >30','Confusion'],
     firstLine: 'Amoxicillin first-line.'),
   'Gastroenteritis': DPlan(
     symptoms: {'Diarrhoea':3,'Vomiting':3,'Abdominal pain':2,'Nausea':2,'Fever':1,'Dehydration':3},
-    tests: ['Stool exam','CBC','Electrolytes'],
+    tests: [DTest.same('Stool exam'),DTest.same('CBC'),DTest.same('Electrolytes')],
     rx: [DRx('ORS Sachets','5','TDS',15), DRx('Zinc 20mg','14','OD',14), DRx('Ondansetron 4mg','3','BD',6)],
     redFlags: ['Severe dehydration','Bloody diarrhoea'],
     firstLine: 'ORS and zinc. Ondansetron for vomiting.'),
   'Chikungunya': DPlan(
     symptoms: {'Fever':3,'Joint pain':3,'Rash':2,'Headache':2,'Fatigue':2,'Body ache':2,'Swelling':2},
-    tests: ['Chikungunya IgM','CBC'],
+    tests: [DTest.same('Chikungunya IgM'),DTest.same('CBC')],
     rx: [DRx('Paracetamol 500mg','5','TDS',15), DRx('ORS Sachets','5','BD',10)],
     redFlags: ['Hemorrhagic signs','Encephalitis'],
     firstLine: 'Supportive care. Paracetamol.'),
   'UTI': DPlan(
     symptoms: {'Burning micturition':3,'Frequent urination':3,'Lower abdominal pain':2,'Fever':2,'Blood in urine':2},
-    tests: ['Urine R/E','Urine Culture','CBC'],
+    tests: [DTest.same('Urine R/E'),DTest.same('Urine Culture'),DTest.same('CBC')],
     rx: [DRx('Nitrofurantoin 100mg','5','BD',10), DRx('Paracetamol 500mg','3','TDS',9)],
     redFlags: ['High fever with flank pain','Persistent haematuria'],
     firstLine: 'Nitrofurantoin first-line. Hydration.'),
   'Hypertension': DPlan(
     symptoms: {'Headache':2,'Dizziness':2,'Chest pain':1,'Palpitations':2,'Shortness of breath':1,'Fatigue':1},
-    tests: ['BP Monitoring','ECG','Lipid Profile'],
+    tests: [DTest.same('BP Monitoring'),DTest.same('ECG'),DTest.same('Lipid Profile')],
     rx: [DRx('Amlodipine 5mg','30','OD',30), DRx('Telmisartan 40mg','30','OD',30)],
     redFlags: ['BP >180/120','Chest pain','Visual changes'],
     firstLine: 'Amlodipine or Telmisartan. Lifestyle modification.'),
   'Diabetes Type 2': DPlan(
     symptoms: {'Frequent urination':2,'Fatigue':2,'Weight loss':2,'Weakness':1,'Numbness':2},
-    tests: ['Fasting Blood Sugar','HbA1c','Renal Profile'],
+    tests: [DTest.same('Fasting Blood Sugar'),DTest.same('HbA1c'),DTest.same('Renal Profile')],
     rx: [DRx('Metformin 500mg','30','BD',60), DRx('Glimepiride 1mg','30','OD',30)],
     redFlags: ['Blood sugar >400','Ketoacidosis','Non-healing wounds'],
     firstLine: 'Metformin first-line. Lifestyle modification.'),

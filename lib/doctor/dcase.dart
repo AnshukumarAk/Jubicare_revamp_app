@@ -591,7 +591,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   void _applyAdvisory(String name, DPlan plan) {
     final resolved = DiseaseMaster.resolve(name);
     final dxStr = resolved?.display ?? name;
-    final newTests = List<String>.from(plan.tests);
+    // masterName goes into Investigations; skip tests with no masterName.
+    final newTests = plan.tests
+        .where((t) => t.masterName.isNotEmpty)
+        .map((t) => t.masterName)
+        .toList();
     final newRxItems = plan.rx.map((r) {
       final (mn, md) = splitMedicine(r.name);
       // splitMedicine returns the strength WITH its unit — right for the
@@ -1338,7 +1342,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         if (plan != null) ...[
           if (plan.tests.isNotEmpty)
             line(Icons.science_outlined, 'Tests:',
-                plan.tests.where((t) => t.trim().length <= 60).join(', ')),
+                plan.tests.map((t) => t.sourceText).where((t) => t.trim().length <= 60).join(', ')),
           if (plan.firstLine.trim().isNotEmpty)
             line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
           if (plan.rx.isNotEmpty)
@@ -1365,7 +1369,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               if (!diagnoses.contains(label)) diagnoses.add(label);
               if (plan != null) {
                 for (final t in plan.tests) {
-                  if (!tests.contains(t)) tests.add(t);
+                  if (t.masterName.isEmpty) continue;
+                  if (!tests.contains(t.masterName)) tests.add(t.masterName);
                 }
                 for (final r in plan.rx) {
                   if (!rx.any((x) => x.name == r.name)) {
@@ -1418,7 +1423,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         // "Typhoid fever - 1A09 (46%)" (user 2026-08-22).
         line(Icons.coronavirus_outlined, 'Likely:',
             '$name${(icd ?? '').isNotEmpty ? ' - $icd' : ''} ($pct%)'),
-        line(Icons.science_outlined, 'Tests:', plan.tests.join(', ')),
+        line(Icons.science_outlined, 'Tests:', plan.tests.map((t) => t.sourceText).join(', ')),
         line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
         line(Icons.medication_outlined, 'Rx:', rxStr),
         line(Icons.warning_amber_rounded, 'Red Flags:', plan.redFlags.join(', ')),
