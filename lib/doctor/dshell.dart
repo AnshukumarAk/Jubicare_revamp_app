@@ -577,7 +577,6 @@ class _DoctorDashboardState extends State<DoctorDashboard>
                   Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                 ])),
                 doctorStatusBadge(p.status),
-                const SizedBox(width: 6), const Icon(Icons.lock_outline, size: 15, color: C2.text3),
               ]),
             ))),
           if (s.doctorAttended.length > 5)
@@ -678,11 +677,12 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
 Widget doctorStatusBadge(String status) {
   final (label, bg, fg) = switch (status) {
     'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
-    'with_pharma'     => ('At Pharmacy', C2.cyanLight, C2.cyan),
+    // Brand blue for the two stages the doctor sees most (user 2026-09-29).
+    'with_pharma'     => ('At Pharmacy', C2.navyLight, C2.navy),
     // Post-consultation rungs: the doctor is done, the case is moving on.
     'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
     'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
-    'with_doctor'     => ('In Progress', C2.cyanLight, C2.cyan),
+    'with_doctor'     => ('In Progress', C2.navyLight, C2.navy),
     _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
   };
   return CBadge(label, bg: bg, fg: fg);
