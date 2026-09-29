@@ -9,6 +9,13 @@ class C2 {
   static const yellow = Color(0xFFF5C518);
   static const cyanLight = Color(0xFFE0F5FC);
   static const navyLight = Color(0xFFE8EDF8);
+
+  /// Solid brand blue behind the status badges the field looks at most --
+  /// At Pharmacy, In Progress, With Doctor. A filled badge rather than the
+  /// tinted ones around it, so the stage a case is at reads from across the
+  /// screen (user 2026-09-29). Text on it is [white]; nothing else is
+  /// readable at this depth.
+  static const badgeBlue = Color(0xFF034DA2);
   static const bg = Color(0xFFF0F7FB);
   static const white = Color(0xFFFFFFFF);
   static const text = Color(0xFF1A2D42);

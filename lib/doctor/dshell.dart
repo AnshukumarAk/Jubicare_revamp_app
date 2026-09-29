@@ -550,8 +550,8 @@ class _DoctorDashboardState extends State<DoctorDashboard>
         else
           ...s.doctorQueue.take(5).map((p) => QueueRow(p: p, sub: '${p.age}y · ${p.symptoms.take(2).join(', ')}',
             badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
-            badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.cyanLight,
-            badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.cyan,
+            badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
+            badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))),
         if (s.doctorQueue.length > 5)
           Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${s.doctorQueue.length} · tap "In Queue" to view all', style: ct(11, FontWeight.w500, C2.text2))),
@@ -678,11 +678,11 @@ Widget doctorStatusBadge(String status) {
   final (label, bg, fg) = switch (status) {
     'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
     // Brand blue for the two stages the doctor sees most (user 2026-09-29).
-    'with_pharma'     => ('At Pharmacy', C2.navyLight, C2.navy),
+    'with_pharma'     => ('At Pharmacy', C2.badgeBlue, C2.white),
     // Post-consultation rungs: the doctor is done, the case is moving on.
     'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
     'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
-    'with_doctor'     => ('In Progress', C2.navyLight, C2.navy),
+    'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),
     _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
   };
   return CBadge(label, bg: bg, fg: fg);
@@ -738,8 +738,8 @@ class _DoctorCaseListState extends State<DoctorCaseList> {
       else
         CCard(child: Column(children: list.map((p) => QueueRow(p: p, sub: '${p.gender}, ${p.age}y · ${p.village}',
           badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
-          badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.cyanLight,
-          badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.cyan,
+          badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
+          badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))).toList())),
     ]);
   }

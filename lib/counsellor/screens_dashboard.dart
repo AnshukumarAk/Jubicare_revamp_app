@@ -644,8 +644,8 @@ class _AttachmentThumb extends StatelessWidget {
 /// to a misleading default.
 (String, Color, Color) apptStatus(String status) => switch (status) {
       'completed' => ('Completed', const Color(0xFFEDF7E0), C2.green),
-      'with_pharma' => ('At Pharmacy', C2.cyanLight, C2.cyan),
-      'with_doctor' => ('With Doctor', C2.cyanLight, C2.cyan),
+      'with_pharma' => ('At Pharmacy', C2.badgeBlue, C2.white),
+      'with_doctor' => ('With Doctor', C2.badgeBlue, C2.white),
       'with_lab' => ('At Lab', C2.cyanLight, C2.cyan),
       'with_counsellor' => ('Payment Due', Color(0xFFFEF7E0), Color(0xFFB8860B)),
       'denied' => ('Delivery Denied', Color(0xFFFDEAEA), C2.danger),
