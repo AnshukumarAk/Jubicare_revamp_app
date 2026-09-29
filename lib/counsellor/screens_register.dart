@@ -484,7 +484,7 @@ class _CounRegisterState extends State<CounRegister> {
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     if (_name.text.trim().isEmpty) return err('Enter patient name');
     if (knowAge && _age.text.trim().isEmpty) return err('Enter age');
-    if (knowAge && _ageErr() != null) return err('Age must be $_maxAgeYears or under');
+    if (knowAge && _ageErr() != null) return err('Age must be between $_minAgeYears and $_maxAgeYears years');
     if (!knowAge && _dob == null) return err('Select date of birth');
     final ce = _contactError(_contact.text.trim());
     // Contact is required now that Unique Code is removed (rule 2026-07-29).
@@ -1444,22 +1444,34 @@ class _CounRegisterState extends State<CounRegister> {
     // kept where it already was, at 10, so nothing that used to be accepted
     // stops being accepted (user 2026-09-28).
     _weight: (10, 300, 'Allowed 10–300 kg'),
+    // Height had no ceiling at all — only the shared "Min 2 digits" floor —
+    // so 999.9 cm went through. 50-260 is the range the user set on
+    // 2026-09-29; the tallest recorded human reached 272 cm, so 260 is
+    // generous for anyone an MMU will measure.
+    _height: (50, 260, 'Allowed 50–260 cm'),
   };
 
   /// Age is typed from memory, not measured, so it gets its own bound rather
   /// than a _vitalRanges entry — that map feeds the vitals section.
   ///
-  /// No lower bound: an infant's age in years is 0 and the MMU registers
-  /// infants. The ceiling is 120 because the field accepted three digits and
-  /// nothing else, so a slipped keystroke could register a 999-year-old
-  /// (user 2026-09-28).
+  /// 1-120 (user 2026-09-29). The ceiling is because the field accepts three
+  /// digits and nothing else, so a slipped keystroke could register a
+  /// 999-year-old.
+  ///
+  /// The floor means an infant cannot be entered HERE, since an age in whole
+  /// years rounds to 0 below their first birthday. They are registered by
+  /// Date of Birth instead — the radio above this field — and that path
+  /// works out the age itself, so nothing is locked out.
+  static const int _minAgeYears = 1;
   static const int _maxAgeYears = 120;
 
   String? _ageErr() {
     final t = _age.text.trim();
     if (t.isEmpty) return null;
     final v = int.tryParse(t);
-    if (v == null || v > _maxAgeYears) return 'Max $_maxAgeYears years';
+    if (v == null || v < _minAgeYears || v > _maxAgeYears) {
+      return 'Allowed $_minAgeYears–$_maxAgeYears years';
+    }
     return null;
   }
 
@@ -1468,8 +1480,9 @@ class _CounRegisterState extends State<CounRegister> {
     if (t.isEmpty) return null;
     final r = _vitalRanges[c];
     if (r == null) {
-      // Height only, now that weight carries a range of its own — the
-      // unchanged digit floor.
+      // Every field this is called with now carries a range, so nothing
+      // reaches here. Kept as the safe default for a controller added later
+      // before somebody remembers to give it one.
       if (t.split('.').first.length < 2) return 'Min 2 digits';
       return null;
     }
