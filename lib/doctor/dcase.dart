@@ -1486,12 +1486,46 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
 
   Widget _testsField() {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // Not a Chip: a Chip keeps its label on one line, and the master's
+      // standard names run long — "Spirometry / Pulmonary Function Test
+      // (with bronchodilator reversibility)" lost its tail the moment the
+      // advisory started applying them (user 2026-09-29). This wraps to as
+      // many lines as the name needs, bounded by the field's own width.
       if (tests.isNotEmpty)
-        Padding(padding: const EdgeInsets.only(bottom: 6), child: Wrap(spacing: 6, runSpacing: 6, children: tests.map((t) => Chip(
-          label: Text(t, style: ct(11.5, FontWeight.w600, C2.navy)), backgroundColor: C2.cyanLight, side: BorderSide.none,
-          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, visualDensity: VisualDensity.compact,
-          deleteIcon: const Icon(Icons.close, size: 13), deleteIconColor: C2.text2, onDeleted: () => setState(() => tests.remove(t)),
-        )).toList())),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: LayoutBuilder(builder: (context, box) => Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final t in tests)
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: box.maxWidth),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
+                    decoration: BoxDecoration(
+                        color: C2.cyanLight,
+                        borderRadius: BorderRadius.circular(14)),
+                    child: Row(mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                      Flexible(child: Text(t,
+                          style: ct(11.5, FontWeight.w600, C2.navy))),
+                      const SizedBox(width: 4),
+                      InkWell(
+                        onTap: () => setState(() => tests.remove(t)),
+                        borderRadius: BorderRadius.circular(10),
+                        child: const Padding(
+                          padding: EdgeInsets.all(2),
+                          child: Icon(Icons.close, size: 13, color: C2.text2),
+                        ),
+                      ),
+                    ]),
+                  ),
+                ),
+            ],
+          )),
+        ),
       COutlineButton('Add Test', icon: Icons.add, onTap: () async {
         print('[JC] Add Test TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
         _parkFocus();
@@ -2349,13 +2383,19 @@ class _PickerSheetState extends State<_PickerSheet> {
                       style: ct(13, FontWeight.w400, C2.text2)))
               // Lazy — 787-symptom sheet was building every row up front
               // and made the picker feel frozen (user 2026-08-25).
+              // 44 was one line's worth, which clipped the master's longer
+              // standard names to "Spirometry / Pulmonary Function Test
+              // (with bronchodi…" (user 2026-09-29). A fixed extent is what
+              // keeps this lazy, so it stays — just tall enough for two.
               : ListView.builder(
                   shrinkWrap: true,
                   itemCount: m.length,
-                  itemExtent: 44,
+                  itemExtent: 62,
                   itemBuilder: (_, i) => ListTile(
                     dense: true,
-                    title: Text(m[i], style: ct(13.5, FontWeight.w500, C2.text)),
+                    title: Text(m[i], maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: ct(13.5, FontWeight.w500, C2.text)),
                     trailing: const Icon(Icons.add, size: 18, color: C2.cyan),
                     onTap: () => Navigator.pop(context, m[i]),
                   ),
