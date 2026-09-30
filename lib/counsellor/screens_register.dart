@@ -954,15 +954,14 @@ class _CounRegisterState extends State<CounRegister> {
       // one forward means the counsellor who does not clear it files a
       // fortnight-old complaint against today's visit.
       //
-      // Symptoms below still carry over: those are what the patient has,
-      // and a returning patient usually still has them (rule 2026-07-31).
+      // Symptoms go the same way (user 2026-09-30): they are what the
+      // patient reports TODAY, and the reason the doctor is about to be
+      // shown an advisory. Carried forward and left untouched they file a
+      // fortnight-old complaint as this visit's, and the advisory ranks
+      // conditions from them -- so a stale chip does not just sit there,
+      // it steers the consultation.
       _remarks.clear();
-      // Carry the previous symptom picks over (rule 2026-07-31) so the
-      // counsellor can just tweak them for today's visit instead of
-      // re-selecting from scratch.
-      symptoms
-        ..clear()
-        ..addAll(p.symptoms);
+      symptoms.clear();
       // Vitals start EMPTY, like the remark above (user 2026-09-30).
       //
       // They used to carry the last visit's readings so the counsellor
