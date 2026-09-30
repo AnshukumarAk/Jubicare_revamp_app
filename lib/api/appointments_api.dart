@@ -49,6 +49,38 @@ class AppointmentsApi {
         if (symptoms != null && symptoms.isNotEmpty) 'symptoms': symptoms,
       })) as Map).cast<String, dynamic>();
 
+  /// POST /appointments/{id}/advisory/applied — the doctor pressed Apply
+  /// on the AI Clinical Advisory and took some or all of what it offered.
+  ///
+  /// A dashboard statistic, never a clinical step: it is fired and forgotten,
+  /// and a failure here must not reach the doctor. Offline it is simply lost
+  /// -- the queue is for the patient's record, not for analytics.
+  Future<void> advisoryApplied(
+    int appointmentId, {
+    required int entryId,
+    String condition = '',
+    String? icd11Code,
+    int score = 0,
+    bool diagnosis = false,
+    int tests = 0,
+    int medicines = 0,
+  }) async {
+    if (entryId <= 0) return;
+    try {
+      await client.post('/appointments/$appointmentId/advisory/applied', body: {
+        'entry_id':   entryId,
+        'condition':  condition,
+        if (icd11Code != null && icd11Code.isNotEmpty) 'icd11_code': icd11Code,
+        'score':      score,
+        'diagnosis':  diagnosis,
+        'tests':      tests,
+        'medicines':  medicines,
+      });
+    } catch (_) {
+      // Swallowed on purpose. See the doc comment.
+    }
+  }
+
   /// GET /advisory/preview — same shape as `advisory()` but for a case
   /// that HAS NOT been registered yet. Powers the counsellor Register
   /// screen so the panels there match what the doctor will see

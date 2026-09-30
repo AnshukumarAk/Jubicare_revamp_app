@@ -615,6 +615,20 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   void _applyAdvisory(String name, DPlan plan) {
     final resolved = DiseaseMaster.resolve(name);
     final dxStr = resolved?.display ?? name;
+    // The other half of the adoption record. This path applies from the
+    // bundled clinical sheet, which carries no entry id, so the condition is
+    // resolved back to the terminology master to find one. No match means no
+    // row -- a statistic is not worth guessing at (user 2026-09-30).
+    final term = context.read<TerminologyStore>().entryByTerm(name);
+    if (term != null) {
+      _recordAdvisoryApplied(
+        entryId: term.entryId,
+        condition: term.standardTerm,
+        icd11Code: term.icd11Code,
+        tests: plan.tests.where((t) => t.masterName.isNotEmpty).length,
+        medicines: plan.rx.length,
+      );
+    }
     // masterName goes into Investigations; skip tests with no masterName.
     final newTests = plan.tests
         .where((t) => t.masterName.isNotEmpty)
@@ -1436,6 +1450,19 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               // (user 2026-08-27).
               _appliedAdvSig = _advSig;
             });
+            // Tell the server the advisory was taken. Until this existed the
+            // adoption panel counted the web portal only, and every MMU
+            // consultation was missing from it (user 2026-09-30). Fired and
+            // forgotten -- a statistic never delays the doctor.
+            _recordAdvisoryApplied(
+              entryId: e.entryId,
+              condition: e.standardTerm,
+              icd11Code: e.icd11Code,
+              tests: plan?.rx == null
+                  ? 0
+                  : plan!.tests.where((t) => t.masterName.isNotEmpty).length,
+              medicines: plan?.rx.length ?? 0,
+            );
           }, disabled: _appliedAdvSig != null && _appliedAdvSig == _advSig),
           // Dismiss hides after the first Apply — once the plan is on
           // record, dismissing the card no longer makes sense
@@ -1494,6 +1521,29 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         ]),
       ]),
     ));
+  }
+
+  /// Record that the doctor took the advisory. Never awaited and never
+  /// allowed to throw: this is a dashboard number, and a dashboard number is
+  /// not worth a snackbar on a clinical screen.
+  void _recordAdvisoryApplied({
+    required int entryId,
+    required String condition,
+    String? icd11Code,
+    int tests = 0,
+    int medicines = 0,
+  }) {
+    final apptId = p.backendAppointmentId;
+    if (apptId == null || entryId <= 0) return;
+    unawaited(context.read<AppointmentsApi>().advisoryApplied(
+          apptId,
+          entryId: entryId,
+          condition: condition,
+          icd11Code: icd11Code,
+          diagnosis: true,
+          tests: tests,
+          medicines: medicines,
+        ));
   }
 
   Widget _aiBtn(String t, Color bg, VoidCallback onTap, {bool disabled = false}) => InkWell(
