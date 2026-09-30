@@ -489,6 +489,12 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     // only de-duplicates in additive mode. Folded in with the rest it put
     // every queued patient on screen twice (user 2026-09-30).
     final todayRows = await safe(api.today(limit: 500));
+    // The week, which is the only pull that carries LAMA: the four above
+    // are live stages and `today` is today, and a visit is never written
+    // off on the day it happened. Without it the doctor's Past 7 Days was
+    // whatever the queues happened to hold, and the patients who stopped
+    // coming were in none of them (user 2026-09-30).
+    final weekRows = await safe(api.doctorPast7Days(limit: 200));
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final combined = [
@@ -497,6 +503,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     ];
     store.mergeBackendPatients(combined);
     store.mergeBackendPatients(todayRows.items, additive: true);
+    store.mergeBackendPatients(weekRows.items, additive: true);
     _delta.seedFrom(combined);
     try {
       final cache = await PatientsCacheStore.open();
