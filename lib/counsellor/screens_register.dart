@@ -522,6 +522,21 @@ class _CounRegisterState extends State<CounRegister> {
     // complaint gives the doctor and the advisory nothing to work from.
     if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
+    // Aadhaar and PIN are optional, but a HALF-typed one is not. Both used
+    // to be dropped from the payload unless they matched exactly, which
+    // kept the server from 422-ing and told the receptionist nothing — the
+    // number simply never reached the record (user 2026-09-30). Say so
+    // instead, and leave the field as typed so it can be corrected.
+    final aadharTyped = _aadhar.text.trim();
+    if (aadharTyped.isNotEmpty && !RegExp(r'^\d{12}$').hasMatch(aadharTyped)) {
+      return err('Aadhaar must be exactly 12 digits — '
+          'clear the field to leave it blank');
+    }
+    final pinTyped = _pin.text.trim();
+    if (pinTyped.isNotEmpty && !RegExp(r'^[1-9]\d{5}$').hasMatch(pinTyped)) {
+      return err('PIN code must be 6 digits and cannot start with 0 — '
+          'clear the field to leave it blank');
+    }
     // A re-appointment that cannot name its patient must not be sent.
     //
     // The id rides as `patient_id`, and the server attaches the visit to
