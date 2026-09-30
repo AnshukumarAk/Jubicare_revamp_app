@@ -690,6 +690,10 @@ Widget doctorStatusBadge(String status) {
     'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
     'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
     'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),
+    // A visit the system wrote off after a day's silence. Red because
+    // it is care that stopped, not care that finished. Reads the stored
+    // status, as the web does -- see clinical/lama.py (user 2026-09-30).
+    'lama'            => ('LAMA', const Color(0xFFFDEAEA), C2.danger),
     _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
   };
   return CBadge(label, bg: bg, fg: fg);

@@ -39,6 +39,7 @@ String apptStatusLabel(String status) => switch (status) {
       'with_pharma' => 'At Pharmacist',
       'with_doctor' => 'With Doctor',
       'denied' => 'Delivery Denied',
+      'lama' => 'LAMA',
       _ => 'Registered',
     };
 

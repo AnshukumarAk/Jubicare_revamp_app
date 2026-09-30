@@ -468,6 +468,11 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
       'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
       'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),
       'registered'      => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
+      // A visit the system wrote off after a day's silence. Red like
+      // 'denied': both mean care that stopped, not care that finished.
+      // It reads the stored status, the same way the web does -- see
+      // clinical/lama.py for when it is written (user 2026-09-30).
+      'lama'            => ('LAMA', const Color(0xFFFDEAEA), C2.danger),
       _                 => (status, C2.cyanLight, C2.cyan),
     };
     return CBadge(label, bg: bg, fg: fg);
