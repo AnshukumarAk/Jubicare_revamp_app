@@ -348,7 +348,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     final s = context.watch<CounsellorState>();
     final name = widget.name;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      GradGreeting(name: name, sub: 'Pharmacy Dashboard', initials: name.isEmpty ? 'P' : name[0].toUpperCase()),
+      GradGreeting(name: name, sub: 'Pharmacist Dashboard', initials: name.isEmpty ? 'P' : name[0].toUpperCase()),
       if (_refreshing) const SizedBox(height: 2, child: LinearProgressIndicator(minHeight: 2)),
       if (!_refreshing && _lastError != null)
         Padding(padding: const EdgeInsets.only(bottom: 6),
@@ -1442,10 +1442,25 @@ class _PharmaStockState extends State<PharmaStock> {
   Widget _overallPanel() {
     final reqs = context.watch<CounsellorState>().requisitions;
     final agg = <String, List<int>>{}; // name -> [requested, dispatched, received]
+    final members = <String, List<String>>{}; // row name -> medicines in it
     for (final r in reqs) {
-      for (final l in r.items) {
-        final a = agg.putIfAbsent(l.name, () => [0, 0, 0]);
-        a[0] += l.requested; a[1] += l.dispatched; a[2] += l.received;
+      // Grouped the way the requisition itself is. A combination strip is
+      // submitted as N lines under one combo_key, each carrying the whole
+      // strip's quantity — so counting them one by one turned a single
+      // order of 1000 four-drug strips into four separate 1000s, as if
+      // the pharmacist had asked for the drugs apart (user 2026-09-30).
+      for (final group in _comboGroups(r.items)) {
+        final name = group.length == 1
+            ? group.first.name
+            : group.map((l) => l.name).join(' + ');
+        final a = agg.putIfAbsent(name, () => [0, 0, 0]);
+        // One strip, one quantity: the lines repeat it, they do not add up.
+        a[0] += group.first.requested;
+        a[1] += group.first.dispatched;
+        a[2] += group.first.received;
+        // The live dispensed figure is keyed by single medicine name, so
+        // remember what a combination row is made of.
+        members[name] = [for (final l in group) l.name];
       }
     }
     if (agg.isEmpty) return CCard(child: Padding(padding: const EdgeInsets.all(10), child: Center(child: Text('No stock movement yet', style: ct(12, FontWeight.w400, C2.text2)))));
@@ -1465,7 +1480,16 @@ class _PharmaStockState extends State<PharmaStock> {
         ])),
       ...agg.entries.map((e) => Container(padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 6), decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.border))),
         child: Builder(builder: (_) {
-          final disp = _liveDispensed[e.key] ?? e.value[1];
+          // A combination row's dispensed figure is the sum of its
+          // members', since the server counts them one by one.
+          final names = members[e.key] ?? [e.key];
+          final live = names.map((n) => _liveDispensed[n])
+              .whereType<int>().toList();
+          final disp = live.isEmpty
+              ? e.value[1]
+              : (names.length > 1
+                  ? (live.reduce((a, b) => a > b ? a : b))
+                  : live.first);
           final recv = e.value[2];
           // TOTAL = what the row itself shows — RECV minus DISP (user
           // 2026-08-25: 1000 received + 18 dispensed must read 982, not
@@ -2572,7 +2596,7 @@ class _PharmaReportState extends State<PharmaReport> {
     final s = context.watch<CounsellorState>();
     final dispensed = s.dispensedPatients;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('Pharmacy Report')),
+      Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('Pharmacist Report')),
       _reportCard('Patient Report', 'Dispensed patients & medicines', Icons.description, C2.cyan, 'patient'),
       _reportCard('Stock Report',   'Requisitions raised, dispatch + receive status', Icons.inventory_2, C2.navy, 'stock'),
 
@@ -2703,7 +2727,7 @@ class _PharmaReportState extends State<PharmaReport> {
     }
     final doc = pw.Document();
     doc.addPage(pw.MultiPage(pageFormat: PdfPageFormat.a4.landscape, build: (ctx) => [
-      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacy Patient Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
+      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacist Patient Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
       pw.Text('Period: ${_from.isEmpty ? "—" : _from} to ${_to.isEmpty ? "—" : _to}'),
       pw.SizedBox(height: 6),
       pw.Text('Dispensed patients: ${dispensed.length}    Denied: $denied'),
@@ -2718,7 +2742,7 @@ class _PharmaReportState extends State<PharmaReport> {
         data: rows,
       ),
     ]));
-    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacy_Patient_Report');
+    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacist_Patient_Report');
   }
 
   /// Stock Report PDF — one row per requisition line raised in the picked
@@ -2753,7 +2777,7 @@ class _PharmaReportState extends State<PharmaReport> {
 
     final doc = pw.Document();
     doc.addPage(pw.MultiPage(pageFormat: PdfPageFormat.a4.landscape, build: (ctx) => [
-      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacy Stock Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
+      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacist Stock Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
       pw.Text('Period: ${_from.isEmpty ? "—" : _from} to ${_to.isEmpty ? "—" : _to}'),
       pw.SizedBox(height: 6),
       pw.Text('Requisitions: ${reqs.length}'),
@@ -2766,7 +2790,7 @@ class _PharmaReportState extends State<PharmaReport> {
         data: rows.isEmpty ? [List.filled(8, '—')] : rows,
       ),
     ]));
-    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacy_Stock_Report');
+    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacist_Stock_Report');
   }
 }
 

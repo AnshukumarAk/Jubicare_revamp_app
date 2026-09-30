@@ -463,7 +463,7 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
   Widget _statusChip(String status) {
     final (label, bg, fg) = switch (status) {
       'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
-      'with_pharma'     => ('At Pharmacy', C2.badgeBlue, C2.white),
+      'with_pharma'     => ('At Pharmacist', C2.badgeBlue, C2.white),
       'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
       'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
       'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),

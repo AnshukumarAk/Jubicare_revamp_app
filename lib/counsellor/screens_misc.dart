@@ -36,7 +36,7 @@ import '../widgets/attendance_capture.dart';
 
 String apptStatusLabel(String status) => switch (status) {
       'completed' => 'Completed',
-      'with_pharma' => 'At Pharmacy',
+      'with_pharma' => 'At Pharmacist',
       'with_doctor' => 'With Doctor',
       'denied' => 'Delivery Denied',
       _ => 'Registered',

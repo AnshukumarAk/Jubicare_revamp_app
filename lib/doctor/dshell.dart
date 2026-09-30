@@ -680,7 +680,7 @@ Widget doctorStatusBadge(String status) {
   final (label, bg, fg) = switch (status) {
     'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
     // Brand blue for the two stages the doctor sees most (user 2026-09-29).
-    'with_pharma'     => ('At Pharmacy', C2.badgeBlue, C2.white),
+    'with_pharma'     => ('At Pharmacist', C2.badgeBlue, C2.white),
     // Post-consultation rungs: the doctor is done, the case is moving on.
     'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
     'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
