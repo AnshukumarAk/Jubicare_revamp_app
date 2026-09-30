@@ -1165,6 +1165,11 @@ class CounsellorState extends ChangeNotifier {
   List<CPatient> get doctorPast7Days => _doctorPast7Days ??= _byRegDateDesc([
         ...doctorQueue.where((p) => _within7Days(p.regDate)),
         ...doctorAttended.where((p) => _within7Days(p.regDate)),
+        // Visits the system wrote off after a day's silence. They are in
+        // neither list above -- LAMA is not a queue and not work finished --
+        // so the doctor's week ended without the patients who stopped coming
+        // (user 2026-09-30). The week is a record, and they belong in it.
+        ...patients.where((p) => p.status == 'lama' && _within7Days(p.regDate)),
       ]);
 
   static const _months = {
@@ -1231,7 +1236,12 @@ class CounsellorState extends ChangeNotifier {
   /// 7 days, newest first.
   List<CPatient> get pharmaPast7Days => _pharmaPast7Days ??= _byRegDateDesc(
       patients
-          .where((p) => p.status == 'with_pharma' || p.status == 'completed')
+          // 'lama' included: a patient who reached the pharmacy and never
+          // came back for the medicine is the pharmacist's week as much as
+          // one who did (user 2026-09-30).
+          .where((p) => p.status == 'with_pharma' ||
+                        p.status == 'completed' ||
+                        p.status == 'lama')
           .where((p) => _within7Days(p.regDate)));
 
   String nextId() => 'P${_seq++}';
