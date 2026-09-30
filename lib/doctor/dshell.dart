@@ -533,8 +533,10 @@ class _DoctorDashboardState extends State<DoctorDashboard>
         Expanded(child: InkWell(
           borderRadius: BorderRadius.circular(10),
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
-            DoctorPatientList(title: 'Completed', patients: s.doctorAttended))),
-          child: StatTile('${s.doctorCompleted}', 'Completed', C2.green))),
+            DoctorPatientList(title: 'Completed Today',
+                patients: s.doctorAttendedToday))),
+          child: StatTile('${s.backendDoctorCompleted ?? s.doctorCompleted}',
+              'Completed Today', C2.green))),
         const SizedBox(width: 8),
         Expanded(child: InkWell(
           borderRadius: BorderRadius.circular(10),

@@ -1532,19 +1532,16 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         // Lab tests DYNAMIC — server master `lab_tests` first, static
         // fallback (user 2026-09-10 dynamic masters, additive only —
         // send-side payload unchanged, no breakage risk).
-        final labTests = () {
-          final rows = context.read<MastersStore>().masterRows('lab_tests');
-          final serverNames = <String>[
-            for (final r in rows)
-              if ((r['name'] ?? r['term']) != null) (r['name'] ?? r['term']).toString(),
-          ];
-          if (serverNames.isEmpty) return kLabTests;
-          final seen = <String>{};
-          return <String>[
-            for (final s in [...serverNames, ...kLabTests])
-              if (s.trim().isNotEmpty && seen.add(s)) s,
-          ];
-        }();
+        // Server master only. The hardcoded kLabTests used to be merged in
+        // on top of it, so "ESR", "Blood Group" and "ANC Profile" were
+        // offered whether or not this organisation's catalogue had them —
+        // and a test it does not have resolves to no id, so the order was
+        // dropped without a word (user 2026-09-30).
+        final labTests = <String>[
+          for (final r in context.read<MastersStore>().masterRows('lab_tests'))
+            if ((r['name'] ?? r['term']) != null)
+              (r['name'] ?? r['term']).toString(),
+        ];
         final picked = await _pick(context, 'Add Test', labTests.where((t) => !tests.contains(t)).toList());
         if (!mounted) return;
         _parkFocus();
@@ -1888,7 +1885,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       'betadine gargle': '10 ml',
     };
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final pool = serverMeds;
     for (final n in pool) {
       if (out.length >= 5) break;
       if (taken.contains(n.toLowerCase())) continue;
@@ -1905,7 +1902,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   Future<void> _pickComboMed(RxItem m) async {
     _parkFocus();
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     final taken = <String>{
       for (final x in rx) x.name.toLowerCase(),
       for (final x in rx)
@@ -1947,7 +1944,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   Future<void> _editCombos(RxItem m) async {
     _parkFocus();
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     // Options = every medicine in the master EXCEPT this primary and
     // any drug already sitting on another rx row (primary or combo).
     final otherRxNames = <String>{
@@ -2009,7 +2006,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // silently dropped by the server's prescription mirror (same root as
     // the requisition "No line matched" bug, 2026-08-21).
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     // Case-insensitive de-dup — the server master occasionally lists a
     // medicine twice (name variants under different ids), and the
     // multi-select checkbox picker was rendering both, letting the

@@ -215,16 +215,19 @@ class _SymptomFieldState extends State<SymptomField> {
   }
 
   /// Symptom list pulled from the backend masters cache (bootstrap →
-  /// MastersStore). Rows are `{id, term}`; we return just the terms so
-  /// the suggestion dropdown is drop-in compatible with the old
-  /// `kAllSymptoms` list. Falls back to the local hardcoded list if
-  /// the masters cache hasn't hydrated yet (first launch, no network) —
-  /// so the counsellor is never staring at an empty picker.
+  /// MastersStore). Rows are `{id, term}`; we return just the terms.
+  ///
+  /// The server master is the only source. There used to be a hardcoded
+  /// fallback of 45 terms for a cache that had not hydrated yet, which
+  /// re-created the very bug the master was introduced to fix: it spells
+  /// them differently ("Abdominal Pain" against the master's "Abdominal
+  /// pain"), so a symptom picked from it was dropped on the server and
+  /// the visit reached the doctor with nothing recorded. An empty picker
+  /// says something is wrong; a picker full of values the server will
+  /// discard does not (user 2026-09-30).
   List<String> _symptomTerms(MastersStore masters) {
-    final rows = masters.masterRows('symptoms');
-    if (rows.isEmpty) return kAllSymptoms;
     return [
-      for (final r in rows)
+      for (final r in masters.masterRows('symptoms'))
         if ((r['term'] ?? r['name'] ?? r['symptom_name']) != null)
           (r['term'] ?? r['name'] ?? r['symptom_name']).toString()
     ];
@@ -238,6 +241,25 @@ class _SymptomFieldState extends State<SymptomField> {
     // mobile but silently dropped because symptom_master doesn't have it".
     final masters = context.watch<MastersStore>();
     final allSymptoms = _symptomTerms(masters);
+    // Nothing to offer at all: the master has not reached this handset.
+    // Say so, rather than leaving a box that looks broken — there is
+    // nothing the counsellor can type that will be accepted either.
+    if (allSymptoms.isEmpty) {
+      return Container(
+        margin: const EdgeInsets.only(top: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: C2.white, borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: C2.border, width: 1.5), boxShadow: C2.shadow),
+        child: Row(children: [
+          const Icon(Icons.cloud_off_outlined, size: 15, color: C2.text3),
+          const SizedBox(width: 8),
+          Expanded(child: Text(
+              'Symptom list not downloaded yet — connect once to sync.',
+              style: ct(12, FontWeight.w400, C2.text2))),
+        ]),
+      );
+    }
     if (q.isEmpty) {
       // Quick adds on focus (the yellow rows). Village trends when the
       // caller has them (doctor case, advisory API); otherwise the first

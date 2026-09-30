@@ -66,18 +66,23 @@ class CounDashboard extends StatelessWidget {
               patients: todaysList))))),
           const SizedBox(width: 8),
           Expanded(child: StatTile(
-            '$done', 'Visits Completed', C2.cyan,
+            '$done', 'Completed Today', C2.cyan,
             // The shell's _refreshFromBackend pulls /queues/doctor/attended
             // alongside tiles + past-7-days on mount, pull-to-refresh, and
             // app-bar refresh, so `s.patients` already carries the COMPLETED
             // rows and the tap opens instantly with no per-tap fetch
             // (user 2026-08-29 "only one time download and when refresh").
+            //
+            // Filtered to today, so the list matches the number on the tile
+            // (user 2026-09-30). Without it the tile said 1 and the list it
+            // opened ran to every completed visit the MMU had ever had.
             onTap: () {
               final list = s.patients
-                  .where((p) => p.status == 'completed').toList()
+                  .where((p) => p.status == 'completed'
+                             && p.registeredOn == 'Today').toList()
                 ..sort((a, b) => b.regDate.compareTo(a.regDate));
               Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientsList(
-                  title: 'Visits Completed', patients: list)));
+                  title: 'Completed Today', patients: list)));
             })),
           const SizedBox(width: 8),
           // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
@@ -149,6 +154,14 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
   // "show follow up details in details page"). ISO yyyy-mm-dd from the
   // appointment detail; '' = none recorded.
   String _followUp = '';
+  // Visit-level details the screen shows but CPatient has no field for.
+  // Local rather than on the model: nothing else reads them, and widening
+  // CPatient means touching every screen that builds one.
+  String _doctorName = '';
+  String _paymentType = '';
+  String _paidAmount = '';
+  String _bpCategory = '';
+  bool _onMedicine = false;
 
   CPatient get p => widget.p;
 
@@ -214,6 +227,22 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       // so a follow-up visit starts with the last recorded measurements.
       if (d['height'] != null) p.heightCm = d['height'].toString();
       if (d['weight'] != null) p.weightKg = d['weight'].toString();
+      // Advance Details. The fields existed on CPatient for the
+      // Re-Appointment prefill but nothing ever filled them from the
+      // server, so a blood group the receptionist had entered minutes
+      // earlier was nowhere on the screen (user 2026-09-30).
+      //
+      // Only assigned when the key is actually present: an older server
+      // build does not send these, and writing '' from a missing key
+      // would wipe what the re-appointment prefill had already put there.
+      String str(String k) => (d[k] ?? '').toString().trim();
+      if (d.containsKey('aadhar_number')) p.aadhar = str('aadhar_number');
+      if (d.containsKey('blood_group')) p.bloodGroup = str('blood_group');
+      if (d.containsKey('category_name')) p.category = str('category_name');
+      if (d.containsKey('disability')) p.pwd = d['disability'] == true ? 'Yes' : 'No';
+      if (d.containsKey('pin_code')) p.pin = str('pin_code');
+      if (d.containsKey('address')) p.address = str('address');
+      if (d.containsKey('past_history')) p.pastHistory = str('past_history');
       // ENGLISH leads on every display (user 2026-08-22 "still remarks
       // showing hindi") — the original (as dictated) stays in the base
       // columns and is only the fallback for rows without a translation.
@@ -233,6 +262,13 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       p.lmpDate = (d['lmp_date'] as String?) ?? p.lmpDate;
       p.eddDate = (d['edd_date'] as String?) ?? p.eddDate;
       _followUp = (d['follow_up_date'] as String?) ?? '';
+      _paymentType = (d['payment_type'] ?? '').toString().trim();
+      final paid = d['paid_amount'];
+      _paidAmount = (paid is num && paid > 0) ? paid.toString() : '';
+      // The server works this out from the BP pair and sends it; the
+      // screen showed 150/58 and never said what that meant.
+      _bpCategory = (d['bp_category'] ?? '').toString().trim();
+      _onMedicine = d['taken_prescribed_medicine'] == true;
       // Assigned doctor (staff_name) — Re-Appointment prefill re-selects
       // them in the register form's dropdown.
       final docName = (d['assigned_doctor_name'] as String?)?.trim();
@@ -373,8 +409,22 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
               _kv('Village', p.village.isEmpty ? '—' : p.village),
               _kv('Symptoms', p.symptoms.isEmpty ? '—' : p.symptoms.join(', ')),
               if (p.pregnant) _kv('Pregnant', 'Yes'),
+              // Pregnancy dates sit under the flag that explains them, and
+              // only when there is one — a blank LMP row on a patient who
+              // is not pregnant reads as missing data (user 2026-09-30).
+              if (p.pregnant && p.lmpDate.isNotEmpty)
+                _kv('LMP Date', _asDisplayDate(p.lmpDate)),
+              if (p.pregnant && p.eddDate.isNotEmpty)
+                _kv('EDD Date', _asDisplayDate(p.eddDate)),
               // 'Likely' row removed from Patient Details (user 2026-08-22).
               _kv('Registered', p.registeredOn),
+              if ((p.assignedDoctor ?? '').trim().isNotEmpty)
+                _kv('Doctor', p.assignedDoctor!),
+              if (_paymentType.isNotEmpty) _kv('Payment', _paymentType),
+              if (_paidAmount.isNotEmpty) _kv('Paid Amount', '₹$_paidAmount'),
+              if (_onMedicine) _kv('On Medicine', 'Yes'),
+              if (p.pastHistory.trim().isNotEmpty)
+                _kv('Past History', p.pastHistory),
               if (_followUp.isNotEmpty)
                 _kv('Next Follow-up', _followUp.split('-').reversed.join('-')),
               // Re-Appointment CTA (rule 2026-07-31). Sits at the end of the
@@ -389,6 +439,23 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                 ),
               ],
             ])),
+            // Advance Details — the optional section of the Register form.
+            // The whole card is skipped when the receptionist filled none
+            // of it, and each row is skipped when that one is blank, so a
+            // patient registered with only the basics reads the same as
+            // before (user 2026-09-30 "show all, hide when empty").
+            if (_hasAdvance(p))
+              CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const SecBar('Advance Details'),
+                if (p.aadhar.trim().isNotEmpty) _kv('Aadhar', _maskAadhar(p.aadhar)),
+                if ((p.bloodGroup ?? '').trim().isNotEmpty) _kv('Blood Group', p.bloodGroup!),
+                if ((p.category ?? '').trim().isNotEmpty) _kv('Category', p.category!),
+                if (p.pwd == 'Yes') _kv('Disability', 'Yes'),
+                if (p.heightCm.trim().isNotEmpty) _kv('Height', '${p.heightCm} cm'),
+                if (p.weightKg.trim().isNotEmpty) _kv('Weight', '${p.weightKg} kg'),
+                if (p.pin.trim().isNotEmpty) _kv('Pin Code', p.pin),
+                if (p.address.trim().isNotEmpty) _kv('Address', p.address),
+              ])),
             if (p.vitals.isNotEmpty)
               CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 const SecBar('Vitals'),
@@ -402,6 +469,13 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                 // it, because "Systolic BP (mmHg)" has no room to sit beside
                 // anything in half a phone's width.
                 ..._vitalRows(p.vitals),
+                // What the BP pair above actually means. The server works
+                // it out and sends it; the screen showed 150/58 and left
+                // the reader to know (user 2026-09-30).
+                if (_bpCategory.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  _kv('BP Category', _bpCategory),
+                ],
               ])),
             if (p.remarks.isNotEmpty)
               CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -501,6 +575,37 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
         ]),
       ),
     );
+  }
+
+  /// True when the receptionist filled anything in Advance Details.
+  bool _hasAdvance(CPatient p) =>
+      p.aadhar.trim().isNotEmpty ||
+      (p.bloodGroup ?? '').trim().isNotEmpty ||
+      (p.category ?? '').trim().isNotEmpty ||
+      p.pwd == 'Yes' ||
+      p.heightCm.trim().isNotEmpty ||
+      p.weightKg.trim().isNotEmpty ||
+      p.pin.trim().isNotEmpty ||
+      p.address.trim().isNotEmpty;
+
+  /// Aadhaar with all but the last four digits covered.
+  ///
+  /// It is a government identity number on a screen any staff member can
+  /// open, and the last four are enough to confirm the right card is on
+  /// file. Anything that is not a plain 12-digit number is shown as it
+  /// was stored rather than mangled.
+  static String _maskAadhar(String raw) {
+    final d = raw.trim();
+    if (d.length != 12 || int.tryParse(d) == null) return d;
+    return 'XXXX XXXX ${d.substring(8)}';
+  }
+
+  /// ISO yyyy-mm-dd from the server rendered dd-mm-yyyy, the way every
+  /// other date on this screen reads. Anything else passes through.
+  static String _asDisplayDate(String iso) {
+    final parts = iso.trim().split('-');
+    if (parts.length != 3 || parts[0].length != 4) return iso.trim();
+    return '${parts[2]}-${parts[1]}-${parts[0]}';
   }
 
   /// The vitals map laid out two to a row, in the order it was built.

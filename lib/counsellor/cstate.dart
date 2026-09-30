@@ -424,6 +424,13 @@ class CounsellorState extends ChangeNotifier {
   int? backendLabQueue;
   int? backendPharmaQueue;
   int? backendPendingPayment;
+  /// Doctor's "Completed Today" and pharmacist's "Dispensed Today".
+  ///
+  /// Counted server-side so the number does not depend on how much of the
+  /// day's work this handset happens to hold — a phone that synced an hour
+  /// ago was showing its own slice as the day's total (user 2026-09-30).
+  int? backendDoctorCompleted;
+  int? backendDispensed;
 
   /// True while a backend refresh is in flight; false when idle.
   bool refreshing = false;
@@ -452,9 +459,13 @@ class CounsellorState extends ChangeNotifier {
     final lq = asInt(tiles['lab_queue']);
     final pq = asInt(tiles['pharmacist_queue']);
     final pp = asInt(tiles['pending_payment']);
+    final dct = asInt(tiles['doctor_completed_today']);
+    final dst = asInt(tiles['dispensed_today']);
     if (t != null) backendRegisteredToday = t;
     if (c != null) backendVisitsCompleted = c;
     if (p != null) backendPast7DaysTotal = p;
+    if (dct != null) backendDoctorCompleted = dct;
+    if (dst != null) backendDispensed = dst;
     if (dq != null) backendDoctorQueue = dq;
     if (lq != null) backendLabQueue = lq;
     if (pq != null) backendPharmaQueue = pq;
@@ -1112,8 +1123,13 @@ class CounsellorState extends ChangeNotifier {
   // ----- Counsellor views -----
   int get registeredToday => _registeredToday ??=
       patients.where((p) => p.registeredOn == 'Today').length;
-  int get visitsCompleted => _visitsCompleted ??=
-      patients.where((p) => p.status == 'completed').length;
+  /// Completed TODAY — the tile beside "Registered today" and "Past 7
+  /// days", which both mean a period. This counted every completed visit
+  /// ever, so it only ever grew and read as today's work (user
+  /// 2026-09-30). Matches the server's `tiles.completed`.
+  int get visitsCompleted => _visitsCompleted ??= patients
+      .where((p) => p.status == 'completed' && p.registeredOn == 'Today')
+      .length;
 
   // ----- Doctor views -----
   List<CPatient> get doctorQueue => _doctorQueue ??= patients
@@ -1136,9 +1152,12 @@ class CounsellorState extends ChangeNotifier {
       patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList()
         ..sort((a, b) => (b.backendAppointmentId ?? 1 << 30)
             .compareTo(a.backendAppointmentId ?? 1 << 30));
-  // Free now that doctorAttended is held: the tile used to build and sort
-  // the entire list just to read .length off it.
-  int get doctorCompleted => doctorAttended.length;
+  /// Today's, to match the tile beside it. The count used to run over
+  /// every case the doctor had ever finished, so it only grew and read as
+  /// the day's work next to "In Queue" (user 2026-09-30).
+  List<CPatient> get doctorAttendedToday =>
+      doctorAttended.where((p) => p.registeredOn == 'Today').toList();
+  int get doctorCompleted => doctorAttendedToday.length;
 
   /// Every patient the doctor has interacted with in the last 7 days —
   /// queue + attended — sorted newest first. Filters by CPatient.regDate
@@ -1168,7 +1187,11 @@ class CounsellorState extends ChangeNotifier {
       patients.where((p) => p.status == 'with_pharma').toList();
   List<CPatient> get dispensedPatients => _dispensedPatients ??=
       patients.where((p) => p.status == 'completed').toList();
-  int get pharmaDispensed => dispensedPatients.length;
+  /// Today's, to match the tile beside it — same reason as
+  /// [doctorAttendedToday] (user 2026-09-30).
+  List<CPatient> get dispensedToday =>
+      dispensedPatients.where((p) => p.registeredOn == 'Today').toList();
+  int get pharmaDispensed => dispensedToday.length;
 
   // ----- Past-7-day KPI feeds (rule 2026-07-31, parity with doctor) -----
   bool _within7Days(String regDate) {

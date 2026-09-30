@@ -28,7 +28,7 @@ import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList, kUploadsBase;
 import '../doctor/dshell.dart' show DocHeader, DocBottomNav;
-import '../doctor/ddata.dart' show kMedicineNames, parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty, displayDosage, strengthWithUnit;
+import '../doctor/ddata.dart' show parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty, displayDosage, strengthWithUnit;
 import '../services/connectivity_service.dart';
 import '../services/deepgram_stt.dart';
 import '../services/attendance_store.dart';
@@ -377,7 +377,8 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
           borderRadius: BorderRadius.circular(10),
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
             const PharmaDispensedList())),
-          child: StatTile('${s.pharmaDispensed}', 'Dispensed', C2.green))),
+          child: StatTile('${s.backendDispensed ?? s.pharmaDispensed}',
+              'Dispensed Today', C2.green))),
         const SizedBox(width: 8),
         // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
         // Reuses the counsellor patient list widget filtered to patients
@@ -483,7 +484,8 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
     final query = q.trim().toLowerCase();
-    final list = s.dispensedPatients.where((p) => query.isEmpty
+    // Today's, to match the tile that opens this list (user 2026-09-30).
+    final list = s.dispensedToday.where((p) => query.isEmpty
         || p.name.toLowerCase().contains(query) || p.contact.contains(query)).toList();
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
@@ -491,7 +493,7 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
         backgroundColor: C2.bg,
         appBar: AppBar(backgroundColor: C2.white, foregroundColor: C2.navy, elevation: 0,
           shape: const Border(bottom: BorderSide(color: C2.cyan, width: 3)),
-          title: Text('Dispensed Patients (${s.dispensedPatients.length})', style: ct(16, FontWeight.w700, C2.navy))),
+          title: Text('Dispensed Today (${s.dispensedToday.length})', style: ct(16, FontWeight.w700, C2.navy))),
         body: Column(children: [
           Padding(padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
             child: TextField(decoration: cInput('Search by name or phone number').copyWith(prefixIcon: const Icon(Icons.search, size: 18, color: C2.navy)),
@@ -1904,7 +1906,7 @@ class _PharmaStockState extends State<PharmaStock> {
   Future<void> _editReqCombos(_Req r) async {
     if (r.name == null) return;
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final pool = serverMeds;
     final taken = <String>{
       r.name!.toLowerCase(),
       for (final other in reqItems)
@@ -2509,7 +2511,7 @@ class _MedPickerState extends State<_MedPicker> {
     // Server medicine master first (only names the backend can match);
     // the hardcoded list is just the first-launch offline fallback.
     final serverMeds = context.watch<MastersStore>().medicineNames();
-    final options = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final options = serverMeds;
     final m = options.where((o) => q.isEmpty || o.toLowerCase().contains(q.toLowerCase())).toList();
     return Padding(padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
