@@ -495,7 +495,7 @@ class _DateFieldState extends State<DateField> {
 /// scrollable filtered list. Looks identical to the plain DropdownButtonFormField
 /// when closed; used for pickers with long lists (block, village) where the
 /// default picker becomes unusable. Empty [items] disables interaction.
-class SearchDropdown extends StatelessWidget {
+class SearchDropdown extends StatefulWidget {
   final List<String> items;
   final String? value;
   final String hint;
@@ -511,29 +511,62 @@ class SearchDropdown extends StatelessWidget {
   });
 
   @override
+  State<SearchDropdown> createState() => _SearchDropdownState();
+}
+
+class _SearchDropdownState extends State<SearchDropdown> {
+  /// Somewhere for focus to go that is not a text field.
+  ///
+  /// `unfocus()` was not enough: the framework restores focus while the
+  /// sheet's route is still popping, so dropping it the instant the await
+  /// returns happens too early and the restore puts it straight back on the
+  /// symptom box — the keyboard reopened there and the next thing typed
+  /// went into Symptoms (user 2026-09-30). Focus that is HELD cannot be
+  /// handed anywhere. Same sink the doctor's case screen uses for its own
+  /// pickers, where the bug has never appeared.
+  final FocusNode _sink =
+      FocusNode(skipTraversal: true, debugLabel: 'search-dropdown-sink');
+
+  @override
+  void dispose() {
+    _sink.dispose();
+    super.dispose();
+  }
+
+  void _park() {
+    if (_sink.canRequestFocus) _sink.requestFocus();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final items = widget.items;
+    final value = widget.value;
+    final hint = widget.hint;
     final disabled = items.isEmpty;
-    return InkWell(
+    return Focus(
+      focusNode: _sink,
+      child: InkWell(
       onTap: disabled ? null : () async {
-        // Drop primary focus BEFORE opening the sheet. Without this the
-        // framework hands focus back to the last-focused TextField when
-        // the sheet closes, and the enclosing scroll view auto-scrolls
-        // up to reveal it — the form "jumped to top" whenever the
-        // Doctor / Block / Village picker was used (user bug 2026-08-14).
-        FocusManager.instance.primaryFocus?.unfocus();
+        // Park BEFORE opening: without it the enclosing scroll view chases
+        // whatever text field held focus when the sheet closes, and the
+        // form jumped to the top (user 2026-08-14).
+        _park();
         final picked = await showModalBottomSheet<String>(
           context: context,
           isScrollControlled: true,
           backgroundColor: Colors.transparent,
-          builder: (_) => _SearchSheet(items: items, current: value, hint: searchLabel ?? 'Search $hint'),
+          builder: (_) => _SearchSheet(
+              items: items, current: value,
+              hint: widget.searchLabel ?? 'Search $hint'),
         );
-        // And again on the way out. The sheet carries its own search field,
-        // and when it closes the framework hands focus back to whatever
-        // held it before — which on Register is the symptom box. Picking a
-        // doctor reopened the keyboard there, and the next thing typed went
-        // into Symptoms (user 2026-09-30).
-        FocusManager.instance.primaryFocus?.unfocus();
-        if (picked != null) onChanged(picked);
+        if (!mounted) return;
+        // And again on the way out, after the frame the route pops on, so
+        // the restore has nothing left to restore to.
+        _park();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _park();
+        });
+        if (picked != null) widget.onChanged(picked);
       },
       child: InputDecorator(
         decoration: cInput().copyWith(
@@ -546,6 +579,7 @@ class SearchDropdown extends StatelessWidget {
               value == null ? C2.text3 : C2.text),
         ),
       ),
+    ),
     );
   }
 }
