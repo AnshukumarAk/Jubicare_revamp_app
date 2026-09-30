@@ -116,6 +116,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // Yes requires a date, which submits as follow_up_date.
   bool? _nextFollowUp;
   DateTime? _followUpDate;
+  /// How far ahead a follow-up may be booked — one month (user 2026-09-30).
+  static const int _followUpMaxDays = 31;
   // True while GET /api/appointments/{id} is in flight — see
   // _loadRegistrationDetail. Without it the Registration Details card shows
   // a bare '—' during the round-trip, which reads as "none recorded".
@@ -1044,11 +1046,20 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               InkWell(
                 onTap: () async {
                   final now = DateTime.now();
+                  // A month out at most. The picker opened on a full year,
+                  // so a stray tap on the forward arrow landed the doctor
+                  // in September 2027 and a review that far ahead is not a
+                  // follow-up (user 2026-09-30). Tomorrow is still the
+                  // earliest — a follow-up dated today is this visit.
+                  final last = now.add(const Duration(days: _followUpMaxDays));
+                  final current = _followUpDate;
                   final picked = await showDatePicker(
                     context: context,
-                    initialDate: _followUpDate ?? now.add(const Duration(days: 7)),
+                    initialDate: (current != null && !current.isAfter(last))
+                        ? current
+                        : now.add(const Duration(days: 7)),
                     firstDate: now.add(const Duration(days: 1)),
-                    lastDate: now.add(const Duration(days: 365)),
+                    lastDate: last,
                   );
                   if (picked != null) setState(() => _followUpDate = picked);
                 },
@@ -1090,6 +1101,13 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             }
             if (_nextFollowUp == null) { return err('Answer "Next Follow-Up" (Yes/No)'); }
             if (_nextFollowUp == true && _followUpDate == null) { return err('Select the follow-up date'); }
+            // Catches a date the picker could not have produced — one held
+            // from before the limit existed, or a re-appointment prefill.
+            if (_nextFollowUp == true && _followUpDate != null &&
+                _followUpDate!.isAfter(DateTime.now()
+                    .add(const Duration(days: _followUpMaxDays)))) {
+              return err('Follow-up must be within $_followUpMaxDays days');
+            }
             // Vitals must be clinically plausible (user 2026-08-22).
             for (final v in _kVitalSpecs) {
               final rangeErr = _vitalRangeErr(v.key);
