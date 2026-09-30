@@ -242,6 +242,26 @@ class _CounRegisterState extends State<CounRegister> {
   // on the new appointment record.
   CPatient? _reAppointmentSource;
 
+  /// The server's id for the patient being re-appointed, or null when this
+  /// handset cannot name them yet.
+  ///
+  /// `backendPatientId` is filled by the queue merge, but a row can reach
+  /// this screen without it — one registered on this phone and not yet
+  /// merged back, or a detail screen that built its own copy. A backend row
+  /// also carries the id in its own key ('B1536329'), so that is read as a
+  /// fallback before giving up. Giving up matters: without the id the
+  /// server registers a second patient rather than refusing (user
+  /// 2026-09-30), so the caller must refuse instead.
+  int? get _reAppointmentPatientId {
+    final src = _reAppointmentSource;
+    if (src == null) return null;
+    if (src.backendPatientId != null) return src.backendPatientId;
+    if (src.id.startsWith('B') || src.id.startsWith('S')) {
+      return int.tryParse(src.id.substring(1));
+    }
+    return null;
+  }
+
   @override
   void dispose() {
     _previewDebounce?.cancel();
@@ -502,6 +522,18 @@ class _CounRegisterState extends State<CounRegister> {
     // complaint gives the doctor and the advisory nothing to work from.
     if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
+    // A re-appointment that cannot name its patient must not be sent.
+    //
+    // The id rides as `patient_id`, and the server attaches the visit to
+    // that patient instead of inserting one. Without the key it registers a
+    // second person under the same name and number -- silently, because an
+    // absent key is exactly what a fresh registration looks like. That is
+    // what happened to Divyansh maurya: two patient rows, one visit each,
+    // both filed as new (user 2026-09-30).
+    if (_reAppointmentSource != null && _reAppointmentPatientId == null) {
+      return err('This patient has not finished syncing yet — '
+          'open Re-Appointment again once the cloud icon is green');
+    }
     // Paid orgs must always collect a consultation fee (payment is
     // pinned to Paid by the render Builder). Free orgs skip this
     // entirely — no amount asked (user 2026-09-02).
@@ -770,7 +802,7 @@ class _CounRegisterState extends State<CounRegister> {
     // server so `/mobile/sync/push` (mobile._register) attaches the new
     // appointment to the same patient row instead of inserting a
     // duplicate (user rule 2026-08-16).
-    final reappointmentPatientId = _reAppointmentSource?.backendPatientId;
+    final reappointmentPatientId = _reAppointmentPatientId;
     final sync = context.read<SyncService>();
     await sync.enqueue(kind: 'patient.register', payload: {
       if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
