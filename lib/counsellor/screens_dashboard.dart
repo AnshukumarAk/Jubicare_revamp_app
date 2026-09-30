@@ -158,6 +158,7 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
   // Local rather than on the model: nothing else reads them, and widening
   // CPatient means touching every screen that builds one.
   String _doctorName = '';
+  String _attendedBy = '';
   String _paymentType = '';
   String _paidAmount = '';
   bool _onMedicine = false;
@@ -262,6 +263,7 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       p.eddDate = (d['edd_date'] as String?) ?? p.eddDate;
       _followUp = (d['follow_up_date'] as String?) ?? '';
       _paymentType = (d['payment_type'] ?? '').toString().trim();
+      _attendedBy = (d['attended_by_name'] ?? '').toString().trim();
       final paid = d['paid_amount'];
       _paidAmount = (paid is num && paid > 0) ? paid.toString() : '';
       _onMedicine = d['taken_prescribed_medicine'] == true;
@@ -416,8 +418,15 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                 _kv('EDD Date', _asDisplayDate(p.eddDate)),
               // 'Likely' row removed from Patient Details (user 2026-08-22).
               _kv('Registered', p.registeredOn),
-              if ((p.assignedDoctor ?? '').trim().isNotEmpty)
-                _kv('Doctor', p.assignedDoctor!),
+              // Who actually saw the patient once somebody has, and who was
+              // assigned until then. An MMU with two doctors assigns one and
+              // whichever is free takes the case, so the assignment alone
+              // credited a consultation to the wrong doctor (user
+              // 2026-09-30).
+              if (_attendedBy.isNotEmpty)
+                _kv('Seen by', _attendedBy)
+              else if ((p.assignedDoctor ?? '').trim().isNotEmpty)
+                _kv('Assigned to', p.assignedDoctor!),
               // Only what was charged, and only when something was. A free
               // organisation never collects a consultation fee, so the
               // Register form hides the field entirely — a "Payment: Free"

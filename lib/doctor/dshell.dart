@@ -482,12 +482,13 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       safe(api.doctorAttended(limit: 200)),
       safe(api.pendingPayment(limit: 200)),
       safe(api.labQueue(limit: 200)),
-      // Today's whole day. The "Completed Today" tile is counted on the
-      // server and the list it opens is filtered from what this handset
-      // holds, and the pulls above are capped -- so the two disagreed
-      // (user 2026-09-30).
-      safe(api.today(limit: 500)),
     ]);
+    // Today's whole day, merged SEPARATELY and additively. The four pulls
+    // above cover disjoint statuses, so concatenating them cannot repeat a
+    // patient; this one covers every status, so it can -- and a plain merge
+    // only de-duplicates in additive mode. Folded in with the rest it put
+    // every queued patient on screen twice (user 2026-09-30).
+    final todayRows = await safe(api.today(limit: 500));
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final combined = [
@@ -495,6 +496,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       for (final r in results) ...r.items,
     ];
     store.mergeBackendPatients(combined);
+    store.mergeBackendPatients(todayRows.items, additive: true);
     _delta.seedFrom(combined);
     try {
       final cache = await PatientsCacheStore.open();
