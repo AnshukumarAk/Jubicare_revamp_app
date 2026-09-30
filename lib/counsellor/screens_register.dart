@@ -963,28 +963,18 @@ class _CounRegisterState extends State<CounRegister> {
       symptoms
         ..clear()
         ..addAll(p.symptoms);
-      // Vitals prefill (user rule 2026-08-13): show the LAST visit's
-      // readings so the counsellor sees them selected and just updates
-      // what changed. Keys cover both spellings the app has written —
-      // 'Oxygen' (backend hydrate) and 'Oxygen Saturation' (local form).
-      String vital(List<String> keys) {
-        for (final k in keys) {
-          final v = p.vitals[k];
-          if (v != null && v.trim().isNotEmpty) return _wholeNumber(v.trim());
-        }
-        return '';
+      // Vitals start EMPTY, like the remark above (user 2026-09-30).
+      //
+      // They used to carry the last visit's readings so the counsellor
+      // could just change what moved. But a reading is a measurement taken
+      // on a day: left untouched, a fortnight-old blood pressure is filed
+      // as today's and read as though somebody had put the cuff on. Blank
+      // is the honest start -- a vital nobody measured is not sent at all,
+      // and the record says so.
+      for (final c in [_sys, _dia, _sugar, _temp, _spo2, _hr, _hb]) {
+        c.clear();
       }
-      _sys.text   = vital(['Systolic BP']);
-      _dia.text   = vital(['Diastolic BP']);
-      _sugar.text = vital(['Blood Sugar']);
-      _temp.text  = vital(['Body Temp (°F)']);
-      _spo2.text  = vital(['Oxygen', 'Oxygen Saturation']);
-      _hr.text    = vital(['Heart Rate']);
-      _hb.text    = vital(['Hemoglobin']);
-      // Auto-expand the vitals section when anything came through, so the
-      // prefill is visible instead of hiding behind the collapsed toggle.
-      showVitals = [_sys, _dia, _sugar, _temp, _spo2, _hr, _hb]
-          .any((c) => c.text.isNotEmpty);
+      showVitals = false;
       _attachments.clear();
       // Previous visit's doctor pre-selected (rule 2026-08-13) — the
       // hydrate stored their staff_name; keep it only when it exists in
