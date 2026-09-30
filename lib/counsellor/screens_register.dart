@@ -948,10 +948,15 @@ class _CounRegisterState extends State<CounRegister> {
       _contact.text = p.contact;
       block = p.block.isEmpty ? null : p.block;
       village = p.village.isEmpty ? null : p.village;
-      // INPUT gets the ORIGINAL as dictated, never the English display
-      // copy (user 2026-08-22 "dont show english version in inputs").
-      _remarks.text =
-          p.remarksOriginal.isNotEmpty ? p.remarksOriginal : p.remarks;
+      // Remarks start EMPTY on a re-appointment. They are why the patient
+      // came THIS time, and every visit now keeps its own
+      // (appointments.patient_remarks, 2026-09-30) — carrying the last
+      // one forward means the counsellor who does not clear it files a
+      // fortnight-old complaint against today's visit.
+      //
+      // Symptoms below still carry over: those are what the patient has,
+      // and a returning patient usually still has them (rule 2026-07-31).
+      _remarks.clear();
       // Carry the previous symptom picks over (rule 2026-07-31) so the
       // counsellor can just tweak them for today's visit instead of
       // re-selecting from scratch.
