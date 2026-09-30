@@ -212,8 +212,17 @@ class _ShellState extends State<_Shell> {
       store.mergeBackendPatients(rows, additive: true);
     }
     try {
-      final tiles = await context.read<QueuesApi>().tiles();
-      if (mounted) store.applyTiles(tiles);
+      final api = context.read<QueuesApi>();
+      final tiles = await api.tiles();
+      if (!mounted) return true;
+      store.applyTiles(tiles);
+      // Today's rows too. A delta only carries what changed since the
+      // cursor, and the lists behind the "today" cards are filtered from
+      // whatever this handset holds — so the card could be right and the
+      // list behind it short (user 2026-09-30). The other two shells had
+      // the same hole.
+      final todayRows = await api.today(limit: 500);
+      if (mounted) store.mergeBackendPatients(todayRows.items, additive: true);
     } catch (_) {/* counts stay as they were — the list is already right */}
     return true;
   }
