@@ -219,8 +219,12 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       v('Oxygen', 'oxygen');
       v('Heart Rate', 'heart_rate');
       v('Hemoglobin', 'hemoglobin');
-      v('Height (cm)', 'height');
-      v('Weight (kg)', 'weight');
+      // Height and weight are NOT vitals here. The Register form keeps them
+      // under Advance Details, the doctor's Vitals card has no room for them
+      // (_kVitalSpecs is the same seven), and Patient Details already prints
+      // them on the Advance Details card below -- so putting them in this map
+      // as well showed each one twice (user 2026-09-30). They are mirrored
+      // onto heightCm/weightKg just below, which is what that card reads.
       p.vitals = vitals;
       // Also mirror height/weight into the CPatient string fields the
       // register form's Re-Appointment prefill reads (heightCm/weightKg)
