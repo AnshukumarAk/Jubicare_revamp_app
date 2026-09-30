@@ -527,6 +527,12 @@ class SearchDropdown extends StatelessWidget {
           backgroundColor: Colors.transparent,
           builder: (_) => _SearchSheet(items: items, current: value, hint: searchLabel ?? 'Search $hint'),
         );
+        // And again on the way out. The sheet carries its own search field,
+        // and when it closes the framework hands focus back to whatever
+        // held it before — which on Register is the symptom box. Picking a
+        // doctor reopened the keyboard there, and the next thing typed went
+        // into Symptoms (user 2026-09-30).
+        FocusManager.instance.primaryFocus?.unfocus();
         if (picked != null) onChanged(picked);
       },
       child: InputDecorator(

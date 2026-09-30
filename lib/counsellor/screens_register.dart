@@ -1317,7 +1317,7 @@ class _CounRegisterState extends State<CounRegister> {
               if (mounted && payment != 'Paid') setState(() => payment = 'Paid');
             });
           }
-          return CField('Paid Amount (₹)',
+          return CField('Consultation Fees (₹)',
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 TextField(controller: _amount, keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly,

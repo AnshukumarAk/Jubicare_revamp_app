@@ -404,7 +404,9 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
               const SecBar('Registration Details'),
               _kv('Contact', p.contact),
               if (p.dob.isNotEmpty) _kv('Date of Birth', p.dob),
-              _kv('Age', '${p.age} y'),
+              // "28 Years", not "28 y" — the abbreviation saved nothing on a
+              // row that has the width for the word (user 2026-09-30).
+              _kv('Age', '${p.age} ${p.age == 1 ? "Year" : "Years"}'),
               _kv('Block', p.block.isEmpty ? '—' : p.block),
               _kv('Village', p.village.isEmpty ? '—' : p.village),
               _kv('Symptoms', p.symptoms.isEmpty ? '—' : p.symptoms.join(', ')),
@@ -420,8 +422,13 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
               _kv('Registered', p.registeredOn),
               if ((p.assignedDoctor ?? '').trim().isNotEmpty)
                 _kv('Doctor', p.assignedDoctor!),
-              if (_paymentType.isNotEmpty) _kv('Payment', _paymentType),
-              if (_paidAmount.isNotEmpty) _kv('Paid Amount', '₹$_paidAmount'),
+              // Only what was charged, and only when something was. A free
+              // organisation never collects a consultation fee, so the
+              // Register form hides the field entirely — a "Payment: Free"
+              // row here said something the form had already decided was
+              // not worth asking (user 2026-09-30).
+              if (_paidAmount.isNotEmpty)
+                _kv('Consultation Fees', '₹$_paidAmount'),
               if (_onMedicine) _kv('On Medicine', 'Yes'),
               if (p.pastHistory.trim().isNotEmpty)
                 _kv('Past History', p.pastHistory),
