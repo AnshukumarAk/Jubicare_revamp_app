@@ -160,7 +160,6 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
   String _doctorName = '';
   String _paymentType = '';
   String _paidAmount = '';
-  String _bpCategory = '';
   bool _onMedicine = false;
 
   CPatient get p => widget.p;
@@ -265,9 +264,6 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
       _paymentType = (d['payment_type'] ?? '').toString().trim();
       final paid = d['paid_amount'];
       _paidAmount = (paid is num && paid > 0) ? paid.toString() : '';
-      // The server works this out from the BP pair and sends it; the
-      // screen showed 150/58 and never said what that meant.
-      _bpCategory = (d['bp_category'] ?? '').toString().trim();
       _onMedicine = d['taken_prescribed_medicine'] == true;
       // Assigned doctor (staff_name) — Re-Appointment prefill re-selects
       // them in the register form's dropdown.
@@ -476,13 +472,6 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
                 // it, because "Systolic BP (mmHg)" has no room to sit beside
                 // anything in half a phone's width.
                 ..._vitalRows(p.vitals),
-                // What the BP pair above actually means. The server works
-                // it out and sends it; the screen showed 150/58 and left
-                // the reader to know (user 2026-09-30).
-                if (_bpCategory.isNotEmpty) ...[
-                  const SizedBox(height: 6),
-                  _kv('BP Category', _bpCategory),
-                ],
               ])),
             if (p.remarks.isNotEmpty)
               CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
