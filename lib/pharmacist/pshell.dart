@@ -298,10 +298,26 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     final rows = await _delta.changedRows(context.read<SyncApi>());
     if (rows == null) return false;
     if (!mounted) return true;
+    final store = context.read<CounsellorState>();
     if (rows.isNotEmpty) {
-      context.read<CounsellorState>()
-          .mergeBackendPatients(rows, additive: true);
+      store.mergeBackendPatients(rows, additive: true);
     }
+    // The tiles come along, as they do on the counsellor's delta. They are
+    // 0.12 KB and they are the server's own counts -- the number on the card
+    // -- where the list behind it is filtered from whatever this handset
+    // holds. Neither shell pulled them at all, so a dispense made the list
+    // go to two while the card stayed on one (user 2026-09-30).
+    //
+    // Today's rows come too: a delta only carries what changed since the
+    // cursor, and the today filters behind those cards need the whole day.
+    try {
+      final api = context.read<QueuesApi>();
+      final tiles = await api.tiles();
+      if (!mounted) return true;
+      store.applyTiles(tiles);
+      final todayRows = await api.today(limit: 500);
+      if (mounted) store.mergeBackendPatients(todayRows.items, additive: true);
+    } catch (_) {/* counts stay as they were -- the list is already right */}
     return true;
   }
 
@@ -343,6 +359,13 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     ];
     store.mergeBackendPatients(combined);
     store.mergeBackendPatients(todayRows.items, additive: true);
+    // The server's own counts for the cards. Without them the cards fall
+    // back to the length of a locally filtered list, which is a narrower
+    // set than the server counted (user 2026-09-30).
+    try {
+      final tiles = await api.tiles();
+      if (mounted) store.applyTiles(tiles);
+    } catch (_) {/* cards keep the numbers they had */}
     _delta.seedFrom(combined);
     try {
       final cache = await PatientsCacheStore.open();
