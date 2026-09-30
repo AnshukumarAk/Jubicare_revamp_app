@@ -242,11 +242,19 @@ class _ShellState extends State<_Shell> {
       final attendedF = api.doctorAttended(limit: 200)
           .then<QueueList?>((v) => v)
           .catchError((_) => null);
-      final results = await Future.wait([tilesF, listF, attendedF]);
+      // Today's whole day, so the "Completed Today" tile and the list it
+      // opens are filtering the same rows. The attended pull above is
+      // capped and ordered by id, so a visit completed today could be
+      // counted by the tile and missing from the list (user 2026-09-30).
+      final todayF = api.today(limit: 500)
+          .then<QueueList?>((v) => v)
+          .catchError((_) => null);
+      final results = await Future.wait([tilesF, listF, attendedF, todayF]);
       if (!mounted) return;
       final tiles = results[0] as Map<String, dynamic>?;
       final list = results[1] as QueueList?;
       final attended = results[2] as QueueList?;
+      final todayRows = results[3] as QueueList?;
       if (tiles != null) store.applyTiles(tiles);
       if (list != null) {
         store.mergeBackendPatients(list.items);
@@ -265,6 +273,9 @@ class _ShellState extends State<_Shell> {
         // registrations that never enter the attended list (user 2026-09-02
         // "register today 1 ho gaya but not showing in the list").
         store.mergeBackendPatients(attended.items, additive: true);
+      }
+      if (todayRows != null) {
+        store.mergeBackendPatients(todayRows.items, additive: true);
       }
       store.setRefreshState(loading: false);
     } catch (_) {

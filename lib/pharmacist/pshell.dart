@@ -325,6 +325,12 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     }
     final week = await api.pharmaPast7Days(limit: 200)
         .catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    // Today's whole day. past-7-days only carries visits this pharmacist
+    // dispensed itself, so one completed from the web was counted by the
+    // "Dispensed Today" tile and missing from the list behind it -- 3
+    // against 1 (user 2026-09-30).
+    final todayRows = await api.today(limit: 500)
+        .catchError((_) => QueueList(items: const [], total: 0, count: 0));
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final queueIds = {
@@ -336,6 +342,7 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
         if (!queueIds.contains(r['appointment_id'])) r,
     ];
     store.mergeBackendPatients(combined);
+    store.mergeBackendPatients(todayRows.items, additive: true);
     _delta.seedFrom(combined);
     try {
       final cache = await PatientsCacheStore.open();

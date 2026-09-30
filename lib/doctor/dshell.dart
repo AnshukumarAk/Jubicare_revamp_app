@@ -482,6 +482,11 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       safe(api.doctorAttended(limit: 200)),
       safe(api.pendingPayment(limit: 200)),
       safe(api.labQueue(limit: 200)),
+      // Today's whole day. The "Completed Today" tile is counted on the
+      // server and the list it opens is filtered from what this handset
+      // holds, and the pulls above are capped -- so the two disagreed
+      // (user 2026-09-30).
+      safe(api.today(limit: 500)),
     ]);
     if (!mounted) return;
     final store = context.read<CounsellorState>();
