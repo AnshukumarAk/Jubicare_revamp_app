@@ -73,6 +73,28 @@ String _fmtVital(Object? v) {
   return n != null ? _fmtVital(n) : s;
 }
 
+/// A diagnosis chip carries the term and the ICD code glued into one label —
+/// "Fever · MG26" from the picker (Disease.display), "Fever | MG26" from the
+/// advisory card's Apply. The server stores them in two separate columns
+/// (appointment_diagnosis.diagnosis_text / .icd11_code), so the label is split
+/// back apart here rather than shipped whole. Before this the whole label went
+/// into diagnosis_text, which is why the web's case page read
+/// "Previous Diagnosis: Fever · MG26" (user 2026-09-30).
+({String text, String icd}) _splitDx(String label) {
+  for (final sep in const [' · ', ' | ']) {
+    final i = label.lastIndexOf(sep);
+    if (i <= 0) continue;
+    final code = label.substring(i + sep.length).trim();
+    // An ICD-11 stem is short and alphanumeric. Anything else belongs to the
+    // term — a doctor may well type "Fever | origin unknown" by hand.
+    if (code.isNotEmpty && code.length <= 12 &&
+        RegExp(r'^[A-Za-z0-9.]+$').hasMatch(code)) {
+      return (text: label.substring(0, i).trim(), icd: code);
+    }
+  }
+  return (text: label.trim(), icd: '');
+}
+
 class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late List<String> symptoms;
   final List<String> diagnoses = []; // multi-select; master "Term · ICD" or typed free text
@@ -1167,6 +1189,17 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // Commit any edited vitals so the update rides along with the
             // rest of the case submission.
             _commitVitalsToPatient();
+            // Split each chip's "Term · ICD" label into the two columns the
+            // server keeps them in. Blank-text chips can't happen (the picker
+            // never returns one) but are dropped rather than trusted.
+            final dxPayload = <Map<String, Object?>>[];
+            for (var i = 0; i < diagnoses.length; i++) {
+              final d = _splitDx(diagnoses[i]);
+              if (d.text.isEmpty) continue;
+              dxPayload.add({'diagnosis_text': d.text,
+                             'icd11_code':     d.icd,
+                             'is_primary':     i == 0});
+            }
             s.doctorSubmit(p, disease: diagnoses.join(', '), rx: rx, tests: tests, observations: _obs.text.trim(), remarks: _remarks.text.trim());
             // Enqueue appointment.doctor_submit (v2 §4). Server decides
             // the next status based on tests vs medicines.
@@ -1201,10 +1234,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               'symptom_names': [for (final s in symptoms) s],
               // DoctorSubmitIn reads `diagnosis_text`; a bare `text` key was
               // dropped on the floor, losing the diagnosis on every case.
-              'diagnoses': [
-                for (var i = 0; i < diagnoses.length; i++)
-                  {'diagnosis_text': diagnoses[i], 'is_primary': i == 0},
-              ],
+              // `icd11_code` rides separately so the server can link the visit
+              // to the diseases master the web portal reads — without it the
+              // web's Diagnosis column stayed "—" on every MMU case.
+              'diagnoses': dxPayload,
               // Tests are recorded as ADVISED (not billed) — the patient
               // goes straight to the pharmacist. lab_test_ids carries the
               // master ids so the server creates structured LabTestOrder

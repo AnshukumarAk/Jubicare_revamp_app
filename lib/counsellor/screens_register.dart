@@ -614,7 +614,14 @@ class _CounRegisterState extends State<CounRegister> {
     // text is preserved so nothing typed on the last visit gets lost.
     String carryPast    = src?.pastHistory ?? '';
     if (src != null && carryDisease.trim().isNotEmpty) {
-      final tag = 'Previous Diagnosis (${src.regDate.isEmpty ? "—" : src.regDate}): $carryDisease';
+      // No date, no bracket. An em-dash in the brackets read as a diagnosis
+      // field that had failed rather than a date nobody recorded, which is
+      // how "Previous Diagnosis (—): ..." ended up on the web case page
+      // (user 2026-09-30).
+      final when = src.regDate.trim();
+      final tag = when.isEmpty
+          ? 'Previous Diagnosis: $carryDisease'
+          : 'Previous Diagnosis ($when): $carryDisease';
       carryPast = carryPast.trim().isEmpty ? tag : '$tag\n$carryPast';
     }
     // previousRx = source's own previousRx history + last visit's
