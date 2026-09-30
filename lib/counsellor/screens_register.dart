@@ -256,11 +256,21 @@ class _CounRegisterState extends State<CounRegister> {
     final src = _reAppointmentSource;
     if (src == null) return null;
     if (src.backendPatientId != null) return src.backendPatientId;
-    if (src.id.startsWith('B') || src.id.startsWith('S')) {
-      return int.tryParse(src.id.substring(1));
-    }
+    // 'S' is a patient searched on the server and carries its id in the key.
+    // 'B' does NOT any more -- a queue row is keyed by its appointment -- so
+    // reading it here would hand the server an appointment id as a patient
+    // and attach the visit to a stranger.
+    if (src.id.startsWith('S')) return int.tryParse(src.id.substring(1));
     return null;
   }
+
+  /// The visit this one follows from, for appointments.parent_appointment.
+  ///
+  /// The web portal's case page links a follow-up back to the visit it came
+  /// from; every MMU re-appointment left that link empty, because the sync
+  /// payload carried the patient id and nothing else. A row searched on the
+  /// server ('S') is a person, not a visit, and has no parent to give.
+  int? get _reAppointmentParentId => _reAppointmentSource?.backendAppointmentId;
 
   @override
   void dispose() {
@@ -828,6 +838,8 @@ class _CounRegisterState extends State<CounRegister> {
     final sync = context.read<SyncService>();
     await sync.enqueue(kind: 'patient.register', payload: {
       if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
+      if (reappointmentPatientId != null && _reAppointmentParentId != null)
+        'parent_appointment_id': _reAppointmentParentId,
       // Basic identity
       'patient_name':      p.name,
       'gender':            p.gender,

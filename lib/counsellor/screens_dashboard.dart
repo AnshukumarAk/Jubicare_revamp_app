@@ -338,9 +338,13 @@ class _CounPatientDetailState extends State<CounPatientDetail> {
   /// 2026-08-13). Pull the FULL patient record first, merge it in, then
   /// hand the enriched object to the register form.
   Future<void> _startReAppointment(BuildContext context) async {
-    final isBackendRow = p.id.startsWith('B') || p.id.startsWith('S');
-    final pid = int.tryParse(p.id.replaceFirst(RegExp(r'^[BS]'), ''));
-    if (isBackendRow && pid != null) {
+    // The PERSON, not the visit. A queue row ('B…') is keyed by its
+    // appointment now, so its digits would fetch whichever patient happened
+    // to share that number -- the prefill would come back as a stranger.
+    // 'S' is a server search result and still carries the patient's own id.
+    final pid = p.backendPatientId ??
+        (p.id.startsWith('S') ? int.tryParse(p.id.substring(1)) : null);
+    if (pid != null) {
       try {
         final d = await context.read<PatientsApi>().get(pid);
         p.aadhar      = (d['aadhar_number'] ?? '').toString();
@@ -888,6 +892,9 @@ class _CounAppointmentStatusState extends State<CounAppointmentStatus> {
 
   CPatient _rowToPatient(Map<String, dynamic> r) => CPatient(
         id:         'S${r['patient_id']}',
+        // Carried in the field as well as the key, so a re-appointment
+        // started from a search never has to parse the id back apart.
+        backendPatientId: (r['patient_id'] as num?)?.toInt(),
         name:       (r['patient_name'] ?? '').toString(),
         gender:     (r['gender'] ?? 'Female').toString(),
         age:        (r['age'] as num?)?.toInt() ?? 0,

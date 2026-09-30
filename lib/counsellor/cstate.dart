@@ -1308,8 +1308,22 @@ class CounsellorState extends ChangeNotifier {
       final syms = rawSyms is List
           ? <String>[ for (final s in rawSyms) if (s != null) s.toString() ]
           : <String>[];
+      // Identity is the VISIT, not the person.
+      //
+      // Two appointments for one patient -- a visit the doctor finished and
+      // the re-appointment booked after it -- are two rows on the doctor's
+      // screen: one under Attended, one still in the Queue. Keyed by patient
+      // they were the same row. The non-additive merge does not de-duplicate,
+      // so both went in under 'B1536332', and every later replace-in-place
+      // found whichever came first -- leaving the same name twice, both
+      // reading Completed, while the pending visit never reached the queue
+      // (user 2026-09-30, "Ghanshyam test").
+      //
+      // Falls back to the patient id when a row carries no appointment,
+      // which is the shape every caller assumed before this.
+      final rowApptId = (row['appointment_id'] as num?)?.toInt();
       final adapted = CPatient(
-        id:          'B$patientId',
+        id:          rowApptId != null ? 'B$rowApptId' : 'B$patientId',
         name:        (row['patient_name'] as String?)?.trim().isNotEmpty == true
                         ? row['patient_name'] as String
                         : '(no name)',

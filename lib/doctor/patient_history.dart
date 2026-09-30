@@ -28,12 +28,10 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   CPatient get p => widget.patient;
 
-  /// Backend rows are keyed 'B<patient_id>' by mergeBackendPatients; locally
-  /// registered ('P…') and demo-seed (numeric) rows have no server record.
-  int? get _backendPatientId {
-    if (!p.id.startsWith('B')) return null;
-    return int.tryParse(p.id.substring(1));
-  }
+  /// The person this visit belongs to. Read from the field rather than
+  /// parsed out of `id`: a backend row is keyed by its APPOINTMENT now, so
+  /// the digits after the 'B' are the visit's, not the patient's.
+  int? get _backendPatientId => p.backendPatientId;
 
   @override
   void initState() {
