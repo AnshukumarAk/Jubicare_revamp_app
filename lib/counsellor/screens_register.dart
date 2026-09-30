@@ -486,6 +486,10 @@ class _CounRegisterState extends State<CounRegister> {
     if (knowAge && _age.text.trim().isEmpty) return err('Enter age');
     if (knowAge && _ageErr() != null) return err('Age must be between $_minAgeYears and $_maxAgeYears years');
     if (!knowAge && _dob == null) return err('Select date of birth');
+    if (!knowAge && _dobErr() != null) {
+      return err('Date of birth must give an age between '
+          '$_minAgeYears and $_maxAgeYears years');
+    }
     final ce = _contactError(_contact.text.trim());
     // Contact is required now that Unique Code is removed (rule 2026-07-29).
     if (_contact.text.trim().isEmpty) return err('Enter contact number');
@@ -1107,7 +1111,14 @@ class _CounRegisterState extends State<CounRegister> {
         if (knowAge)
           CField('Age (Years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 28').copyWith(errorText: _ageErr())), required: true)
         else
-          CField('Date of Birth', DateField(hint: 'Pick date of birth', first: DateTime(1920), last: DateTime.now(), initial: _dob, onPicked: (d) => setState(() => _dob = d)), required: true),
+          CField('Date of Birth', Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            DateField(hint: 'Pick date of birth',
+                first: _earliestDob, last: _latestDob,
+                initial: _dob, onPicked: (d) => setState(() => _dob = d)),
+            if (_dobErr() case final e?)
+              Padding(padding: const EdgeInsets.only(top: 6, left: 2),
+                  child: Text(e, style: ct(11.5, FontWeight.w400, C2.danger))),
+          ]), required: true),
         CField('Contact Number', TextField(controller: _contact, keyboardType: TextInputType.phone,
           inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(10)],
           onChanged: (_) => setState(() {}),
@@ -1471,6 +1482,34 @@ class _CounRegisterState extends State<CounRegister> {
     final v = int.tryParse(t);
     if (v == null || v < _minAgeYears || v > _maxAgeYears) {
       return 'Allowed $_minAgeYears–$_maxAgeYears years';
+    }
+    return null;
+  }
+
+  /// The window a date of birth may fall in — the same 1–120 years the Age
+  /// field allows (user 2026-09-30), expressed as dates so the picker can
+  /// refuse the rest rather than let one be chosen and then rejected.
+  ///
+  /// The picker used to open on 1920–today, which accepted a 106-year-old
+  /// and a date typed a decade out by a slipped year.
+  DateTime get _earliestDob {
+    final n = DateTime.now();
+    return DateTime(n.year - _maxAgeYears, n.month, n.day);
+  }
+
+  DateTime get _latestDob {
+    final n = DateTime.now();
+    return DateTime(n.year - _minAgeYears, n.month, n.day);
+  }
+
+  /// Guards a date that got past the picker — a value held from before the
+  /// bounds existed, or one restored by a re-appointment prefill.
+  String? _dobErr() {
+    final d = _dob;
+    if (d == null) return null;
+    final years = _ageFromDob(d);
+    if (years < _minAgeYears || years > _maxAgeYears) {
+      return 'Allowed $_minAgeYears–$_maxAgeYears years (this is $years)';
     }
     return null;
   }

@@ -42,7 +42,7 @@ class CounDashboard extends StatelessWidget {
     // (older visits are one tap away via the stat tiles).
     final todaysList = s.patients.where((p) => p.registeredOn == 'Today').toList();
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      GradGreeting(name: name, sub: 'Recipient Dashboard', initials: initials),
+      GradGreeting(name: name, sub: 'Receptionist Dashboard', initials: initials),
       // Sync status moved to the app-bar cloud icon (user 2026-08-14) —
       // tap it for the counts + a "Sync now" action.
       // Backend refresh status: thin loading bar while the shell's

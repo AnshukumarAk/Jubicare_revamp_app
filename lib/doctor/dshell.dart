@@ -880,7 +880,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Recipient').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Receptionist').toString());
           return;
         }
       }
@@ -1354,7 +1354,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Recipient $_counsellorMarkedBy has marked you present today.',
+              'Receptionist $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),

@@ -754,7 +754,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ])),
           // registration details (read-only, filled by counsellor)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Recipient', bg: C2.cyanLight, fg: C2.cyan)]),
+            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Receptionist', bg: C2.cyanLight, fg: C2.cyan)]),
             _kv('Symptoms', p.symptoms.isNotEmpty
                 ? p.symptoms.join(', ')
                 : (_loadingRegDetail ? 'Loading…' : '—')),
