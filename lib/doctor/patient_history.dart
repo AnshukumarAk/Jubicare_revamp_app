@@ -470,7 +470,7 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
       // 'denied': both mean care that stopped, not care that finished.
       // It reads the stored status, the same way the web does -- see
       // clinical/lama.py for when it is written (user 2026-09-30).
-      'lama'            => ('LAMA', const Color(0xFFFDEAEA), C2.danger),
+      'lama'            => ('LAMA', C2.lamaLight, C2.lama),
       _                 => (status, C2.cyanLight, C2.cyan),
     };
     return CBadge(label, bg: bg, fg: fg);

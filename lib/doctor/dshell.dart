@@ -726,7 +726,7 @@ Widget doctorStatusBadge(String status) {
     // A visit the system wrote off after a day's silence. Red because
     // it is care that stopped, not care that finished. Reads the stored
     // status, as the web does -- see clinical/lama.py (user 2026-09-30).
-    'lama'            => ('LAMA', const Color(0xFFFDEAEA), C2.danger),
+    'lama'            => ('LAMA', C2.lamaLight, C2.lama),
     _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
   };
   return CBadge(label, bg: bg, fg: fg);

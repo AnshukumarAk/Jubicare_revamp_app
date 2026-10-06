@@ -24,6 +24,16 @@ class C2 {
   static const border = Color(0xFFD0E8F5);
   static const danger = Color(0xFFE53935);
 
+  /// LAMA, and nothing else.
+  ///
+  /// It used to share [danger] with Delivery Denied and the offline warning,
+  /// which read as something having gone wrong. A visit nobody came back for
+  /// is not an error and not an emergency -- it is a visit that stopped, and
+  /// it wants its own colour. The web portal settled on orange for it, so the
+  /// two now say the same thing in the same shade (user 2026-10-06).
+  static const lama = Color(0xFFEA580C);
+  static const lamaLight = Color(0xFFFFF0E6);
+
   static const headerGrad = LinearGradient(
     begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [navy, cyan]);
   static List<BoxShadow> get shadow =>

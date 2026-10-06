@@ -767,7 +767,7 @@ class _AttachmentThumb extends StatelessWidget {
       'with_lab' => ('At Lab', C2.cyanLight, C2.cyan),
       'with_counsellor' => ('Payment Due', Color(0xFFFEF7E0), Color(0xFFB8860B)),
       'denied' => ('Delivery Denied', Color(0xFFFDEAEA), C2.danger),
-      'lama' => ('LAMA', Color(0xFFFDEAEA), C2.danger),
+      'lama' => ('LAMA', C2.lamaLight, C2.lama),
       _ => ('Waiting', Color(0xFFFEF7E0), Color(0xFFB8860B)),
     };
 
