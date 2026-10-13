@@ -64,3 +64,4 @@ docs/mobile_local_storage.xml
 ATTEND_IMPROVEMENTS.md
 NOTIFICATIONS_NOTE.md
 .claude/run_jubicare_web.cmd
+.backup_perf_opt/
