@@ -28,12 +28,10 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   CPatient get p => widget.patient;
 
-  /// Backend rows are keyed 'B<patient_id>' by mergeBackendPatients; locally
-  /// registered ('P…') and demo-seed (numeric) rows have no server record.
-  int? get _backendPatientId {
-    if (!p.id.startsWith('B')) return null;
-    return int.tryParse(p.id.substring(1));
-  }
+  /// The person this visit belongs to. Read from the field rather than
+  /// parsed out of `id`: a backend row is keyed by its APPOINTMENT now, so
+  /// the digits after the 'B' are the visit's, not the patient's.
+  int? get _backendPatientId => p.backendPatientId;
 
   @override
   void initState() {
@@ -205,11 +203,36 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
               _vitalsLine(v),
               _testsBlock(v, advised),
               _rxBlock(v),
-              _kv('Observation', en('observation_english', 'observation')),
-              _kv('Doctor Remarks', remarks),
+              // Observation and Doctor Remarks are dictated and translated
+              // the same way the patient's own words are, so they get the
+              // same way back to the original (user 2026-09-28).
+              _kv('Observation', en('observation_english', 'observation'),
+                  value: CTranslatedText(
+                    en('observation_english', 'observation'),
+                    original: '${v['observation'] ?? ''}',
+                    style: ct(12.5, FontWeight.w400, C2.text),
+                  )),
+              // `remarks` is the doctor's text with its "Tests advised:"
+              // line already split off, so the original is split the same
+              // way before being offered — otherwise the toggle would put
+              // the test list back.
+              _kv('Doctor Remarks', remarks,
+                  value: CTranslatedText(
+                    remarks,
+                    original: _splitAdvisedTests('${v['doctor_remarks'] ?? ''}').$2,
+                    style: ct(12.5, FontWeight.w400, C2.text),
+                  )),
               // Label renamed Counsellor → Patient Remarks (user 2026-08-22).
+              // English leads, as asked, but the words the patient actually
+              // said are one tap away — a translation of a dictated complaint
+              // is worth reading against the original (user 2026-09-28).
               _kv('Patient Remarks',
-                  en('counsellor_remarks_english', 'counsellor_remarks')),
+                  en('counsellor_remarks_english', 'counsellor_remarks'),
+                  value: CTranslatedText(
+                    en('counsellor_remarks_english', 'counsellor_remarks'),
+                    original: '${v['counsellor_remarks'] ?? ''}',
+                    style: ct(12.5, FontWeight.w400, C2.text),
+                  )),
               // Next Follow-Up the doctor picked at submit (user 2026-08-22).
               if ('${v['follow_up_date'] ?? ''}'.isNotEmpty)
                 _kv('Next Follow-up', _fmtDate('${v['follow_up_date']}')),
@@ -235,25 +258,59 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   /// Vitals render as one wrapped line — seven separate rows pushed the
   /// prescription off the screen on a phone.
+  /// Vitals laid out the way Patient Details lays them out: each reading
+  /// labelled above its value, two to a row (user 2026-09-28).
+  ///
+  /// It used to be one joined string — "BP 280/150 · Sugar 100 · Temp 86 ·
+  /// …" — which broke wherever the width ran out, so a line could open with
+  /// an orphaned separator, and "Wt 999" gave no clue what it was measuring.
   Widget _vitalsLine(Map<String, dynamic> v) {
     const specs = [
-      ('BP', 'systolic_bp', 'diastolic_bp'),
-      ('Sugar', 'blood_sugar', null),
-      ('Temp', 'body_temp', null),
-      ('SpO₂', 'oxygen', null),
-      ('Hb', 'hemoglobin', null),
-      ('Ht', 'height', null),
-      ('Wt', 'weight', null),
+      ('BP (mmHg)', 'systolic_bp', 'diastolic_bp'),
+      ('Blood Sugar (mg/dl)', 'blood_sugar', null),
+      ('Body Temp (°F)', 'body_temp', null),
+      ('SpO₂ (%)', 'oxygen', null),
+      ('Hemoglobin (g/dL)', 'hemoglobin', null),
+      ('Height (cm)', 'height', null),
+      ('Weight (kg)', 'weight', null),
     ];
-    final parts = <String>[];
+    final cells = <(String, String)>[];
     for (final (label, a, b) in specs) {
       final va = _num(v[a]);
       if (va.isEmpty) continue;
       final vb = b == null ? '' : _num(v[b]);
-      parts.add(vb.isEmpty ? '$label $va' : '$label $va/$vb');
+      cells.add((label, vb.isEmpty ? va : '$va/$vb'));
     }
-    return _kv('Vitals', parts.join('  ·  '));
+    if (cells.isEmpty) return _kv('Vitals', '');
+    return _kv('Vitals', ' ',
+        value: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          for (var i = 0; i < cells.length; i += 2)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(child: _vitalCell(cells[i])),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: i + 1 < cells.length
+                        ? _vitalCell(cells[i + 1])
+                        : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
+            ),
+        ]));
   }
+
+  Widget _vitalCell((String, String) c) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(c.$1, style: ct(10.5, FontWeight.w400, C2.text2)),
+          const SizedBox(height: 2),
+          Text(c.$2, style: ct(13, FontWeight.w600, C2.text)),
+        ],
+      );
 
   /// Split a "Tests advised: A, B" line out of the doctor's remarks.
   ///
@@ -377,22 +434,43 @@ class _PatientHistoryScreenState extends State<PatientHistoryScreen> {
 
   /// Blank values still render a row so the record reads as "nothing recorded"
   /// rather than silently omitting a field the doctor expects to see.
-  Widget _kv(String k, String v) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 3),
-        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          SizedBox(width: 108, child: Text(k, style: ct(11.5, FontWeight.w500, C2.text2))),
-          Expanded(child: Text(v.trim().isEmpty ? '—' : v, style: ct(12.5, FontWeight.w400, C2.text))),
+  /// Label above, value beneath, the full width — every row.
+  ///
+  /// It was a 108px label column with the value beside it, which left a
+  /// dictated remark running twenty lines down 60% of the screen with the
+  /// rest empty. The first pass stacked only the long ones, which read worse:
+  /// Diagnosis sat beside its label while Symptoms above it did not
+  /// (user 2026-09-28). One rule for the whole card now.
+  ///
+  /// [value] replaces the plain Text for rows that need more than one --
+  /// the vitals grid, and the remarks with their "Show original" toggle.
+  Widget _kv(String k, String v, {Widget? value}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(k, style: ct(11.5, FontWeight.w500, C2.text2)),
+          const SizedBox(height: 3),
+          SizedBox(
+            width: double.infinity,
+            child: value ??
+                Text(v.trim().isEmpty ? '—' : v.trim(),
+                    style: ct(12.5, FontWeight.w400, C2.text)),
+          ),
         ]),
       );
 
   Widget _statusChip(String status) {
     final (label, bg, fg) = switch (status) {
       'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
-      'with_pharma'     => ('At Pharmacy', C2.cyanLight, C2.cyan),
+      'with_pharma'     => ('At Pharmacist', C2.badgeBlue, C2.white),
       'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
       'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
-      'with_doctor'     => ('In Progress', C2.cyanLight, C2.cyan),
+      'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),
       'registered'      => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
+      // A visit the system wrote off after a day's silence. Red like
+      // 'denied': both mean care that stopped, not care that finished.
+      // It reads the stored status, the same way the web does -- see
+      // clinical/lama.py for when it is written (user 2026-09-30).
+      'lama'            => ('LAMA', C2.lamaLight, C2.lama),
       _                 => (status, C2.cyanLight, C2.cyan),
     };
     return CBadge(label, bg: bg, fg: fg);

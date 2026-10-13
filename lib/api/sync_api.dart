@@ -5,9 +5,19 @@ class SyncApi {
   final ApiClient client;
   SyncApi(this.client);
 
-  Future<PullResponse> pull({DateTime? updatedSince, int? perPage}) async {
+  /// [updatedSinceRaw] is the server's own `cursor` string, handed straight
+  /// back. Prefer it to [updatedSince] when continuing a previous pull:
+  /// parsing the stamp and re-serialising it risks landing a hair AHEAD of
+  /// the row it came from, and a cursor that runs ahead skips rows for good.
+  /// Passing the string through cannot drift.
+  Future<PullResponse> pull({
+    DateTime? updatedSince,
+    String? updatedSinceRaw,
+    int? perPage,
+  }) async {
+    final since = updatedSinceRaw ?? updatedSince?.toUtc().toIso8601String();
     final res = await client.get('/mobile/sync/pull', query: {
-      if (updatedSince != null) 'updated_since': updatedSince.toUtc().toIso8601String(),
+      if (since != null) 'updated_since': since,
       if (perPage != null) 'per_page': perPage,
     });
     return PullResponse.fromJson((res as Map).cast<String, dynamic>());

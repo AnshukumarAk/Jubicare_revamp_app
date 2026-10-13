@@ -16,6 +16,16 @@ class QueuesApi {
     return (res as Map).cast<String, dynamic>();
   }
 
+  /// Every visit of this facility dated today, whatever its status.
+  ///
+  /// The Home tiles that say "today" are counted on the server, where the
+  /// count is whole; the lists they open are filtered out of whatever this
+  /// handset is holding, which is a narrower set. Pulling the day itself
+  /// and merging it makes those local filters whole too, so tile and list
+  /// cannot disagree (user 2026-09-30: "dispensed today 3, inside 1").
+  Future<QueueList> today({int? facilityId, DateTime? updatedSince, int? limit}) =>
+      _list('/queues/today', facilityId, updatedSince, limit);
+
   Future<QueueList> doctorQueue({int? facilityId, DateTime? updatedSince, int? limit}) =>
       _list('/queues/doctor', facilityId, updatedSince, limit);
 

@@ -145,6 +145,10 @@ class CPatient {
   /// fields prefill from this, never from the English display copy
   /// (user 2026-08-22 "dont show english version in inputs").
   String remarksOriginal;
+
+  /// The doctor's remarks as dictated, before translation — the twin of
+  /// [remarksOriginal] for the other author on the visit (2026-09-28).
+  String doctorRemarksOriginal;
   String pastHistory; // chronic illness / surgeries / ongoing treatment
   String uploadedRx; // prescription file/image uploaded by counsellor (filename)
   List<Attachment> attachments; // multi-attachment (Prescription/Report/Other)
@@ -203,6 +207,7 @@ class CPatient {
     this.eddDate = '',
     this.remarks = '',
     this.remarksOriginal = '',
+    this.doctorRemarksOriginal = '',
     this.pastHistory = '',
     this.uploadedRx = '',
     List<Attachment>? attachments,
@@ -419,6 +424,13 @@ class CounsellorState extends ChangeNotifier {
   int? backendLabQueue;
   int? backendPharmaQueue;
   int? backendPendingPayment;
+  /// Doctor's "Completed Today" and pharmacist's "Dispensed Today".
+  ///
+  /// Counted server-side so the number does not depend on how much of the
+  /// day's work this handset happens to hold — a phone that synced an hour
+  /// ago was showing its own slice as the day's total (user 2026-09-30).
+  int? backendDoctorCompleted;
+  int? backendDispensed;
 
   /// True while a backend refresh is in flight; false when idle.
   bool refreshing = false;
@@ -447,9 +459,13 @@ class CounsellorState extends ChangeNotifier {
     final lq = asInt(tiles['lab_queue']);
     final pq = asInt(tiles['pharmacist_queue']);
     final pp = asInt(tiles['pending_payment']);
+    final dct = asInt(tiles['doctor_completed_today']);
+    final dst = asInt(tiles['dispensed_today']);
     if (t != null) backendRegisteredToday = t;
     if (c != null) backendVisitsCompleted = c;
     if (p != null) backendPast7DaysTotal = p;
+    if (dct != null) backendDoctorCompleted = dct;
+    if (dst != null) backendDispensed = dst;
     if (dq != null) backendDoctorQueue = dq;
     if (lq != null) backendLabQueue = lq;
     if (pq != null) backendPharmaQueue = pq;
@@ -1107,8 +1123,13 @@ class CounsellorState extends ChangeNotifier {
   // ----- Counsellor views -----
   int get registeredToday => _registeredToday ??=
       patients.where((p) => p.registeredOn == 'Today').length;
-  int get visitsCompleted => _visitsCompleted ??=
-      patients.where((p) => p.status == 'completed').length;
+  /// Completed TODAY — the tile beside "Registered today" and "Past 7
+  /// days", which both mean a period. This counted every completed visit
+  /// ever, so it only ever grew and read as today's work (user
+  /// 2026-09-30). Matches the server's `tiles.completed`.
+  int get visitsCompleted => _visitsCompleted ??= patients
+      .where((p) => p.status == 'completed' && p.registeredOn == 'Today')
+      .length;
 
   // ----- Doctor views -----
   List<CPatient> get doctorQueue => _doctorQueue ??= patients
@@ -1131,9 +1152,12 @@ class CounsellorState extends ChangeNotifier {
       patients.where((p) => _doctorDoneStatuses.contains(p.status)).toList()
         ..sort((a, b) => (b.backendAppointmentId ?? 1 << 30)
             .compareTo(a.backendAppointmentId ?? 1 << 30));
-  // Free now that doctorAttended is held: the tile used to build and sort
-  // the entire list just to read .length off it.
-  int get doctorCompleted => doctorAttended.length;
+  /// Today's, to match the tile beside it. The count used to run over
+  /// every case the doctor had ever finished, so it only grew and read as
+  /// the day's work next to "In Queue" (user 2026-09-30).
+  List<CPatient> get doctorAttendedToday =>
+      doctorAttended.where((p) => p.registeredOn == 'Today').toList();
+  int get doctorCompleted => doctorAttendedToday.length;
 
   /// Every patient the doctor has interacted with in the last 7 days —
   /// queue + attended — sorted newest first. Filters by CPatient.regDate
@@ -1141,6 +1165,11 @@ class CounsellorState extends ChangeNotifier {
   List<CPatient> get doctorPast7Days => _doctorPast7Days ??= _byRegDateDesc([
         ...doctorQueue.where((p) => _within7Days(p.regDate)),
         ...doctorAttended.where((p) => _within7Days(p.regDate)),
+        // Visits the system wrote off after a day's silence. They are in
+        // neither list above -- LAMA is not a queue and not work finished --
+        // so the doctor's week ended without the patients who stopped coming
+        // (user 2026-09-30). The week is a record, and they belong in it.
+        ...patients.where((p) => p.status == 'lama' && _within7Days(p.regDate)),
       ]);
 
   static const _months = {
@@ -1163,7 +1192,11 @@ class CounsellorState extends ChangeNotifier {
       patients.where((p) => p.status == 'with_pharma').toList();
   List<CPatient> get dispensedPatients => _dispensedPatients ??=
       patients.where((p) => p.status == 'completed').toList();
-  int get pharmaDispensed => dispensedPatients.length;
+  /// Today's, to match the tile beside it — same reason as
+  /// [doctorAttendedToday] (user 2026-09-30).
+  List<CPatient> get dispensedToday =>
+      dispensedPatients.where((p) => p.registeredOn == 'Today').toList();
+  int get pharmaDispensed => dispensedToday.length;
 
   // ----- Past-7-day KPI feeds (rule 2026-07-31, parity with doctor) -----
   bool _within7Days(String regDate) {
@@ -1203,7 +1236,12 @@ class CounsellorState extends ChangeNotifier {
   /// 7 days, newest first.
   List<CPatient> get pharmaPast7Days => _pharmaPast7Days ??= _byRegDateDesc(
       patients
-          .where((p) => p.status == 'with_pharma' || p.status == 'completed')
+          // 'lama' included: a patient who reached the pharmacy and never
+          // came back for the medicine is the pharmacist's week as much as
+          // one who did (user 2026-09-30).
+          .where((p) => p.status == 'with_pharma' ||
+                        p.status == 'completed' ||
+                        p.status == 'lama')
           .where((p) => _within7Days(p.regDate)));
 
   String nextId() => 'P${_seq++}';
@@ -1270,8 +1308,22 @@ class CounsellorState extends ChangeNotifier {
       final syms = rawSyms is List
           ? <String>[ for (final s in rawSyms) if (s != null) s.toString() ]
           : <String>[];
+      // Identity is the VISIT, not the person.
+      //
+      // Two appointments for one patient -- a visit the doctor finished and
+      // the re-appointment booked after it -- are two rows on the doctor's
+      // screen: one under Attended, one still in the Queue. Keyed by patient
+      // they were the same row. The non-additive merge does not de-duplicate,
+      // so both went in under 'B1536332', and every later replace-in-place
+      // found whichever came first -- leaving the same name twice, both
+      // reading Completed, while the pending visit never reached the queue
+      // (user 2026-09-30, "Ghanshyam test").
+      //
+      // Falls back to the patient id when a row carries no appointment,
+      // which is the shape every caller assumed before this.
+      final rowApptId = (row['appointment_id'] as num?)?.toInt();
       final adapted = CPatient(
-        id:          'B$patientId',
+        id:          rowApptId != null ? 'B$rowApptId' : 'B$patientId',
         name:        (row['patient_name'] as String?)?.trim().isNotEmpty == true
                         ? row['patient_name'] as String
                         : '(no name)',

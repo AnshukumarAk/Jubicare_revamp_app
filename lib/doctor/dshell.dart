@@ -8,18 +8,18 @@ import 'package:provider/provider.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
-import '../api/api_client.dart';
-import '../api/api_errors.dart';
 import '../api/attendance_api.dart';
-import '../api/auth_api.dart';
 import '../api/camps_api.dart';
 import '../api/masters_store.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show kUploadsBase;
 import '../counsellor/shell.dart' show SyncStatusIcon, ShellRefreshButton, NotificationsBell;
+import '../services/logout_flow.dart';
 import '../services/attendance_store.dart';
 import '../services/patients_cache_store.dart';
 import '../services/connectivity_service.dart';
@@ -28,7 +28,6 @@ import '../services/fcm_service.dart';
 import '../services/notification_router.dart';
 import '../services/terminology_store.dart';
 import '../services/notifications_service.dart';
-import '../screens/unified_login.dart';
 import '../state/app_state.dart';
 import '../widgets/pending_alert.dart';
 import '../widgets/attendance_capture.dart';
@@ -247,43 +246,7 @@ class DocHeader extends StatelessWidget {
               title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
               onTap: () async {
                 Navigator.pop(context);
-                if (!await confirmLogout(context)) return;
-                if (!context.mounted) return;
-                // Center loader while FCM DELETE + auth logout finish.
-                showDialog<void>(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (_) => const Center(child: CircularProgressIndicator()),
-                );
-                // FCM unregister FIRST so the DELETE call still has a
-                // valid access token — parity with the counsellor
-                // shell fix (user 2026-09-10: logout was racing token
-                // clear vs DELETE, leaving the server-side FCM row
-                // alive and pushes kept arriving).
-                try {
-                  await FcmService.instance
-                      .unregister(context.read<ApiClient>())
-                      // 2 s, not 5. This is best-effort cleanup and the
-                      // user has already confirmed Logout; holding them
-                      // five seconds on a bad network to tidy up a push
-                      // registration is the wrong trade (2026-09-26).
-                      // It cannot simply move to the background: the
-                      // AuthApi.logout() below clears the very token this
-                      // DELETE needs, and if the user signs back in within
-                      // that window it would clear the NEW session's token.
-                      .timeout(const Duration(seconds: 2));
-                } catch (_) {/* offline — server auto-cleans on next
-                                UnregisteredError push */}
-                if (!context.mounted) return;
-                // Best-effort backend logout (v2 §1.3).
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                // Wipe user-scoped lists (user rule 2026-08-16).
-                context.read<CounsellorState>().resetForNewUser();
-                context.read<AppState>().logout();
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                  (route) => false,
-                );
+                await performLogout(context);
               }),
           ])),
         ),
@@ -386,8 +349,11 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     if (state == AppLifecycleState.resumed) _refreshFromBackend();
   }
 
-  /// Pull-to-refresh from the shell. Always fetches.
-  Future<void> refreshNow() => _refreshFromBackend(immediate: true);
+  /// Pull-to-refresh from the shell. Always fetches, and always fetches
+  /// EVERYTHING — this is the doctor asking directly, and it should be the
+  /// one gesture that cannot leave anything behind. Deltas resume from the
+  /// result.
+  Future<void> refreshNow() => _refreshFromBackend(immediate: true, full: true);
 
   /// Home tab re-selected. Throttled — tapping between tabs shouldn't hammer
   /// the API.
@@ -440,7 +406,13 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     } catch (_) {/* first run — nothing cached yet */}
   }
 
-  Future<void> _refreshFromBackend({bool immediate = false}) async {
+  /// Where the next delta starts. Deliberately NOT persisted: every app start
+  /// therefore begins with a full load, so anything a delta could get wrong
+  /// cannot outlive one session. It does survive tab switches, because the
+  /// shell keeps these pages in an IndexedStack.
+  final _delta = QueueDelta();
+
+  Future<void> _refreshFromBackend({bool immediate = false, bool full = false}) async {
     if (_refreshing || !mounted) return;
     final last = _lastFetchAt;
     if (!immediate && last != null && DateTime.now().difference(last) < _minGap) {
@@ -449,38 +421,118 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     _lastFetchAt = DateTime.now();
     setState(() { _refreshing = true; _lastError = null; });
     try {
-      final api = context.read<QueuesApi>();
-      // Silent-on-failure (user 2026-08-26: banner didn't clear even
-      // after server came back). Cached list stays on screen; retry is
-      // one tap away. Primary queue failure returns early — banner was
-      // already cleared at start.
-      QueueList queue;
-      try {
-        queue = await api.doctorQueue(limit: 200);
-      } catch (_) {
-        return;
-      }
-      Future<QueueList> safe(Future<QueueList> f) =>
-          f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
-      final results = await Future.wait([
-        safe(api.doctorAttended(limit: 200)),
-        safe(api.pendingPayment(limit: 200)),
-        safe(api.labQueue(limit: 200)),
-      ]);
-      if (!mounted) return;
-      final store = context.read<CounsellorState>();
-      final combined = [
-        ...queue.items,
-        for (final r in results) ...r.items,
-      ];
-      store.mergeBackendPatients(combined);
-      try {
-        final cache = await PatientsCacheStore.open();
-        await cache.save(_doctorCacheKey, combined);
-      } catch (_) {/* best-effort */}
+      if (!full && await _refreshDelta()) return;
+      await _refreshEverything();
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The four queue endpoints together return up to 800 rows, on a thirty
+  /// second timer and again on every FCM ping, to answer "did anything
+  /// happen" — and usually nothing did. This asks the question directly and
+  /// most of the time gets an empty list back.
+  ///
+  /// `/mobile/sync/pull` rather than `updated_since` on the queues: the queue
+  /// views filter by status BEFORE the timestamp, so a visit that moves on
+  /// simply stops appearing and the handset never learns to drop it. The sync
+  /// view filters only by team, so a visit that moves comes back wearing its
+  /// new status and mergeBackendPatients re-files it. Rows in statuses this
+  /// screen doesn't show are kept rather than filtered out, for exactly that
+  /// reason — dropping them here is how a patient gets stuck in the queue.
+  ///
+  /// Returns false to mean "fall back to a full load", which is the answer to
+  /// anything unexpected: the full path is bounded and known-good.
+  Future<bool> _refreshDelta() async {
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
+    if (!mounted) return true;
+    final store = context.read<CounsellorState>();
+    if (rows.isNotEmpty) {
+      // Update in place and insert what's new — never wipe. The delta only
+      // carries what changed, so clearing first would empty the screen.
+      store.mergeBackendPatients(rows, additive: true);
+    }
+    // The tiles come along, as they do on the counsellor's delta. They are
+    // 0.12 KB and they are the server's own counts -- the number on the card
+    // -- where the list behind it is filtered from whatever this handset
+    // holds. Neither this shell nor the pharmacist's pulled them at all, so
+    // a case moving on made the list change while the card did not (user
+    // 2026-09-30).
+    //
+    // Today's rows come too: a delta only carries what changed since the
+    // cursor, and the today filters behind those cards need the whole day.
+    try {
+      final api = context.read<QueuesApi>();
+      final tiles = await api.tiles();
+      if (!mounted) return true;
+      store.applyTiles(tiles);
+      final todayRows = await api.today(limit: 500);
+      if (mounted) store.mergeBackendPatients(todayRows.items, additive: true);
+    } catch (_) {/* counts stay as they were -- the list is already right */}
+    return true;
+  }
+
+  /// The whole picture: four status-scoped queues, bounded and known-good.
+  ///
+  /// Runs at app start, on pull-to-refresh, and whenever a delta declines.
+  /// Also what re-seeds the cursor — and what quietly repairs anything the
+  /// deltas missed, such as a visit soft-deleted on the server, which by
+  /// definition never comes back in a list of changed rows.
+  Future<void> _refreshEverything() async {
+    final api = context.read<QueuesApi>();
+    // Silent-on-failure (user 2026-08-26: banner didn't clear even
+    // after server came back). Cached list stays on screen; retry is
+    // one tap away. Primary queue failure returns early — banner was
+    // already cleared at start.
+    QueueList queue;
+    try {
+      queue = await api.doctorQueue(limit: 200);
+    } catch (_) {
+      return;
+    }
+    Future<QueueList> safe(Future<QueueList> f) =>
+        f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    final results = await Future.wait([
+      safe(api.doctorAttended(limit: 200)),
+      safe(api.pendingPayment(limit: 200)),
+      safe(api.labQueue(limit: 200)),
+    ]);
+    // Today's whole day, merged SEPARATELY and additively. The four pulls
+    // above cover disjoint statuses, so concatenating them cannot repeat a
+    // patient; this one covers every status, so it can -- and a plain merge
+    // only de-duplicates in additive mode. Folded in with the rest it put
+    // every queued patient on screen twice (user 2026-09-30).
+    final todayRows = await safe(api.today(limit: 500));
+    // The week, which is the only pull that carries LAMA: the four above
+    // are live stages and `today` is today, and a visit is never written
+    // off on the day it happened. Without it the doctor's Past 7 Days was
+    // whatever the queues happened to hold, and the patients who stopped
+    // coming were in none of them (user 2026-09-30).
+    final weekRows = await safe(api.doctorPast7Days(limit: 200));
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final combined = [
+      ...queue.items,
+      for (final r in results) ...r.items,
+    ];
+    store.mergeBackendPatients(combined);
+    store.mergeBackendPatients(todayRows.items, additive: true);
+    store.mergeBackendPatients(weekRows.items, additive: true);
+    // The server's own counts for the cards. Without them the cards fall
+    // back to the length of a locally filtered list, which is a narrower
+    // set than the server counted (user 2026-09-30).
+    try {
+      final tiles = await api.tiles();
+      if (mounted) store.applyTiles(tiles);
+    } catch (_) {/* cards keep the numbers they had */}
+    _delta.seedFrom(combined);
+    try {
+      final cache = await PatientsCacheStore.open();
+      await cache.save(_doctorCacheKey, combined);
+    } catch (_) {/* best-effort */}
   }
 
   @override
@@ -496,7 +548,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       if (!_refreshing && _lastError != null)
         Padding(padding: const EdgeInsets.only(bottom: 6),
           child: InkWell(
-            onTap: _refreshFromBackend,
+            onTap: () => _refreshFromBackend(full: true),
             child: Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),
@@ -519,8 +571,10 @@ class _DoctorDashboardState extends State<DoctorDashboard>
         Expanded(child: InkWell(
           borderRadius: BorderRadius.circular(10),
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
-            DoctorPatientList(title: 'Completed', patients: s.doctorAttended))),
-          child: StatTile('${s.doctorCompleted}', 'Completed', C2.green))),
+            DoctorPatientList(title: 'Completed Today',
+                patients: s.doctorAttendedToday))),
+          child: StatTile('${s.backendDoctorCompleted ?? s.doctorCompleted}',
+              'Completed Today', C2.green))),
         const SizedBox(width: 8),
         Expanded(child: InkWell(
           borderRadius: BorderRadius.circular(10),
@@ -536,8 +590,8 @@ class _DoctorDashboardState extends State<DoctorDashboard>
         else
           ...s.doctorQueue.take(5).map((p) => QueueRow(p: p, sub: '${p.age}y · ${p.symptoms.take(2).join(', ')}',
             badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
-            badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.cyanLight,
-            badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.cyan,
+            badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
+            badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
             onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))),
         if (s.doctorQueue.length > 5)
           Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${s.doctorQueue.length} · tap "In Queue" to view all', style: ct(11, FontWeight.w500, C2.text2))),
@@ -563,7 +617,6 @@ class _DoctorDashboardState extends State<DoctorDashboard>
                   Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
                 ])),
                 doctorStatusBadge(p.status),
-                const SizedBox(width: 6), const Icon(Icons.lock_outline, size: 15, color: C2.text3),
               ]),
             ))),
           if (s.doctorAttended.length > 5)
@@ -628,23 +681,28 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
               onChanged: (v) => setState(() => _q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(q.isEmpty ? 'No patients' : 'No patient matches "$_q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [
-                CCard(child: Column(children: list.map((p) => InkWell(
-                  onTap: () => _openPatient(context, p),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                    child: Row(children: [
-                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                        const SizedBox(height: 1),
-                        Text(p.symptoms.isEmpty ? '${p.age}y · —' : '${p.age}y · ${p.symptoms.join(', ')}',
-                          maxLines: 1, overflow: TextOverflow.ellipsis, style: ct(11.5, FontWeight.w400, C2.text2)),
-                      ])),
-                      _statusBadge(p.status),
-                    ]),
-                  ))).toList())),
-              ])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => _openPatient(context, p),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          const SizedBox(height: 1),
+                          Text(p.symptoms.isEmpty ? '${p.age}y · —' : '${p.age}y · ${p.symptoms.join(', ')}',
+                            maxLines: 1, overflow: TextOverflow.ellipsis, style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        _statusBadge(p.status),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );
@@ -659,11 +717,16 @@ class _DoctorPatientListState extends State<DoctorPatientList> {
 Widget doctorStatusBadge(String status) {
   final (label, bg, fg) = switch (status) {
     'completed'       => ('Completed', const Color(0xFFEDF7E0), C2.green),
-    'with_pharma'     => ('At Pharmacy', C2.cyanLight, C2.cyan),
+    // Brand blue for the two stages the doctor sees most (user 2026-09-29).
+    'with_pharma'     => ('At Pharmacist', C2.badgeBlue, C2.white),
     // Post-consultation rungs: the doctor is done, the case is moving on.
     'with_counsellor' => ('Awaiting Test Payment', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
     'with_lab'        => ('At Lab', C2.cyanLight, C2.cyan),
-    'with_doctor'     => ('In Progress', C2.cyanLight, C2.cyan),
+    'with_doctor'     => ('In Progress', C2.badgeBlue, C2.white),
+    // A visit the system wrote off after a day's silence. Red because
+    // it is care that stopped, not care that finished. Reads the stored
+    // status, as the web does -- see clinical/lama.py (user 2026-09-30).
+    'lama'            => ('LAMA', C2.lamaLight, C2.lama),
     _                 => ('Waiting', const Color(0xFFFEF7E0), const Color(0xFFB8860B)),
   };
   return CBadge(label, bg: bg, fg: fg);
@@ -719,8 +782,8 @@ class _DoctorCaseListState extends State<DoctorCaseList> {
       else
         CCard(child: Column(children: list.map((p) => QueueRow(p: p, sub: '${p.gender}, ${p.age}y · ${p.village}',
           badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
-          badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.cyanLight,
-          badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.cyan,
+          badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
+          badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))).toList())),
     ]);
   }
@@ -861,7 +924,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Recipient').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Receptionist').toString());
           return;
         }
       }
@@ -1335,7 +1398,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Recipient $_counsellorMarkedBy has marked you present today.',
+              'Receptionist $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),
@@ -1729,46 +1792,9 @@ class SimpleProfile extends StatelessWidget {
               _kv('Status', status),
             ])),
             SizedBox(width: double.infinity, child: OutlinedButton.icon(
-              onPressed: () async {
-                if (!await confirmLogout(context)) return;
-                if (!context.mounted) return;
-                // REAL logout (user 2026-08-26: Yes was just popping back
-                // to Home while the session stayed alive). Same lines as
-                // the shell menu's logout — end the server session, stop
-                // pushes, wipe user-scoped state, land on Login with no
-                // back stack. Serves BOTH doctor and pharmacist (the
-                // pharmacist shell reuses this SimpleProfile).
-                // Center loader while FCM DELETE + auth logout finish
-                // (user 2026-09-10).
-                showDialog<void>(
-                  context: context,
-                  barrierDismissible: false,
-                  builder: (_) => const Center(child: CircularProgressIndicator()),
-                );
-                // FCM unregister FIRST — DELETE needs the still-valid
-                // access token (user 2026-09-10 fix).
-                try {
-                  await FcmService.instance
-                      .unregister(context.read<ApiClient>())
-                      // 2 s, not 5. This is best-effort cleanup and the
-                      // user has already confirmed Logout; holding them
-                      // five seconds on a bad network to tidy up a push
-                      // registration is the wrong trade (2026-09-26).
-                      // It cannot simply move to the background: the
-                      // AuthApi.logout() below clears the very token this
-                      // DELETE needs, and if the user signs back in within
-                      // that window it would clear the NEW session's token.
-                      .timeout(const Duration(seconds: 2));
-                } catch (_) {}
-                if (!context.mounted) return;
-                unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-                context.read<CounsellorState>().resetForNewUser();
-                context.read<AppState>().logout();
-                Navigator.of(context).pushAndRemoveUntil(
-                  MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                  (route) => false,
-                );
-              },
+              // Serves BOTH doctor and pharmacist — the pharmacist shell
+              // reuses this SimpleProfile.
+              onPressed: () => performLogout(context),
               icon: const Icon(Icons.logout, color: C2.danger),
               label: Text('Log out', style: ct(14, FontWeight.w600, C2.danger)),
               style: OutlinedButton.styleFrom(

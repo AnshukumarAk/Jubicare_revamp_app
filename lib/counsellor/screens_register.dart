@@ -95,6 +95,27 @@ double? _asDouble(TextEditingController c) {
 }
 
 /// Same for ints. Backend vitals like systolic_bp / blood_sugar are int.
+/// "100.0" -> "100"; "98.6" stays "98.6"; anything unparseable is returned
+/// untouched.
+///
+/// Numeric columns come back from the server carrying their decimal part,
+/// and Blood Sugar is the only one of them read back with int.tryParse --
+/// which returns null for "100.0". So a re-appointment prefilled with last
+/// visit's reading dropped that one field on submit while every other vital
+/// carried over: BP, pulse and SpO2 are integer columns, and temperature and
+/// haemoglobin are parsed as doubles. Confirmed on live 2026-09-28 --
+/// appointment 1828880 recorded blood_sugar 100.0, its re-appointment
+/// 1828894 recorded null, and nothing else differed.
+///
+/// It was visible as well as broken: the box is digits-only with a
+/// three-character limit, and it was being handed five characters, two of
+/// them ones it would refuse to accept if typed.
+String _wholeNumber(String s) {
+  final d = double.tryParse(s);
+  if (d == null) return s;
+  return d == d.roundToDouble() ? d.toInt().toString() : s;
+}
+
 int? _asInt(TextEditingController c) {
   final s = c.text.trim();
   if (s.isEmpty) return null;
@@ -220,6 +241,36 @@ class _CounRegisterState extends State<CounRegister> {
   // pastHistory / previousRx / attachments so the doctor sees the history
   // on the new appointment record.
   CPatient? _reAppointmentSource;
+
+  /// The server's id for the patient being re-appointed, or null when this
+  /// handset cannot name them yet.
+  ///
+  /// `backendPatientId` is filled by the queue merge, but a row can reach
+  /// this screen without it — one registered on this phone and not yet
+  /// merged back, or a detail screen that built its own copy. A backend row
+  /// also carries the id in its own key ('B1536329'), so that is read as a
+  /// fallback before giving up. Giving up matters: without the id the
+  /// server registers a second patient rather than refusing (user
+  /// 2026-09-30), so the caller must refuse instead.
+  int? get _reAppointmentPatientId {
+    final src = _reAppointmentSource;
+    if (src == null) return null;
+    if (src.backendPatientId != null) return src.backendPatientId;
+    // 'S' is a patient searched on the server and carries its id in the key.
+    // 'B' does NOT any more -- a queue row is keyed by its appointment -- so
+    // reading it here would hand the server an appointment id as a patient
+    // and attach the visit to a stranger.
+    if (src.id.startsWith('S')) return int.tryParse(src.id.substring(1));
+    return null;
+  }
+
+  /// The visit this one follows from, for appointments.parent_appointment.
+  ///
+  /// The web portal's case page links a follow-up back to the visit it came
+  /// from; every MMU re-appointment left that link empty, because the sync
+  /// payload carried the patient id and nothing else. A row searched on the
+  /// server ('S') is a person, not a visit, and has no parent to give.
+  int? get _reAppointmentParentId => _reAppointmentSource?.backendAppointmentId;
 
   @override
   void dispose() {
@@ -463,7 +514,12 @@ class _CounRegisterState extends State<CounRegister> {
     void err(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: C2.danger));
     if (_name.text.trim().isEmpty) return err('Enter patient name');
     if (knowAge && _age.text.trim().isEmpty) return err('Enter age');
+    if (knowAge && _ageErr() != null) return err('Age must be between $_minAgeYears and $_maxAgeYears years');
     if (!knowAge && _dob == null) return err('Select date of birth');
+    if (!knowAge && _dobErr() != null) {
+      return err('Date of birth must give an age between '
+          '$_minAgeYears and $_maxAgeYears years');
+    }
     final ce = _contactError(_contact.text.trim());
     // Contact is required now that Unique Code is removed (rule 2026-07-29).
     if (_contact.text.trim().isEmpty) return err('Enter contact number');
@@ -476,6 +532,33 @@ class _CounRegisterState extends State<CounRegister> {
     // complaint gives the doctor and the advisory nothing to work from.
     if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
+    // Aadhaar and PIN are optional, but a HALF-typed one is not. Both used
+    // to be dropped from the payload unless they matched exactly, which
+    // kept the server from 422-ing and told the receptionist nothing — the
+    // number simply never reached the record (user 2026-09-30). Say so
+    // instead, and leave the field as typed so it can be corrected.
+    final aadharTyped = _aadhar.text.trim();
+    if (aadharTyped.isNotEmpty && !RegExp(r'^\d{12}$').hasMatch(aadharTyped)) {
+      return err('Aadhaar must be exactly 12 digits — '
+          'clear the field to leave it blank');
+    }
+    final pinTyped = _pin.text.trim();
+    if (pinTyped.isNotEmpty && !RegExp(r'^[1-9]\d{5}$').hasMatch(pinTyped)) {
+      return err('PIN code must be 6 digits and cannot start with 0 — '
+          'clear the field to leave it blank');
+    }
+    // A re-appointment that cannot name its patient must not be sent.
+    //
+    // The id rides as `patient_id`, and the server attaches the visit to
+    // that patient instead of inserting one. Without the key it registers a
+    // second person under the same name and number -- silently, because an
+    // absent key is exactly what a fresh registration looks like. That is
+    // what happened to Divyansh maurya: two patient rows, one visit each,
+    // both filed as new (user 2026-09-30).
+    if (_reAppointmentSource != null && _reAppointmentPatientId == null) {
+      return err('This patient has not finished syncing yet — '
+          'open Re-Appointment again once the cloud icon is green');
+    }
     // Paid orgs must always collect a consultation fee (payment is
     // pinned to Paid by the render Builder). Free orgs skip this
     // entirely — no amount asked (user 2026-09-02).
@@ -556,7 +639,14 @@ class _CounRegisterState extends State<CounRegister> {
     // text is preserved so nothing typed on the last visit gets lost.
     String carryPast    = src?.pastHistory ?? '';
     if (src != null && carryDisease.trim().isNotEmpty) {
-      final tag = 'Previous Diagnosis (${src.regDate.isEmpty ? "—" : src.regDate}): $carryDisease';
+      // No date, no bracket. An em-dash in the brackets read as a diagnosis
+      // field that had failed rather than a date nobody recorded, which is
+      // how "Previous Diagnosis (—): ..." ended up on the web case page
+      // (user 2026-09-30).
+      final when = src.regDate.trim();
+      final tag = when.isEmpty
+          ? 'Previous Diagnosis: $carryDisease'
+          : 'Previous Diagnosis ($when): $carryDisease';
       carryPast = carryPast.trim().isEmpty ? tag : '$tag\n$carryPast';
     }
     // previousRx = source's own previousRx history + last visit's
@@ -744,10 +834,12 @@ class _CounRegisterState extends State<CounRegister> {
     // server so `/mobile/sync/push` (mobile._register) attaches the new
     // appointment to the same patient row instead of inserting a
     // duplicate (user rule 2026-08-16).
-    final reappointmentPatientId = _reAppointmentSource?.backendPatientId;
+    final reappointmentPatientId = _reAppointmentPatientId;
     final sync = context.read<SyncService>();
     await sync.enqueue(kind: 'patient.register', payload: {
       if (reappointmentPatientId != null) 'patient_id': reappointmentPatientId,
+      if (reappointmentPatientId != null && _reAppointmentParentId != null)
+        'parent_appointment_id': _reAppointmentParentId,
       // Basic identity
       'patient_name':      p.name,
       'gender':            p.gender,
@@ -922,38 +1014,32 @@ class _CounRegisterState extends State<CounRegister> {
       _contact.text = p.contact;
       block = p.block.isEmpty ? null : p.block;
       village = p.village.isEmpty ? null : p.village;
-      // INPUT gets the ORIGINAL as dictated, never the English display
-      // copy (user 2026-08-22 "dont show english version in inputs").
-      _remarks.text =
-          p.remarksOriginal.isNotEmpty ? p.remarksOriginal : p.remarks;
-      // Carry the previous symptom picks over (rule 2026-07-31) so the
-      // counsellor can just tweak them for today's visit instead of
-      // re-selecting from scratch.
-      symptoms
-        ..clear()
-        ..addAll(p.symptoms);
-      // Vitals prefill (user rule 2026-08-13): show the LAST visit's
-      // readings so the counsellor sees them selected and just updates
-      // what changed. Keys cover both spellings the app has written —
-      // 'Oxygen' (backend hydrate) and 'Oxygen Saturation' (local form).
-      String vital(List<String> keys) {
-        for (final k in keys) {
-          final v = p.vitals[k];
-          if (v != null && v.trim().isNotEmpty) return v.trim();
-        }
-        return '';
+      // Remarks start EMPTY on a re-appointment. They are why the patient
+      // came THIS time, and every visit now keeps its own
+      // (appointments.patient_remarks, 2026-09-30) — carrying the last
+      // one forward means the counsellor who does not clear it files a
+      // fortnight-old complaint against today's visit.
+      //
+      // Symptoms go the same way (user 2026-09-30): they are what the
+      // patient reports TODAY, and the reason the doctor is about to be
+      // shown an advisory. Carried forward and left untouched they file a
+      // fortnight-old complaint as this visit's, and the advisory ranks
+      // conditions from them -- so a stale chip does not just sit there,
+      // it steers the consultation.
+      _remarks.clear();
+      symptoms.clear();
+      // Vitals start EMPTY, like the remark above (user 2026-09-30).
+      //
+      // They used to carry the last visit's readings so the counsellor
+      // could just change what moved. But a reading is a measurement taken
+      // on a day: left untouched, a fortnight-old blood pressure is filed
+      // as today's and read as though somebody had put the cuff on. Blank
+      // is the honest start -- a vital nobody measured is not sent at all,
+      // and the record says so.
+      for (final c in [_sys, _dia, _sugar, _temp, _spo2, _hr, _hb]) {
+        c.clear();
       }
-      _sys.text   = vital(['Systolic BP']);
-      _dia.text   = vital(['Diastolic BP']);
-      _sugar.text = vital(['Blood Sugar']);
-      _temp.text  = vital(['Body Temp (°F)']);
-      _spo2.text  = vital(['Oxygen', 'Oxygen Saturation']);
-      _hr.text    = vital(['Heart Rate']);
-      _hb.text    = vital(['Hemoglobin']);
-      // Auto-expand the vitals section when anything came through, so the
-      // prefill is visible instead of hiding behind the collapsed toggle.
-      showVitals = [_sys, _dia, _sugar, _temp, _spo2, _hr, _hb]
-          .any((c) => c.text.isNotEmpty);
+      showVitals = false;
       _attachments.clear();
       // Previous visit's doctor pre-selected (rule 2026-08-13) — the
       // hydrate stored their staff_name; keep it only when it exists in
@@ -969,8 +1055,8 @@ class _CounRegisterState extends State<CounRegister> {
       // blood group, category, PwD flag, pincode, address. Section is
       // auto-expanded so the counsellor sees the values right away.
       _aadhar.text = p.aadhar;
-      _height.text = p.heightCm;
-      _weight.text = p.weightKg;
+      _height.text = _wholeNumber(p.heightCm);
+      _weight.text = _wholeNumber(p.weightKg);
       bloodGroup   = p.bloodGroup;
       category     = p.category;
       pwd          = p.pwd.isEmpty ? 'No' : p.pwd;
@@ -1083,9 +1169,16 @@ class _CounRegisterState extends State<CounRegister> {
         ],
         CField('Know', _radios(['Age','Date of Birth'], knowAge ? 'Age' : 'Date of Birth', (v) => setState(() => knowAge = v == 'Age')), required: true),
         if (knowAge)
-          CField('Age (in years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], decoration: cInput('e.g. 28')), required: true)
+          CField('Age (Years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 28').copyWith(errorText: _ageErr())), required: true)
         else
-          CField('Date of Birth', DateField(hint: 'Pick date of birth', first: DateTime(1920), last: DateTime.now(), initial: _dob, onPicked: (d) => setState(() => _dob = d)), required: true),
+          CField('Date of Birth', Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            DateField(hint: 'Pick date of birth',
+                first: _earliestDob, last: _latestDob,
+                initial: _dob, onPicked: (d) => setState(() => _dob = d)),
+            if (_dobErr() case final e?)
+              Padding(padding: const EdgeInsets.only(top: 6, left: 2),
+                  child: Text(e, style: ct(11.5, FontWeight.w400, C2.danger))),
+          ]), required: true),
         CField('Contact Number', TextField(controller: _contact, keyboardType: TextInputType.phone,
           inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(10)],
           onChanged: (_) => setState(() {}),
@@ -1284,7 +1377,7 @@ class _CounRegisterState extends State<CounRegister> {
               if (mounted && payment != 'Paid') setState(() => payment = 'Paid');
             });
           }
-          return CField('Paid Amount (₹)',
+          return CField('Consultation Fees (₹)',
               Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 TextField(controller: _amount, keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly,
@@ -1322,7 +1415,7 @@ class _CounRegisterState extends State<CounRegister> {
         // with_login deploy lands) keep the picker so nothing breaks.
         CField('Doctor Assignment',
             _doctorNames.length == 1
-                ? _lockedField(doctor ?? _doctorNames.first)
+                ? _lockedField(doctor ?? _doctorNames.first, showLock: false)
                 : _dd(_doctorNames, doctor, (v) => setState(() => doctor = v), hint: 'Select Doctor'),
             required: true),
         // Patient Remarks — Deepgram STT (nova-2 + language=hi, locked
@@ -1417,14 +1510,78 @@ class _CounRegisterState extends State<CounRegister> {
     _spo2:  (50, 100, 'Allowed 50–100%'),
     _hr:    (30, 220, 'Allowed 30–220'),
     _hb:    (3, 25, 'Allowed 3–25'),
+    // Weight had only the shared "Min 2 digits" floor, so 999.9 kg went
+    // through. 300 is well past any patient an MMU will weigh; the floor is
+    // kept where it already was, at 10, so nothing that used to be accepted
+    // stops being accepted (user 2026-09-28).
+    _weight: (10, 300, 'Allowed 10–300 kg'),
+    // Height had no ceiling at all — only the shared "Min 2 digits" floor —
+    // so 999.9 cm went through. 50-260 is the range the user set on
+    // 2026-09-29; the tallest recorded human reached 272 cm, so 260 is
+    // generous for anyone an MMU will measure.
+    _height: (50, 260, 'Allowed 50–260 cm'),
   };
+
+  /// Age is typed from memory, not measured, so it gets its own bound rather
+  /// than a _vitalRanges entry — that map feeds the vitals section.
+  ///
+  /// 1-120 (user 2026-09-29). The ceiling is because the field accepts three
+  /// digits and nothing else, so a slipped keystroke could register a
+  /// 999-year-old.
+  ///
+  /// The floor means an infant cannot be entered HERE, since an age in whole
+  /// years rounds to 0 below their first birthday. They are registered by
+  /// Date of Birth instead — the radio above this field — and that path
+  /// works out the age itself, so nothing is locked out.
+  static const int _minAgeYears = 1;
+  static const int _maxAgeYears = 120;
+
+  String? _ageErr() {
+    final t = _age.text.trim();
+    if (t.isEmpty) return null;
+    final v = int.tryParse(t);
+    if (v == null || v < _minAgeYears || v > _maxAgeYears) {
+      return 'Allowed $_minAgeYears–$_maxAgeYears years';
+    }
+    return null;
+  }
+
+  /// The window a date of birth may fall in — the same 1–120 years the Age
+  /// field allows (user 2026-09-30), expressed as dates so the picker can
+  /// refuse the rest rather than let one be chosen and then rejected.
+  ///
+  /// The picker used to open on 1920–today, which accepted a 106-year-old
+  /// and a date typed a decade out by a slipped year.
+  DateTime get _earliestDob {
+    final n = DateTime.now();
+    return DateTime(n.year - _maxAgeYears, n.month, n.day);
+  }
+
+  DateTime get _latestDob {
+    final n = DateTime.now();
+    return DateTime(n.year - _minAgeYears, n.month, n.day);
+  }
+
+  /// Guards a date that got past the picker — a value held from before the
+  /// bounds existed, or one restored by a re-appointment prefill.
+  String? _dobErr() {
+    final d = _dob;
+    if (d == null) return null;
+    final years = _ageFromDob(d);
+    if (years < _minAgeYears || years > _maxAgeYears) {
+      return 'Allowed $_minAgeYears–$_maxAgeYears years (this is $years)';
+    }
+    return null;
+  }
 
   String? _vitalMinErr(TextEditingController c) {
     final t = c.text.trim();
     if (t.isEmpty) return null;
     final r = _vitalRanges[c];
     if (r == null) {
-      // Height / weight — unchanged digit floor.
+      // Every field this is called with now carries a range, so nothing
+      // reaches here. Kept as the safe default for a controller added later
+      // before somebody remembers to give it one.
       if (t.split('.').first.length < 2) return 'Min 2 digits';
       return null;
     }
@@ -1437,9 +1594,16 @@ class _CounRegisterState extends State<CounRegister> {
   /// (State / District). Renders with the same border/padding as every
   /// other field, a lock suffix instead of a dropdown arrow, and no tap
   /// handler — visibly a field, visibly not editable.
-  Widget _lockedField(String v) => InputDecorator(
+  /// [showLock] false drops the padlock while keeping the read-only look.
+  /// State and District are assigned by the web admin and the padlock says
+  /// so usefully. A single-doctor MMU is not the same thing — there is
+  /// simply nobody else to pick, and a padlock made it read as a permission
+  /// the counsellor lacks (user 2026-09-28).
+  Widget _lockedField(String v, {bool showLock = true}) => InputDecorator(
         decoration: cInput().copyWith(
-          suffixIcon: const Icon(Icons.lock_outline, size: 16, color: C2.text3),
+          suffixIcon: showLock
+              ? const Icon(Icons.lock_outline, size: 16, color: C2.text3)
+              : null,
         ),
         child: Text(
           v.isEmpty ? '—' : v,

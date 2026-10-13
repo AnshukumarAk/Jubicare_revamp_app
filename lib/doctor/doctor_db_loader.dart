@@ -37,14 +37,44 @@ class DoctorDbLoader {
     for (final e in (data['conditions'] as List? ?? const [])) {
       if (e is! Map) continue;
       final m = e.cast<String, dynamic>();
-      final plan = DPlan(
-        symptoms: {
-          for (final s in ((m['symptoms'] as Map?) ?? const {}).entries)
+
+      // symptoms — old format: Map<String, int>
+      //            new format: List<Map> with sourceText + weight
+      final rawSym = m['symptoms'];
+      final Map<String, int> symptoms;
+      if (rawSym is Map) {
+        symptoms = {
+          for (final s in rawSym.entries)
             s.key.toString(): (s.value as num?)?.toInt() ?? 1,
-        },
-        tests: [
-          for (final t in (m['tests'] as List? ?? const [])) t.toString()
-        ],
+        };
+      } else if (rawSym is List) {
+        symptoms = {
+          for (final s in rawSym)
+            if (s is Map)
+              (s['sourceText'] ?? '').toString():
+                  (s['weight'] as num?)?.toInt() ?? 1,
+        };
+      } else {
+        symptoms = const {};
+      }
+
+      // tests — old format: List<String>
+      //         new format: List<Map> with sourceText + masterName
+      final tests = <DTest>[];
+      for (final t in (m['tests'] as List? ?? const [])) {
+        if (t is Map) {
+          final src = (t['sourceText'] ?? '').toString();
+          final master = (t['masterName'] ?? '').toString();
+          if (src.isNotEmpty) tests.add(DTest(src, master));
+        } else {
+          final s = t.toString();
+          if (s.isNotEmpty) tests.add(DTest.same(s));
+        }
+      }
+
+      final plan = DPlan(
+        symptoms: symptoms,
+        tests: tests,
         redFlags: [
           for (final t in (m['redFlags'] as List? ?? const [])) t.toString()
         ],

@@ -73,6 +73,28 @@ String _fmtVital(Object? v) {
   return n != null ? _fmtVital(n) : s;
 }
 
+/// A diagnosis chip carries the term and the ICD code glued into one label —
+/// "Fever · MG26" from the picker (Disease.display), "Fever | MG26" from the
+/// advisory card's Apply. The server stores them in two separate columns
+/// (appointment_diagnosis.diagnosis_text / .icd11_code), so the label is split
+/// back apart here rather than shipped whole. Before this the whole label went
+/// into diagnosis_text, which is why the web's case page read
+/// "Previous Diagnosis: Fever · MG26" (user 2026-09-30).
+({String text, String icd}) _splitDx(String label) {
+  for (final sep in const [' · ', ' | ']) {
+    final i = label.lastIndexOf(sep);
+    if (i <= 0) continue;
+    final code = label.substring(i + sep.length).trim();
+    // An ICD-11 stem is short and alphanumeric. Anything else belongs to the
+    // term — a doctor may well type "Fever | origin unknown" by hand.
+    if (code.isNotEmpty && code.length <= 12 &&
+        RegExp(r'^[A-Za-z0-9.]+$').hasMatch(code)) {
+      return (text: label.substring(0, i).trim(), icd: code);
+    }
+  }
+  return (text: label.trim(), icd: '');
+}
+
 class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late List<String> symptoms;
   final List<String> diagnoses = []; // multi-select; master "Term · ICD" or typed free text
@@ -116,6 +138,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // Yes requires a date, which submits as follow_up_date.
   bool? _nextFollowUp;
   DateTime? _followUpDate;
+  /// How far ahead a follow-up may be booked — one month (user 2026-09-30).
+  static const int _followUpMaxDays = 31;
   // True while GET /api/appointments/{id} is in flight — see
   // _loadRegistrationDetail. Without it the Registration Details card shows
   // a bare '—' during the round-trip, which reads as "none recorded".
@@ -173,13 +197,18 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           for (var j = i + 1; j < p.prescription.length; j++) {
             if (p.prescription[j].comboKey == key) {
               final pp = parseDosage(p.prescription[j].dosage);
-              partners.add(ComboMed(name: p.prescription[j].name, dosage: pp.strength));
+              partners.add(ComboMed(
+                  name: p.prescription[j].name,
+                  dosage: bareStrength(pp.strength)));
             }
           }
         }
         rx.add(RxItem(
           name: m.name,
-          dosage: parsed.strength,
+          // Rows written before the unit became automatic carry it in the
+          // text ("100 mg"); the box below is captioned with the unit
+          // already (user 2026-09-26).
+          dosage: bareStrength(parsed.strength),
           dosageForm: m.dosageForm.isNotEmpty ? m.dosageForm : parsed.form,
           days: m.days, interval: m.interval, qty: m.qty,
           comboKey: key,
@@ -389,6 +418,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ? cRemarksEn
           : (d['counsellor_remarks'] ?? '').toString().trim();
       if (cRemarks.isNotEmpty) p.remarks = cRemarks;
+      // As dictated. Kept so the card below can offer it back — a
+      // translation of a complaint is worth reading against the words the
+      // patient actually used (user 2026-09-28).
+      p.remarksOriginal = (d['counsellor_remarks'] ?? '').toString();
       if (freshVitals.isNotEmpty) {
         p.vitals = {...p.vitals, ...freshVitals};
         for (final e in freshVitals.entries) {
@@ -582,10 +615,32 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   void _applyAdvisory(String name, DPlan plan) {
     final resolved = DiseaseMaster.resolve(name);
     final dxStr = resolved?.display ?? name;
-    final newTests = List<String>.from(plan.tests);
+    // The other half of the adoption record. This path applies from the
+    // bundled clinical sheet, which carries no entry id, so the condition is
+    // resolved back to the terminology master to find one. No match means no
+    // row -- a statistic is not worth guessing at (user 2026-09-30).
+    final term = context.read<TerminologyStore>().entryByTerm(name);
+    if (term != null) {
+      _recordAdvisoryApplied(
+        entryId: term.entryId,
+        condition: term.standardTerm,
+        icd11Code: term.icd11Code,
+        tests: plan.tests.where((t) => t.masterName.isNotEmpty).length,
+        medicines: plan.rx.length,
+      );
+    }
+    // masterName goes into Investigations; skip tests with no masterName.
+    final newTests = plan.tests
+        .where((t) => t.masterName.isNotEmpty)
+        .map((t) => t.masterName)
+        .toList();
     final newRxItems = plan.rx.map((r) {
       final (mn, md) = splitMedicine(r.name);
-      return RxItem(name: mn, dosage: md, days: r.days, interval: r.interval, qty: r.qty);
+      // splitMedicine returns the strength WITH its unit — right for the
+      // dispense report that also calls it, wrong for an input box that
+      // already says MG above it (user 2026-09-26).
+      return RxItem(name: mn, dosage: bareStrength(md),
+          days: r.days, interval: r.interval, qty: r.qty);
     }).toList();
     setState(() {
       // 1. Drop the PREVIOUS auto-applied items (only if they are still
@@ -737,7 +792,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ])),
           // registration details (read-only, filled by counsellor)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Recipient', bg: C2.cyanLight, fg: C2.cyan)]),
+            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Receptionist', bg: C2.cyanLight, fg: C2.cyan)]),
             _kv('Symptoms', p.symptoms.isNotEmpty
                 ? p.symptoms.join(', ')
                 : (_loadingRegDetail ? 'Loading…' : '—')),
@@ -745,7 +800,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // p.remarks is set by _applyRegistrationDetail with the English
             // version preferred (counsellor_remarks_english), falling back
             // to the original counsellor_remarks only when English is empty.
-            if (p.remarks.isNotEmpty) _kv('Patient Remarks', p.remarks),
+            if (p.remarks.isNotEmpty)
+              _kv('Patient Remarks', p.remarks,
+                  value: CTranslatedText(p.remarks,
+                      original: p.remarksOriginal,
+                      style: ct(13, FontWeight.w500, C2.text))),
           ])),
           // Editable Vitals card (rule 2026-07-31). Collapsible — same
           // switch pattern as the Counsellor Register form's Vitals section.
@@ -958,7 +1017,11 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                         borderRadius: BorderRadius.circular(12),
                         onTap: () => setState(() {
                           if (rx.any((x) => x.name == f.name)) return;
-                          rx.add(RxItem(name: f.name, dosage: f.dosage));
+                          // The chip SHOWS "Paracetamol · 100 mg" because
+                          // that reads well on a chip. The Dosage box is
+                          // captioned (MG) and filters to digits, so only
+                          // the number goes in (user 2026-09-26).
+                          rx.add(RxItem(name: f.name, dosage: bareStrength(f.dosage)));
                         }),
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1019,11 +1082,20 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               InkWell(
                 onTap: () async {
                   final now = DateTime.now();
+                  // A month out at most. The picker opened on a full year,
+                  // so a stray tap on the forward arrow landed the doctor
+                  // in September 2027 and a review that far ahead is not a
+                  // follow-up (user 2026-09-30). Tomorrow is still the
+                  // earliest — a follow-up dated today is this visit.
+                  final last = now.add(const Duration(days: _followUpMaxDays));
+                  final current = _followUpDate;
                   final picked = await showDatePicker(
                     context: context,
-                    initialDate: _followUpDate ?? now.add(const Duration(days: 7)),
+                    initialDate: (current != null && !current.isAfter(last))
+                        ? current
+                        : now.add(const Duration(days: 7)),
                     firstDate: now.add(const Duration(days: 1)),
-                    lastDate: now.add(const Duration(days: 365)),
+                    lastDate: last,
                   );
                   if (picked != null) setState(() => _followUpDate = picked);
                 },
@@ -1065,6 +1137,13 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             }
             if (_nextFollowUp == null) { return err('Answer "Next Follow-Up" (Yes/No)'); }
             if (_nextFollowUp == true && _followUpDate == null) { return err('Select the follow-up date'); }
+            // Catches a date the picker could not have produced — one held
+            // from before the limit existed, or a re-appointment prefill.
+            if (_nextFollowUp == true && _followUpDate != null &&
+                _followUpDate!.isAfter(DateTime.now()
+                    .add(const Duration(days: _followUpMaxDays)))) {
+              return err('Follow-up must be within $_followUpMaxDays days');
+            }
             // Vitals must be clinically plausible (user 2026-08-22).
             for (final v in _kVitalSpecs) {
               final rangeErr = _vitalRangeErr(v.key);
@@ -1124,6 +1203,17 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             // Commit any edited vitals so the update rides along with the
             // rest of the case submission.
             _commitVitalsToPatient();
+            // Split each chip's "Term · ICD" label into the two columns the
+            // server keeps them in. Blank-text chips can't happen (the picker
+            // never returns one) but are dropped rather than trusted.
+            final dxPayload = <Map<String, Object?>>[];
+            for (var i = 0; i < diagnoses.length; i++) {
+              final d = _splitDx(diagnoses[i]);
+              if (d.text.isEmpty) continue;
+              dxPayload.add({'diagnosis_text': d.text,
+                             'icd11_code':     d.icd,
+                             'is_primary':     i == 0});
+            }
             s.doctorSubmit(p, disease: diagnoses.join(', '), rx: rx, tests: tests, observations: _obs.text.trim(), remarks: _remarks.text.trim());
             // Enqueue appointment.doctor_submit (v2 §4). Server decides
             // the next status based on tests vs medicines.
@@ -1158,17 +1248,18 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               'symptom_names': [for (final s in symptoms) s],
               // DoctorSubmitIn reads `diagnosis_text`; a bare `text` key was
               // dropped on the floor, losing the diagnosis on every case.
-              'diagnoses': [
-                for (var i = 0; i < diagnoses.length; i++)
-                  {'diagnosis_text': diagnoses[i], 'is_primary': i == 0},
+              // `icd11_code` rides separately so the server can link the visit
+              // to the diseases master the web portal reads — without it the
+              // web's Diagnosis column stayed "—" on every MMU case.
+              'diagnoses': dxPayload,
+              // Tests are recorded as ADVISED (not billed) — the patient
+              // goes straight to the pharmacist. lab_test_ids carries the
+              // master ids so the server creates structured LabTestOrder
+              // rows; lab_test_names is the text fallback.
+              'lab_test_ids': [
+                for (final t in tests)
+                  if (context.read<MastersStore>().labTestIdOf(t) case final id?) id,
               ],
-              // lab_test_ids is deliberately NOT sent. This MMU runs
-              // Counsellor -> Doctor -> Pharmacist with no lab desk and no test
-              // payment, but the server routes any formally-ordered test to
-              // 'with_counsellor' to collect a fee — a state nothing in this app
-              // can clear, which stranded the patient short of the pharmacist.
-              // The doctor only *advises* tests here, so they ride along as text
-              // (see _remarksWithTests) and the case routes on medicines alone.
               'lab_test_names': [ for (final t in tests) t ],
               'prescription': () {
                 // Resolve master ids on the mobile side so the server
@@ -1317,7 +1408,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         if (plan != null) ...[
           if (plan.tests.isNotEmpty)
             line(Icons.science_outlined, 'Tests:',
-                plan.tests.where((t) => t.trim().length <= 60).join(', ')),
+                plan.tests.map((t) => t.sourceText).where((t) => t.trim().length <= 60).join(', ')),
           if (plan.firstLine.trim().isNotEmpty)
             line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
           if (plan.rx.isNotEmpty)
@@ -1344,7 +1435,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               if (!diagnoses.contains(label)) diagnoses.add(label);
               if (plan != null) {
                 for (final t in plan.tests) {
-                  if (!tests.contains(t)) tests.add(t);
+                  if (t.masterName.isEmpty) continue;
+                  if (!tests.contains(t.masterName)) tests.add(t.masterName);
                 }
                 for (final r in plan.rx) {
                   if (!rx.any((x) => x.name == r.name)) {
@@ -1358,6 +1450,19 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
               // (user 2026-08-27).
               _appliedAdvSig = _advSig;
             });
+            // Tell the server the advisory was taken. Until this existed the
+            // adoption panel counted the web portal only, and every MMU
+            // consultation was missing from it (user 2026-09-30). Fired and
+            // forgotten -- a statistic never delays the doctor.
+            _recordAdvisoryApplied(
+              entryId: e.entryId,
+              condition: e.standardTerm,
+              icd11Code: e.icd11Code,
+              tests: plan?.rx == null
+                  ? 0
+                  : plan!.tests.where((t) => t.masterName.isNotEmpty).length,
+              medicines: plan?.rx.length ?? 0,
+            );
           }, disabled: _appliedAdvSig != null && _appliedAdvSig == _advSig),
           // Dismiss hides after the first Apply — once the plan is on
           // record, dismissing the card no longer makes sense
@@ -1397,7 +1502,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         // "Typhoid fever - 1A09 (46%)" (user 2026-08-22).
         line(Icons.coronavirus_outlined, 'Likely:',
             '$name${(icd ?? '').isNotEmpty ? ' - $icd' : ''} ($pct%)'),
-        line(Icons.science_outlined, 'Tests:', plan.tests.join(', ')),
+        line(Icons.science_outlined, 'Tests:', plan.tests.map((t) => t.sourceText).join(', ')),
         line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
         line(Icons.medication_outlined, 'Rx:', rxStr),
         line(Icons.warning_amber_rounded, 'Red Flags:', plan.redFlags.join(', ')),
@@ -1416,6 +1521,29 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         ]),
       ]),
     ));
+  }
+
+  /// Record that the doctor took the advisory. Never awaited and never
+  /// allowed to throw: this is a dashboard number, and a dashboard number is
+  /// not worth a snackbar on a clinical screen.
+  void _recordAdvisoryApplied({
+    required int entryId,
+    required String condition,
+    String? icd11Code,
+    int tests = 0,
+    int medicines = 0,
+  }) {
+    final apptId = p.backendAppointmentId;
+    if (apptId == null || entryId <= 0) return;
+    unawaited(context.read<AppointmentsApi>().advisoryApplied(
+          apptId,
+          entryId: entryId,
+          condition: condition,
+          icd11Code: icd11Code,
+          diagnosis: true,
+          tests: tests,
+          medicines: medicines,
+        ));
   }
 
   Widget _aiBtn(String t, Color bg, VoidCallback onTap, {bool disabled = false}) => InkWell(
@@ -1459,31 +1587,62 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
 
   Widget _testsField() {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // Not a Chip: a Chip keeps its label on one line, and the master's
+      // standard names run long — "Spirometry / Pulmonary Function Test
+      // (with bronchodilator reversibility)" lost its tail the moment the
+      // advisory started applying them (user 2026-09-29). This wraps to as
+      // many lines as the name needs, bounded by the field's own width.
       if (tests.isNotEmpty)
-        Padding(padding: const EdgeInsets.only(bottom: 6), child: Wrap(spacing: 6, runSpacing: 6, children: tests.map((t) => Chip(
-          label: Text(t, style: ct(11.5, FontWeight.w600, C2.navy)), backgroundColor: C2.cyanLight, side: BorderSide.none,
-          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap, visualDensity: VisualDensity.compact,
-          deleteIcon: const Icon(Icons.close, size: 13), deleteIconColor: C2.text2, onDeleted: () => setState(() => tests.remove(t)),
-        )).toList())),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: LayoutBuilder(builder: (context, box) => Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              for (final t in tests)
+                ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: box.maxWidth),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
+                    decoration: BoxDecoration(
+                        color: C2.cyanLight,
+                        borderRadius: BorderRadius.circular(14)),
+                    child: Row(mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                      Flexible(child: Text(t,
+                          style: ct(11.5, FontWeight.w600, C2.navy))),
+                      const SizedBox(width: 4),
+                      InkWell(
+                        onTap: () => setState(() => tests.remove(t)),
+                        borderRadius: BorderRadius.circular(10),
+                        child: const Padding(
+                          padding: EdgeInsets.all(2),
+                          child: Icon(Icons.close, size: 13, color: C2.text2),
+                        ),
+                      ),
+                    ]),
+                  ),
+                ),
+            ],
+          )),
+        ),
       COutlineButton('Add Test', icon: Icons.add, onTap: () async {
         print('[JC] Add Test TAPPED at ${DateTime.now().toIso8601String().substring(11,23)}');
         _parkFocus();
         // Lab tests DYNAMIC — server master `lab_tests` first, static
         // fallback (user 2026-09-10 dynamic masters, additive only —
         // send-side payload unchanged, no breakage risk).
-        final labTests = () {
-          final rows = context.read<MastersStore>().masterRows('lab_tests');
-          final serverNames = <String>[
-            for (final r in rows)
-              if ((r['name'] ?? r['term']) != null) (r['name'] ?? r['term']).toString(),
-          ];
-          if (serverNames.isEmpty) return kLabTests;
-          final seen = <String>{};
-          return <String>[
-            for (final s in [...serverNames, ...kLabTests])
-              if (s.trim().isNotEmpty && seen.add(s)) s,
-          ];
-        }();
+        // Server master only. The hardcoded kLabTests used to be merged in
+        // on top of it, so "ESR", "Blood Group" and "ANC Profile" were
+        // offered whether or not this organisation's catalogue had them —
+        // and a test it does not have resolves to no id, so the order was
+        // dropped without a word (user 2026-09-30).
+        final labTests = <String>[
+          for (final r in context.read<MastersStore>().masterRows('lab_tests'))
+            if ((r['name'] ?? r['term']) != null)
+              (r['name'] ?? r['term']).toString(),
+        ];
         final picked = await _pick(context, 'Add Test', labTests.where((t) => !tests.contains(t)).toList());
         if (!mounted) return;
         _parkFocus();
@@ -1827,7 +1986,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       'betadine gargle': '10 ml',
     };
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final pool = serverMeds;
     for (final n in pool) {
       if (out.length >= 5) break;
       if (taken.contains(n.toLowerCase())) continue;
@@ -1844,7 +2003,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   Future<void> _pickComboMed(RxItem m) async {
     _parkFocus();
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     final taken = <String>{
       for (final x in rx) x.name.toLowerCase(),
       for (final x in rx)
@@ -1886,7 +2045,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   Future<void> _editCombos(RxItem m) async {
     _parkFocus();
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     // Options = every medicine in the master EXCEPT this primary and
     // any drug already sitting on another rx row (primary or combo).
     final otherRxNames = <String>{
@@ -1948,7 +2107,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // silently dropped by the server's prescription mirror (same root as
     // the requisition "No line matched" bug, 2026-08-21).
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final medOptions = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final medOptions = serverMeds;
     // Case-insensitive de-dup — the server master occasionally lists a
     // medicine twice (name variants under different ids), and the
     // multi-select checkbox picker was rendering both, letting the
@@ -2024,10 +2183,27 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     ));
   }
 
-  Widget _kv(String k, String v) => Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        SizedBox(width: 90, child: Text(k, style: ct(12, FontWeight.w400, C2.text2))),
-        Expanded(child: Text(v, style: ct(13, FontWeight.w500, C2.text))),
-      ]));
+  /// Label above value, each taking the full width.
+  ///
+  /// It was a 90px label column with the value beside it, which left a
+  /// dictated remark running twenty lines down 65% of the screen while the
+  /// column beside it sat empty — and wrapped a five-symptom list onto two
+  /// lines for no reason (user 2026-09-28, screenshot). Only two rows use
+  /// this and both are long, so both stack.
+  ///
+  /// [value] replaces the plain Text for rows that need more than one — the
+  /// remarks carry a "Show original" toggle.
+  Widget _kv(String k, String v, {Widget? value}) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 5),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(k, style: ct(12, FontWeight.w400, C2.text2)),
+          const SizedBox(height: 3),
+          SizedBox(
+            width: double.infinity,
+            child: value ?? Text(v, style: ct(13, FontWeight.w500, C2.text)),
+          ),
+        ]),
+      );
 
   // ═════════════ Px + Rx history (rule 2026-08-05) ═════════════
   // Prescription & Reports section renders two chip buttons; tapping each
@@ -2305,13 +2481,19 @@ class _PickerSheetState extends State<_PickerSheet> {
                       style: ct(13, FontWeight.w400, C2.text2)))
               // Lazy — 787-symptom sheet was building every row up front
               // and made the picker feel frozen (user 2026-08-25).
+              // 44 was one line's worth, which clipped the master's longer
+              // standard names to "Spirometry / Pulmonary Function Test
+              // (with bronchodi…" (user 2026-09-29). A fixed extent is what
+              // keeps this lazy, so it stays — just tall enough for two.
               : ListView.builder(
                   shrinkWrap: true,
                   itemCount: m.length,
-                  itemExtent: 44,
+                  itemExtent: 62,
                   itemBuilder: (_, i) => ListTile(
                     dense: true,
-                    title: Text(m[i], style: ct(13.5, FontWeight.w500, C2.text)),
+                    title: Text(m[i], maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: ct(13.5, FontWeight.w500, C2.text)),
                     trailing: const Icon(Icons.add, size: 18, color: C2.cyan),
                     onTap: () => Navigator.pop(context, m[i]),
                   ),

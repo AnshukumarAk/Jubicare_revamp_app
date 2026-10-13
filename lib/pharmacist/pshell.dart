@@ -18,15 +18,17 @@ import '../api/appointments_api.dart';
 import '../api/attendance_api.dart';
 import '../api/camps_api.dart';
 import '../api/masters_store.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
 import '../api/requisitions_api.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
 import '../api/uploads_api.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/screens_dashboard.dart' show CounPatientDetail, CounPatientsList, kUploadsBase;
 import '../doctor/dshell.dart' show DocHeader, DocBottomNav;
-import '../doctor/ddata.dart' show kMedicineNames, parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty, displayDosage, strengthWithUnit;
+import '../doctor/ddata.dart' show parseDosage, kDosageForms, kDosageFormSep, dosageFormNeedsQty, displayDosage, strengthWithUnit;
 import '../services/connectivity_service.dart';
 import '../services/deepgram_stt.dart';
 import '../services/attendance_store.dart';
@@ -203,7 +205,11 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
 
   /// Public hook for the shell's app-bar refresh button (user rule
   /// 2026-08-16).
-  Future<void> refreshNow() => _refreshFromBackend();
+  ///
+  /// Always loads EVERYTHING. This is the pharmacist asking directly, and it
+  /// should be the one gesture that cannot leave anything behind. Deltas
+  /// resume from the result.
+  Future<void> refreshNow() => _refreshFromBackend(full: true);
 
   @override
   void initState() {
@@ -260,43 +266,111 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     }
   }
 
-  Future<void> _refreshFromBackend() async {
+  /// Where the next delta starts. Not persisted, so every app start loads
+  /// everything and nothing a delta gets wrong can outlive one session.
+  final _delta = QueueDelta();
+
+  Future<void> _refreshFromBackend({bool full = false}) async {
     if (_refreshing || !mounted) return;
     setState(() { _refreshing = true; _lastError = null; });
     try {
-      final api = context.read<QueuesApi>();
-      // Fetch the primary queue. ANY failure here is silent — cached
-      // list is already on screen and the retry button is one tap away
-      // (user 2026-08-26: "server started but red banner not going" —
-      // the banner survived until every conceivable throw path was
-      // treated silent). Once this succeeds we know the server is
-      // reachable, so a stale error is cleared unconditionally.
-      QueueList queue;
-      try {
-        queue = await api.pharmaQueue(limit: 200);
-      } catch (_) {
-        return; // banner already cleared at start; retry will run again
-      }
-      final week = await api.pharmaPast7Days(limit: 200)
-          .catchError((_) => QueueList(items: const [], total: 0, count: 0));
-      if (!mounted) return;
-      final store = context.read<CounsellorState>();
-      final queueIds = {
-        for (final r in queue.items) r['appointment_id'],
-      };
-      final combined = [
-        for (final r in queue.items) {...r, 'status': 'with_pharma'},
-        for (final r in week.items)
-          if (!queueIds.contains(r['appointment_id'])) r,
-      ];
-      store.mergeBackendPatients(combined);
-      try {
-        final cache = await PatientsCacheStore.open();
-        await cache.save(_pharmaCacheKey, combined);
-      } catch (_) {}
+      if (!full && await _refreshDelta()) return;
+      await _refreshEverything();
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The two queue calls below return up to 400 rows every refresh to answer
+  /// "did anything happen", and usually nothing did. False means "load
+  /// everything instead".
+  ///
+  /// Note what is NOT done here: the full path stamps the primary queue's
+  /// rows with 'with_pharma', because that list is the pharmacist's queue by
+  /// definition. A delta carries every status, so stamping it would mark
+  /// completed and cancelled visits as waiting for the pharmacist. The rows
+  /// already carry the right status — both endpoints run through the same
+  /// appointment_row(), which maps with_pharmacist to with_pharma — so they
+  /// are taken as they come.
+  Future<bool> _refreshDelta() async {
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
+    if (!mounted) return true;
+    final store = context.read<CounsellorState>();
+    if (rows.isNotEmpty) {
+      store.mergeBackendPatients(rows, additive: true);
+    }
+    // The tiles come along, as they do on the counsellor's delta. They are
+    // 0.12 KB and they are the server's own counts -- the number on the card
+    // -- where the list behind it is filtered from whatever this handset
+    // holds. Neither shell pulled them at all, so a dispense made the list
+    // go to two while the card stayed on one (user 2026-09-30).
+    //
+    // Today's rows come too: a delta only carries what changed since the
+    // cursor, and the today filters behind those cards need the whole day.
+    try {
+      final api = context.read<QueuesApi>();
+      final tiles = await api.tiles();
+      if (!mounted) return true;
+      store.applyTiles(tiles);
+      final todayRows = await api.today(limit: 500);
+      if (mounted) store.mergeBackendPatients(todayRows.items, additive: true);
+    } catch (_) {/* counts stay as they were -- the list is already right */}
+    return true;
+  }
+
+  /// The whole picture. Runs at app start, on pull-to-refresh, and whenever a
+  /// delta declines. Also re-seeds the cursor, and quietly repairs anything
+  /// the deltas missed — a visit soft-deleted on the server never appears in
+  /// a list of changed rows.
+  Future<void> _refreshEverything() async {
+    final api = context.read<QueuesApi>();
+    // Fetch the primary queue. ANY failure here is silent — cached
+    // list is already on screen and the retry button is one tap away
+    // (user 2026-08-26: "server started but red banner not going" —
+    // the banner survived until every conceivable throw path was
+    // treated silent). Once this succeeds we know the server is
+    // reachable, so a stale error is cleared unconditionally.
+    QueueList queue;
+    try {
+      queue = await api.pharmaQueue(limit: 200);
+    } catch (_) {
+      return; // banner already cleared at start; retry will run again
+    }
+    final week = await api.pharmaPast7Days(limit: 200)
+        .catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    // Today's whole day. past-7-days only carries visits this pharmacist
+    // dispensed itself, so one completed from the web was counted by the
+    // "Dispensed Today" tile and missing from the list behind it -- 3
+    // against 1 (user 2026-09-30).
+    final todayRows = await api.today(limit: 500)
+        .catchError((_) => QueueList(items: const [], total: 0, count: 0));
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    final queueIds = {
+      for (final r in queue.items) r['appointment_id'],
+    };
+    final combined = [
+      for (final r in queue.items) {...r, 'status': 'with_pharma'},
+      for (final r in week.items)
+        if (!queueIds.contains(r['appointment_id'])) r,
+    ];
+    store.mergeBackendPatients(combined);
+    store.mergeBackendPatients(todayRows.items, additive: true);
+    // The server's own counts for the cards. Without them the cards fall
+    // back to the length of a locally filtered list, which is a narrower
+    // set than the server counted (user 2026-09-30).
+    try {
+      final tiles = await api.tiles();
+      if (mounted) store.applyTiles(tiles);
+    } catch (_) {/* cards keep the numbers they had */}
+    _delta.seedFrom(combined);
+    try {
+      final cache = await PatientsCacheStore.open();
+      await cache.save(_pharmaCacheKey, combined);
+    } catch (_) {}
   }
 
   @override
@@ -304,12 +378,12 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
     final s = context.watch<CounsellorState>();
     final name = widget.name;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      GradGreeting(name: name, sub: 'Pharmacy Dashboard', initials: name.isEmpty ? 'P' : name[0].toUpperCase()),
+      GradGreeting(name: name, sub: 'Pharmacist Dashboard', initials: name.isEmpty ? 'P' : name[0].toUpperCase()),
       if (_refreshing) const SizedBox(height: 2, child: LinearProgressIndicator(minHeight: 2)),
       if (!_refreshing && _lastError != null)
         Padding(padding: const EdgeInsets.only(bottom: 6),
           child: InkWell(
-            onTap: _refreshFromBackend,
+            onTap: () => _refreshFromBackend(full: true),
             child: Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(color: const Color(0xFFFEECEA), borderRadius: BorderRadius.circular(6)),
@@ -333,7 +407,8 @@ class _PharmaDashboardState extends State<PharmaDashboard> {
           borderRadius: BorderRadius.circular(10),
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
             const PharmaDispensedList())),
-          child: StatTile('${s.pharmaDispensed}', 'Dispensed', C2.green))),
+          child: StatTile('${s.backendDispensed ?? s.pharmaDispensed}',
+              'Dispensed Today', C2.green))),
         const SizedBox(width: 8),
         // Past 7 Days tile (rule 2026-07-31 — parity with doctor screen).
         // Reuses the counsellor patient list widget filtered to patients
@@ -400,19 +475,26 @@ class _PharmaQueueListState extends State<PharmaQueueList> {
               onChanged: (v) => setState(() => q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(query.isEmpty ? 'No patients in queue' : 'No patient matches "$q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [CCard(child: Column(children: list.map((p) => InkWell(
-                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientDetail(p: p, showReAppointment: false))),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                  child: Row(children: [
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
-                    ])),
-                    const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
-                  ]),
-                ))).toList()))])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CounPatientDetail(p: p, showReAppointment: false))),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        const CBadge('Pending', bg: Color(0xFFFEF7E0), fg: Color(0xFFB8860B)),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );
@@ -432,7 +514,8 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
   Widget build(BuildContext context) {
     final s = context.watch<CounsellorState>();
     final query = q.trim().toLowerCase();
-    final list = s.dispensedPatients.where((p) => query.isEmpty
+    // Today's, to match the tile that opens this list (user 2026-09-30).
+    final list = s.dispensedToday.where((p) => query.isEmpty
         || p.name.toLowerCase().contains(query) || p.contact.contains(query)).toList();
     return MediaQuery(
       data: MediaQuery.of(context).copyWith(textScaler: const TextScaler.linear(1.0)),
@@ -440,27 +523,34 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
         backgroundColor: C2.bg,
         appBar: AppBar(backgroundColor: C2.white, foregroundColor: C2.navy, elevation: 0,
           shape: const Border(bottom: BorderSide(color: C2.cyan, width: 3)),
-          title: Text('Dispensed Patients (${s.dispensedPatients.length})', style: ct(16, FontWeight.w700, C2.navy))),
+          title: Text('Dispensed Today (${s.dispensedToday.length})', style: ct(16, FontWeight.w700, C2.navy))),
         body: Column(children: [
           Padding(padding: const EdgeInsets.fromLTRB(14, 14, 14, 6),
             child: TextField(decoration: cInput('Search by name or phone number').copyWith(prefixIcon: const Icon(Icons.search, size: 18, color: C2.navy)),
               onChanged: (v) => setState(() => q = v))),
           Expanded(child: list.isEmpty
             ? Center(child: Text(query.isEmpty ? 'No dispensed patients' : 'No patient matches "$q"', style: ct(13, FontWeight.w400, C2.text2)))
-            : ListView(padding: const EdgeInsets.fromLTRB(14, 6, 14, 20), children: [CCard(child: Column(children: list.map((p) => InkWell(
-                onTap: () => _showDispensedMeds(context, p),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 10),
-                  decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-                  child: Row(children: [
-                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                      Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
-                    ])),
-                    const CBadge('Dispensed', bg: Color(0xFFEDF7E0), fg: C2.green),
-                    const SizedBox(width: 6), const Icon(Icons.chevron_right, color: C2.text3, size: 18),
-                  ]),
-                ))).toList()))])),
+            : CLazyRowCard(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final p = list[i];
+                  return InkWell(
+                    onTap: () => _showDispensedMeds(context, p),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
+                      child: Row(children: [
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
+                          Text('${p.age}y · ${p.contact} · ${medsLabel(p)} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
+                        ])),
+                        const CBadge('Dispensed', bg: Color(0xFFEDF7E0), fg: C2.green),
+                        const SizedBox(width: 6), const Icon(Icons.chevron_right, color: C2.text3, size: 18),
+                      ]),
+                    ),
+                  );
+                },
+              )),
         ]),
       ),
     );
@@ -1382,10 +1472,25 @@ class _PharmaStockState extends State<PharmaStock> {
   Widget _overallPanel() {
     final reqs = context.watch<CounsellorState>().requisitions;
     final agg = <String, List<int>>{}; // name -> [requested, dispatched, received]
+    final members = <String, List<String>>{}; // row name -> medicines in it
     for (final r in reqs) {
-      for (final l in r.items) {
-        final a = agg.putIfAbsent(l.name, () => [0, 0, 0]);
-        a[0] += l.requested; a[1] += l.dispatched; a[2] += l.received;
+      // Grouped the way the requisition itself is. A combination strip is
+      // submitted as N lines under one combo_key, each carrying the whole
+      // strip's quantity — so counting them one by one turned a single
+      // order of 1000 four-drug strips into four separate 1000s, as if
+      // the pharmacist had asked for the drugs apart (user 2026-09-30).
+      for (final group in _comboGroups(r.items)) {
+        final name = group.length == 1
+            ? group.first.name
+            : group.map((l) => l.name).join(' + ');
+        final a = agg.putIfAbsent(name, () => [0, 0, 0]);
+        // One strip, one quantity: the lines repeat it, they do not add up.
+        a[0] += group.first.requested;
+        a[1] += group.first.dispatched;
+        a[2] += group.first.received;
+        // The live dispensed figure is keyed by single medicine name, so
+        // remember what a combination row is made of.
+        members[name] = [for (final l in group) l.name];
       }
     }
     if (agg.isEmpty) return CCard(child: Padding(padding: const EdgeInsets.all(10), child: Center(child: Text('No stock movement yet', style: ct(12, FontWeight.w400, C2.text2)))));
@@ -1405,7 +1510,16 @@ class _PharmaStockState extends State<PharmaStock> {
         ])),
       ...agg.entries.map((e) => Container(padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 6), decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.border))),
         child: Builder(builder: (_) {
-          final disp = _liveDispensed[e.key] ?? e.value[1];
+          // A combination row's dispensed figure is the sum of its
+          // members', since the server counts them one by one.
+          final names = members[e.key] ?? [e.key];
+          final live = names.map((n) => _liveDispensed[n])
+              .whereType<int>().toList();
+          final disp = live.isEmpty
+              ? e.value[1]
+              : (names.length > 1
+                  ? (live.reduce((a, b) => a > b ? a : b))
+                  : live.first);
           final recv = e.value[2];
           // TOTAL = what the row itself shows — RECV minus DISP (user
           // 2026-08-25: 1000 received + 18 dispensed must read 982, not
@@ -1473,15 +1587,35 @@ class _PharmaStockState extends State<PharmaStock> {
     return CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       ...reqItems.asMap().entries.map((e) => Padding(padding: const EdgeInsets.only(bottom: 10), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Row(children: [
-          Expanded(child: CField(
-              e.value.combos.isEmpty
-                  ? 'Medicine'
-                  : 'Combined: ${e.value.name ?? ''}${e.value.combos.map((c) => ' + ${c.name}').join()}',
-              InkWell(
-            onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
-            child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
-              child: Text(e.value.name ?? 'Select Medicine', overflow: TextOverflow.ellipsis,
-                style: ct(13, e.value.name == null ? FontWeight.w400 : FontWeight.w500, e.value.name == null ? C2.text3 : C2.text)))), required: true)),
+          // The picker disappears once partners are attached. It could only
+          // ever show the primary, and beside a heading already reading
+          // "COMBINATION: PARACETAMOL + VITAMIN A + VITAMIN C" a box saying
+          // just "Paracetamol" read as though one medicine had been chosen
+          // and the rest forgotten (user 2026-09-26).
+          //
+          // The cost, stated plainly: the primary can no longer be changed
+          // once it has partners — the combo sheet edits partners around a
+          // fixed primary. Changing it means removing the row and starting
+          // again. Accepted deliberately; a combination is built once and
+          // rebuilt rarely.
+          if (e.value.combos.isEmpty)
+            Expanded(child: CField(
+                'Medicine',
+                InkWell(
+              onTap: () async { final m = await _pickMed(); if (m != null) setState(() => e.value.name = m); },
+              child: InputDecorator(decoration: cInput().copyWith(suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2)),
+                child: Text(e.value.name ?? 'Select Medicine', overflow: TextOverflow.ellipsis,
+                  style: ct(13, e.value.name == null ? FontWeight.w400 : FontWeight.w500, e.value.name == null ? C2.text3 : C2.text)))), required: true))
+          else
+            Expanded(child: Padding(
+              padding: const EdgeInsets.only(bottom: 10, top: 2),
+              child: RichText(text: TextSpan(
+                text: 'COMBINATION: ${(e.value.name ?? '').toUpperCase()}'
+                    '${e.value.combos.map((c) => ' + ${c.name.toUpperCase()}').join()}',
+                style: ct(11.5, FontWeight.w600, C2.text2),
+                children: [TextSpan(text: ' *', style: ct(11.5, FontWeight.w700, C2.danger))],
+              )),
+            )),
           // Edit combo — bare pencil icon (user 2026-09-18 "remove
           // rounded circle"). Disabled until a primary is picked.
           //
@@ -1502,44 +1636,19 @@ class _PharmaStockState extends State<PharmaStock> {
           if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key)), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         Row(children: [
-          // Dosage Form first (user 2026-09-14) — picking Tab vs Syp
-          // decides the label + input rules of the Dosage box beside
-          // it, so the form belongs upstream in the reading order.
+          // Dosage Form first (user 2026-09-14, restated 2026-09-26) —
+          // picking Tab vs Syp decides whether every dosage box below asks
+          // for mg or ml, so it has to be answered before any of them.
           Expanded(flex: 2, child: CField('Dosage Form', SearchDropdown(
             items: kDosageForms,
             value: kDosageForms.contains(e.value.dosageForm) ? e.value.dosageForm : null,
             onChanged: (v) => setState(() { e.value.dosageForm = v ?? ''; }),
           ), required: true)),
           const SizedBox(width: 8),
-          Expanded(flex: 2, child: () {
-            // Solid forms are counted in mg; syrups / gels / creams are
-            // measured by ml, so widen the label + allow decimal input
-            // for those (user 2026-09-14).
-            final needsQty = dosageFormNeedsQty(e.value.dosageForm);
-            return CField(
-              needsQty ? 'Dosage (mg)' : 'Dosage (ML)',
-              TextField(
-                controller: TextEditingController(text: e.value.dosage),
-                decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
-                keyboardType: needsQty
-                    ? TextInputType.number
-                    : const TextInputType.numberWithOptions(decimal: true),
-                inputFormatters: needsQty
-                    ? [
-                        FilteringTextInputFormatter.digitsOnly,
-                        LengthLimitingTextInputFormatter(3),
-                      ]
-                    : [LengthLimitingTextInputFormatter(12)],
-                onChanged: (v) => e.value.dosage = v,
-              ),
-              required: true,
-            );
-          }()),
-          const SizedBox(width: 8),
           // Qty is always asked on a requisition — even for creams /
           // gels / syrups the pharmacist orders N tubes or bottles,
           // not a bare volume (user 2026-09-14).
-          Expanded(flex: 1, child: CField('Qty', TextField(
+          Expanded(flex: 2, child: CField('Qty', TextField(
             controller: TextEditingController(text: e.value.qty),
             keyboardType: TextInputType.number,
             inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)],
@@ -1547,26 +1656,59 @@ class _PharmaStockState extends State<PharmaStock> {
             onChanged: (v) => e.value.qty = v,
           ), required: true)),
         ]),
-        // Combination partner rows — one dosage input per attached
-        // partner. No inline X: the pencil edit icon above owns
-        // add / remove (user 2026-09-18 "dont do option every
-        // medicine cross icon").
-        for (final c in e.value.combos)
-          Padding(padding: const EdgeInsets.only(top: 4),
-            child: CField(
-              '${c.name} Dosage',
+        // Every dosage box full width, one under the other, in the order the
+        // combination names them: the primary first, then each partner.
+        //
+        // The primary used to sit squeezed between Dosage Form and Qty, and
+        // once it was labelled with its medicine's name that label wrapped to
+        // two lines and dropped its box below the other two — three inputs on
+        // one row, none of them aligned (user 2026-09-26, screenshot). The
+        // partners were already stacked full width, so the first one being
+        // different was the odd one out rather than the rule.
+        //
+        // No inline X on any of them: the pencil edit icon above owns
+        // add / remove (user 2026-09-18 "dont do option every medicine
+        // cross icon").
+        for (final d in [
+          (name: e.value.name, get: () => e.value.dosage, set: (String v) => e.value.dosage = v),
+          for (final c in e.value.combos)
+            (name: c.name, get: () => c.dosage, set: (String v) => c.dosage = v),
+        ])
+          Padding(padding: const EdgeInsets.only(top: 4), child: () {
+            // Solid forms are counted in mg; syrups / gels / creams are
+            // measured by ml, so the label, placeholder, keyboard and input
+            // rules all follow the dosage form picked above — for the
+            // partners too, since they share the primary's form
+            // (user 2026-09-14, extended to partners 2026-09-26).
+            final needsQty = dosageFormNeedsQty(e.value.dosageForm);
+            final unit = needsQty ? 'mg' : 'ML';
+            return CField(
+              // Named once partners are attached, so the boxes read as a list
+              // of named strengths the way the doctor's prescribe card does.
+              // A bare "Dosage" left it ambiguous which medicine it meant.
+              e.value.combos.isEmpty
+                  ? 'Dosage ($unit)'
+                  : '${d.name ?? 'Medicine'} Dosage ($unit)',
               TextField(
-                controller: TextEditingController(text: c.dosage),
-                decoration: cInput('e.g. 500'),
-                keyboardType: dosageFormNeedsQty(e.value.dosageForm)
+                controller: TextEditingController(text: d.get()),
+                decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
+                keyboardType: needsQty
                     ? TextInputType.number
                     : const TextInputType.numberWithOptions(decimal: true),
-                inputFormatters: [LengthLimitingTextInputFormatter(12)],
-                onChanged: (v) => c.dosage = v,
+                inputFormatters: needsQty
+                    ? [
+                        FilteringTextInputFormatter.digitsOnly,
+                        // 4, not 3: a 1000 mg strength exists and could not
+                        // be requested at all, while the doctor's identical
+                        // box has always allowed it (user 2026-09-26).
+                        LengthLimitingTextInputFormatter(4),
+                      ]
+                    : [LengthLimitingTextInputFormatter(12)],
+                onChanged: d.set,
               ),
               required: true,
-            ),
-          ),
+            );
+          }()),
       ]))),
       COutlineButton('Add More', icon: Icons.add_circle_outline, onTap: () => setState(() => reqItems.add(_Req()))),
       const SizedBox(height: 8),
@@ -1818,7 +1960,7 @@ class _PharmaStockState extends State<PharmaStock> {
   Future<void> _editReqCombos(_Req r) async {
     if (r.name == null) return;
     final serverMeds = context.read<MastersStore>().medicineNames();
-    final pool = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final pool = serverMeds;
     final taken = <String>{
       r.name!.toLowerCase(),
       for (final other in reqItems)
@@ -2423,7 +2565,7 @@ class _MedPickerState extends State<_MedPicker> {
     // Server medicine master first (only names the backend can match);
     // the hardcoded list is just the first-launch offline fallback.
     final serverMeds = context.watch<MastersStore>().medicineNames();
-    final options = serverMeds.isNotEmpty ? serverMeds : kMedicineNames;
+    final options = serverMeds;
     final m = options.where((o) => q.isEmpty || o.toLowerCase().contains(q.toLowerCase())).toList();
     return Padding(padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -2484,7 +2626,7 @@ class _PharmaReportState extends State<PharmaReport> {
     final s = context.watch<CounsellorState>();
     final dispensed = s.dispensedPatients;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('Pharmacy Report')),
+      Padding(padding: const EdgeInsets.only(bottom: 8), child: SecBar('Pharmacist Report')),
       _reportCard('Patient Report', 'Dispensed patients & medicines', Icons.description, C2.cyan, 'patient'),
       _reportCard('Stock Report',   'Requisitions raised, dispatch + receive status', Icons.inventory_2, C2.navy, 'stock'),
 
@@ -2615,7 +2757,7 @@ class _PharmaReportState extends State<PharmaReport> {
     }
     final doc = pw.Document();
     doc.addPage(pw.MultiPage(pageFormat: PdfPageFormat.a4.landscape, build: (ctx) => [
-      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacy Patient Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
+      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacist Patient Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
       pw.Text('Period: ${_from.isEmpty ? "—" : _from} to ${_to.isEmpty ? "—" : _to}'),
       pw.SizedBox(height: 6),
       pw.Text('Dispensed patients: ${dispensed.length}    Denied: $denied'),
@@ -2630,7 +2772,7 @@ class _PharmaReportState extends State<PharmaReport> {
         data: rows,
       ),
     ]));
-    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacy_Patient_Report');
+    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacist_Patient_Report');
   }
 
   /// Stock Report PDF — one row per requisition line raised in the picked
@@ -2665,7 +2807,7 @@ class _PharmaReportState extends State<PharmaReport> {
 
     final doc = pw.Document();
     doc.addPage(pw.MultiPage(pageFormat: PdfPageFormat.a4.landscape, build: (ctx) => [
-      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacy Stock Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
+      pw.Header(level: 0, child: pw.Text('JubiCare - Pharmacist Stock Report', style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold))),
       pw.Text('Period: ${_from.isEmpty ? "—" : _from} to ${_to.isEmpty ? "—" : _to}'),
       pw.SizedBox(height: 6),
       pw.Text('Requisitions: ${reqs.length}'),
@@ -2678,7 +2820,7 @@ class _PharmaReportState extends State<PharmaReport> {
         data: rows.isEmpty ? [List.filled(8, '—')] : rows,
       ),
     ]));
-    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacy_Stock_Report');
+    await Printing.layoutPdf(onLayout: (f) => doc.save(), name: 'JubiCare_Pharmacist_Stock_Report');
   }
 }
 
@@ -2921,7 +3063,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Recipient').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Receptionist').toString());
           return;
         }
       }
@@ -3217,7 +3359,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Recipient $_counsellorMarkedBy has marked you present today.',
+              'Receptionist $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),

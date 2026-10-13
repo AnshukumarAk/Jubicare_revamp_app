@@ -226,16 +226,23 @@ void main() {
     });
   });
 
-  test('long-paragraph symptoms do not capture chips — the Jogipur '
-       '"Fever + Sore throat topped by AIDS" case (2026-08-28)', () {
+  test('a narrative paragraph does not outrank real symptoms once the '
+       'village has spoken — the Jogipur "Fever + Sore throat topped by '
+       'AIDS" case (2026-08-28, rescored 2026-08-29)', () {
+    // This test used to assert that AIDS must score BELOW pharyngitis on
+    // symptoms alone, by penalising matches found inside a long narrative
+    // sentence. That two-tier rule was removed on 2026-08-29 because it
+    // also punished genuine symptoms the sheet happens to bury in prose —
+    // Dengue's fever among them. Phrase matching is flat now, so on chips
+    // alone the two genuinely tie, and village_share is what separates
+    // them. This pins that arrangement rather than the rule it replaced.
     final s = TerminologyStore(ApiClient());
     s.debugSetEntries([
       _entry(1, 'AIDS',
           ['aids', 'hiv disease'],
           [
             // The live sheet's seroconversion PARAGRAPH — contains the
-            // words "fever" and "sore throat" inside a narrative
-            // sentence. It must NOT count as a symptom match.
+            // words "fever" and "sore throat" inside a narrative sentence.
             'Acute seroconversion illness 2-6 weeks after exposure in '
                 '50-90% - a glandular-fever-like illness with fever, sore '
                 'throat, a non-pruritic maculopapular rash on the trunk, '
@@ -246,18 +253,35 @@ void main() {
           ['sore throat', 'gala kharab'],
           ['Throat pain', 'Fever', 'Sore throat', 'Headache']),
     ]);
-    final scored = s.likelyConditions(['Fever', 'Sore throat']);
-    final aids = scored.firstWhere((c) => c.name == 'AIDS',
-        orElse: () => const ScoredCondition(name: '-', pct: 0));
-    final phar = scored.firstWhere((c) => c.name == 'Acute pharyngitis',
-        orElse: () => const ScoredCondition(name: '-', pct: 0));
+
+    ScoredCondition pick(List<ScoredCondition> l, String name) =>
+        l.firstWhere((c) => c.name == name,
+            orElse: () => const ScoredCondition(name: '-', pct: 0));
+
+    // No trend data: both matched both chips, so both sit at the case-only
+    // ceiling of 70%. Neither is promoted over the other on symptoms alone.
+    final blind = s.likelyConditions(['Fever', 'Sore throat']);
+    expect(pick(blind, 'Acute pharyngitis').pct, 70);
+    expect(pick(blind, 'AIDS').pct, 70,
+        reason: 'flat phrase matching is deliberate — see the 2026-08-29 '
+            'note in likelyConditions');
+
+    // With the village actually diagnosing sore throats, the real condition
+    // takes the 30% and pulls clear. That is the mechanism which keeps
+    // paragraph noise off the top of the list.
+    final informed = s.likelyConditions(['Fever', 'Sore throat'],
+        trending: [
+          {'term': 'sore throat', 'frequency': 12},
+        ]);
+    final phar = pick(informed, 'Acute pharyngitis');
+    final aids = pick(informed, 'AIDS');
     expect(phar.pct, greaterThan(aids.pct),
-        reason: 'Pharyngitis (short symptom names match both chips) must '
-            'outrank AIDS (only a long paragraph mentions the words); '
-            'got pharyngitis=${phar.pct}% aids=${aids.pct}%');
-    expect(aids.pct, lessThan(40),
-        reason: 'AIDS must not get full case-match credit from a '
-            'narrative paragraph');
+        reason: 'village_share must break the tie; got pharyngitis='
+            '${phar.pct}% aids=${aids.pct}%');
+    expect(informed.first.name, 'Acute pharyngitis');
+    expect(aids.pct, lessThan(80),
+        reason: 'AIDS has no village diagnoses, so it keeps only its '
+            'case-match share');
   });
 
   test('Related symptoms: uses server list when provided, dedupes '

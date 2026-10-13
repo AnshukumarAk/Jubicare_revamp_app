@@ -151,8 +151,15 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
     return Scaffold(
       backgroundColor: JC.bg,
       body: SafeArea(
-        child: SingleChildScrollView(
-          child: Column(children: [
+        // The footer sits on the bottom edge, not under the button. Spacer
+        // needs a bounded height and a scroll view gives it none, so the
+        // content is held to at least one screen and the spare space goes
+        // to the Spacer below (user 2026-09-28).
+        child: LayoutBuilder(builder: (context, viewport) => SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: viewport.maxHeight),
+            child: IntrinsicHeight(
+              child: Column(children: [
             Container(
               width: double.infinity,
               decoration: const BoxDecoration(gradient: JC.headerGradient),
@@ -218,8 +225,24 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
                 ),
               ]),
             ),
-          ]),
-        ),
+            const Spacer(),
+            // Who built this. Asked for on the login screen specifically
+            // (user 2026-09-28) — it is the one screen every user sees
+            // before they are anybody in particular.
+            Text(
+              'Technology Partner: Indev Consultancy Pvt. Ltd',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: Colors.black.withValues(alpha: 0.45),
+              ),
+            ),
+            const SizedBox(height: 14),
+              ]),
+            ),
+          ),
+        )),
       ),
     );
   }

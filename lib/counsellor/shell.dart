@@ -3,15 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:provider/provider.dart';
-import '../api/api_client.dart';
-import '../api/api_errors.dart';
-import '../api/auth_api.dart';
+import '../api/queue_delta.dart';
 import '../api/queues_api.dart';
 import '../api/masters_store.dart';
+import '../api/sync_api.dart';
 import '../api/sync_service.dart';
-import '../screens/unified_login.dart';
+import '../services/logout_flow.dart';
 import '../services/location_service.dart';
-import '../services/fcm_service.dart';
 import '../services/notification_router.dart';
 import '../services/notifications_store.dart';
 import '../services/patients_cache_store.dart';
@@ -178,11 +176,65 @@ class _ShellState extends State<_Shell> {
     } catch (_) {/* first run — nothing cached yet */}
   }
 
-  Future<void> _refreshFromBackend() async {
+  /// Where the next delta starts. Not persisted, so every app start loads
+  /// everything and nothing a delta gets wrong can outlive one session.
+  final _delta = QueueDelta();
+
+  Future<void> _refreshFromBackend({bool full = false}) async {
+    if (!mounted) return;
+    final store = context.read<CounsellorState>();
+    store.setRefreshState(loading: true);
+    if (!full && await _refreshDelta()) {
+      if (mounted) store.setRefreshState(loading: false);
+      return;
+    }
+    await _refreshEverything();
+  }
+
+  /// Ask for the rows that changed, nothing else.
+  ///
+  /// The two list calls below fetch up to 400 rows every refresh to answer
+  /// "did anything happen", and usually nothing did — measured on live, the
+  /// past-7-days list alone averages 20 KB a call.
+  ///
+  /// The tiles come along anyway: they are 0.12 KB, and they are the server's
+  /// own counts, which is what the dashboard shows in preference to the local
+  /// list length. Skipping them to save a tenth of a kilobyte would mean
+  /// showing stale numbers.
+  ///
+  /// False means "load everything instead".
+  Future<bool> _refreshDelta() async {
+    final rows = await _delta.changedRows(context.read<SyncApi>());
+    if (rows == null) return false;
+    if (!mounted) return true;
+    final store = context.read<CounsellorState>();
+    if (rows.isNotEmpty) {
+      store.mergeBackendPatients(rows, additive: true);
+    }
+    try {
+      final api = context.read<QueuesApi>();
+      final tiles = await api.tiles();
+      if (!mounted) return true;
+      store.applyTiles(tiles);
+      // Today's rows too. A delta only carries what changed since the
+      // cursor, and the lists behind the "today" cards are filtered from
+      // whatever this handset holds — so the card could be right and the
+      // list behind it short (user 2026-09-30). The other two shells had
+      // the same hole.
+      final todayRows = await api.today(limit: 500);
+      if (mounted) store.mergeBackendPatients(todayRows.items, additive: true);
+    } catch (_) {/* counts stay as they were — the list is already right */}
+    return true;
+  }
+
+  /// The whole picture. Runs at app start, on pull-to-refresh, and whenever a
+  /// delta declines. Also re-seeds the cursor, and quietly repairs anything
+  /// the deltas missed — a visit soft-deleted on the server never appears in
+  /// a list of changed rows.
+  Future<void> _refreshEverything() async {
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final api = context.read<QueuesApi>();
-    store.setRefreshState(loading: true);
     try {
       // Silent-on-failure (user 2026-08-26: banner stuck even after
       // server came back). Both calls independent + swallow errors;
@@ -199,11 +251,19 @@ class _ShellState extends State<_Shell> {
       final attendedF = api.doctorAttended(limit: 200)
           .then<QueueList?>((v) => v)
           .catchError((_) => null);
-      final results = await Future.wait([tilesF, listF, attendedF]);
+      // Today's whole day, so the "Completed Today" tile and the list it
+      // opens are filtering the same rows. The attended pull above is
+      // capped and ordered by id, so a visit completed today could be
+      // counted by the tile and missing from the list (user 2026-09-30).
+      final todayF = api.today(limit: 500)
+          .then<QueueList?>((v) => v)
+          .catchError((_) => null);
+      final results = await Future.wait([tilesF, listF, attendedF, todayF]);
       if (!mounted) return;
       final tiles = results[0] as Map<String, dynamic>?;
       final list = results[1] as QueueList?;
       final attended = results[2] as QueueList?;
+      final todayRows = results[3] as QueueList?;
       if (tiles != null) store.applyTiles(tiles);
       if (list != null) {
         store.mergeBackendPatients(list.items);
@@ -212,6 +272,9 @@ class _ShellState extends State<_Shell> {
           await cache.save(_patientsCacheKey, list.items);
         } catch (_) {/* best-effort */}
       }
+      // Seed from BOTH lists: whichever carries the newer row decides where
+      // the next delta starts, and starting too early only costs duplicates.
+      _delta.seedFrom([...?list?.items, ...?attended?.items]);
       if (attended != null) {
         // Additive — attended only ADDS its rows (WITH_PHARMACIST + COMPLETED)
         // to the primary past-7-days snapshot. Non-additive would wipe every
@@ -219,6 +282,9 @@ class _ShellState extends State<_Shell> {
         // registrations that never enter the attended list (user 2026-09-02
         // "register today 1 ho gaya but not showing in the list").
         store.mergeBackendPatients(attended.items, additive: true);
+      }
+      if (todayRows != null) {
+        store.mergeBackendPatients(todayRows.items, additive: true);
       }
       store.setRefreshState(loading: false);
     } catch (_) {
@@ -255,7 +321,9 @@ class _ShellState extends State<_Shell> {
       context.read<AppState>().applyBackendUser(freshUser);
     }
     unawaited(context.read<TerminologyStore>().refresh());
-    await _refreshFromBackend();
+    // Everything, not a delta — this is the counsellor asking directly, and
+    // it should be the one gesture that cannot leave anything behind.
+    await _refreshFromBackend(full: true);
     switch (_tab) {
       case 3: _campsRefresh.value++; break;
       case 4: _devicesRefresh.value++; break;
@@ -328,7 +396,7 @@ class _ShellState extends State<_Shell> {
     }
     final initials = widget.userName.isEmpty ? 'C' : widget.userName[0].toUpperCase();
     final pages = [
-      CounDashboard(onRegister: () => _go(2), name: widget.userName, onRefresh: _refreshFromBackend),
+      CounDashboard(onRegister: () => _go(2), name: widget.userName, onRefresh: () => _refreshFromBackend(full: true)),
       // Status → Register tab jump for the Re-Appointment button. Uses the
       // shared CounsellorState.setPrefill so the Register form picks it up on
       // the next frame.
@@ -480,52 +548,7 @@ class _ShellState extends State<_Shell> {
             title: Text('Logout', style: ct(14, FontWeight.w600, C2.text)),
             onTap: () async {
               Navigator.pop(context);
-              if (!await confirmLogout(context)) return;
-              if (!mounted) return;
-              // Center loader so the user sees progress while the
-              // FCM DELETE + auth logout round-trips run — up to a
-              // few seconds on a slow network (user 2026-09-10).
-              showDialog<void>(
-                context: context,
-                barrierDismissible: false,
-                builder: (_) => const Center(child: CircularProgressIndicator()),
-              );
-              // Stop location tracking BEFORE clearing session — otherwise the
-              // sampler keeps firing after logout.
-              context.read<LocationService>().stop();
-              // Kill the FCM registration FIRST so the DELETE call still
-              // carries a valid access token (user 2026-09-10: logout was
-              // racing token-clear vs fcm DELETE; DELETE 401'd and the
-              // server-side FCM row survived, so notifications kept
-              // arriving after logout). AWAIT it with a short cap so a
-              // slow network never blocks the logout tap.
-              try {
-                await FcmService.instance
-                    .unregister(context.read<ApiClient>())
-                    // 2 s, not 5. This is best-effort cleanup and the
-                    // user has already confirmed Logout; holding them
-                    // five seconds on a bad network to tidy up a push
-                    // registration is the wrong trade (2026-09-26).
-                    // It cannot simply move to the background: the
-                    // AuthApi.logout() below clears the very token this
-                    // DELETE needs, and if the user signs back in within
-                    // that window it would clear the NEW session's token.
-                    .timeout(const Duration(seconds: 2));
-              } catch (_) {/* offline — the server auto-cleans on the
-                              next UnregisteredError push */}
-              if (!mounted) return;
-              // Best-effort backend logout (v2 §1.3 — ends every session
-              // for this account on the server). Fire-and-forget after
-              // fcm unregister has finished.
-              unawaited(context.read<AuthApi>().logout().catchError((_) {}));
-              // Wipe user-scoped lists (user rule 2026-08-16).
-              context.read<CounsellorState>().resetForNewUser();
-              context.read<AppState>().logout();
-              // Replace the whole navigation stack with the unified login.
-              Navigator.of(context).pushAndRemoveUntil(
-                MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),
-                (route) => false,
-              );
+              await performLogout(context);
             },
           ),
         ])),

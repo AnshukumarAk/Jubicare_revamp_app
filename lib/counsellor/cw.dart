@@ -9,6 +9,13 @@ class C2 {
   static const yellow = Color(0xFFF5C518);
   static const cyanLight = Color(0xFFE0F5FC);
   static const navyLight = Color(0xFFE8EDF8);
+
+  /// Solid brand blue behind the status badges the field looks at most --
+  /// At Pharmacy, In Progress, With Doctor. A filled badge rather than the
+  /// tinted ones around it, so the stage a case is at reads from across the
+  /// screen (user 2026-09-29). Text on it is [white]; nothing else is
+  /// readable at this depth.
+  static const badgeBlue = Color(0xFF034DA2);
   static const bg = Color(0xFFF0F7FB);
   static const white = Color(0xFFFFFFFF);
   static const text = Color(0xFF1A2D42);
@@ -16,6 +23,16 @@ class C2 {
   static const text3 = Color(0xFF8FA4BC);
   static const border = Color(0xFFD0E8F5);
   static const danger = Color(0xFFE53935);
+
+  /// LAMA, and nothing else.
+  ///
+  /// It used to share [danger] with Delivery Denied and the offline warning,
+  /// which read as something having gone wrong. A visit nobody came back for
+  /// is not an error and not an emergency -- it is a visit that stopped, and
+  /// it wants its own colour. The web portal settled on orange for it, so the
+  /// two now say the same thing in the same shade (user 2026-10-06).
+  static const lama = Color(0xFFEA580C);
+  static const lamaLight = Color(0xFFFFF0E6);
 
   static const headerGrad = LinearGradient(
     begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [navy, cyan]);
@@ -45,6 +62,70 @@ class CCard extends StatelessWidget {
       ),
       clipBehavior: Clip.antiAlias,
       child: onTap == null ? inner : InkWell(onTap: onTap, child: inner),
+    );
+  }
+}
+
+/// A card of rows that only builds the rows you can actually see.
+///
+/// The patient-list screens all wrote `ListView(children: [CCard(Column(...))])`
+/// — a lazy list with exactly one child, which is not lazy at all. Every row
+/// was constructed and laid out on every rebuild, and these screens rebuild on
+/// every keystroke of their search box.
+///
+/// That is invisible on a small team and brutal on a large one. Measured on
+/// live 2026-09-26: the test team carries 12 visits with the pharmacist, but
+/// team 100 carries 140,104 and the queue endpoint returns 200 of them — so a
+/// pharmacist there was rebuilding ~200 rows, seven-odd widgets apiece, per
+/// character typed.
+///
+/// Short lists keep the old widget exactly. They are cheap to build, they hug
+/// their content, and a card that suddenly filled the screen for three rows
+/// would look wrong. Past [_lazyFrom] rows the card already runs off the
+/// bottom of the screen, so a full-height card that scrolls inside itself
+/// looks the same and builds only what is on screen.
+class CLazyRowCard extends StatelessWidget {
+  /// Below this the eager version is used. Roughly a screenful — beyond it
+  /// the card's lower edge is off-screen anyway.
+  static const _lazyFrom = 20;
+
+  final int itemCount;
+  final IndexedWidgetBuilder itemBuilder;
+  final EdgeInsets padding;
+  const CLazyRowCard({
+    super.key,
+    required this.itemCount,
+    required this.itemBuilder,
+    this.padding = const EdgeInsets.fromLTRB(14, 6, 14, 20),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (itemCount <= _lazyFrom) {
+      return ListView(padding: padding, children: [
+        CCard(child: Column(children: [
+          for (var i = 0; i < itemCount; i++) itemBuilder(context, i),
+        ])),
+      ]);
+    }
+    // Same decoration as CCard, minus the bottom margin it uses to space
+    // itself from the next card — there is no next card here.
+    return Padding(
+      padding: padding,
+      child: Container(
+        decoration: BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: C2.cyanLight),
+          boxShadow: C2.shadow,
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: ListView.builder(
+          padding: const EdgeInsets.all(14),
+          itemCount: itemCount,
+          itemBuilder: itemBuilder,
+        ),
+      ),
     );
   }
 }
@@ -176,6 +257,64 @@ class CBadge extends StatelessWidget {
 }
 
 /// Labelled form field wrapper (uppercase muted label, optional required *).
+/// Text with its pre-translation wording one tap away.
+///
+/// Patient remarks are dictated in Hindi and translated to English when the
+/// registration is submitted, and every screen shows the English — that was
+/// asked for (user 2026-08-22, "still remarks showing hindi"). The original
+/// is kept on the server all the same, and a counsellor or doctor re-reading
+/// what the patient actually said needs the words they said, not a machine's
+/// rendering of them. So it is a tap away rather than gone
+/// (user 2026-09-28).
+///
+/// The toggle only appears when there IS an original and it differs from
+/// what is already on screen. A row typed in English, or one written before
+/// translation existed, shows nothing extra.
+class CTranslatedText extends StatefulWidget {
+  /// What to show first — normally the English.
+  final String text;
+
+  /// As dictated. Empty, or equal to [text], hides the toggle.
+  final String original;
+  final TextStyle? style;
+  const CTranslatedText(this.text,
+      {super.key, this.original = '', this.style});
+
+  @override
+  State<CTranslatedText> createState() => _CTranslatedTextState();
+}
+
+class _CTranslatedTextState extends State<CTranslatedText> {
+  bool _showOriginal = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = widget.text.trim();
+    final original = widget.original.trim();
+    final canFlip = original.isNotEmpty && original != shown;
+    final body = (_showOriginal && canFlip) ? original : shown;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(body.isEmpty ? '—' : body,
+          style: widget.style ?? _t(13, FontWeight.w400, C2.text)),
+      if (canFlip)
+        InkWell(
+          onTap: () => setState(() => _showOriginal = !_showOriginal),
+          borderRadius: BorderRadius.circular(4),
+          child: Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 2, right: 6),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(_showOriginal ? Icons.translate : Icons.record_voice_over_outlined,
+                  size: 13, color: C2.cyan),
+              const SizedBox(width: 4),
+              Text(_showOriginal ? 'Show translation' : 'Show original',
+                  style: _t(11.5, FontWeight.w600, C2.cyan)),
+            ]),
+          ),
+        ),
+    ]);
+  }
+}
+
 class CField extends StatelessWidget {
   final String label;
   final Widget child;
@@ -366,7 +505,7 @@ class _DateFieldState extends State<DateField> {
 /// scrollable filtered list. Looks identical to the plain DropdownButtonFormField
 /// when closed; used for pickers with long lists (block, village) where the
 /// default picker becomes unusable. Empty [items] disables interaction.
-class SearchDropdown extends StatelessWidget {
+class SearchDropdown extends StatefulWidget {
   final List<String> items;
   final String? value;
   final String hint;
@@ -382,23 +521,62 @@ class SearchDropdown extends StatelessWidget {
   });
 
   @override
+  State<SearchDropdown> createState() => _SearchDropdownState();
+}
+
+class _SearchDropdownState extends State<SearchDropdown> {
+  /// Somewhere for focus to go that is not a text field.
+  ///
+  /// `unfocus()` was not enough: the framework restores focus while the
+  /// sheet's route is still popping, so dropping it the instant the await
+  /// returns happens too early and the restore puts it straight back on the
+  /// symptom box — the keyboard reopened there and the next thing typed
+  /// went into Symptoms (user 2026-09-30). Focus that is HELD cannot be
+  /// handed anywhere. Same sink the doctor's case screen uses for its own
+  /// pickers, where the bug has never appeared.
+  final FocusNode _sink =
+      FocusNode(skipTraversal: true, debugLabel: 'search-dropdown-sink');
+
+  @override
+  void dispose() {
+    _sink.dispose();
+    super.dispose();
+  }
+
+  void _park() {
+    if (_sink.canRequestFocus) _sink.requestFocus();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final items = widget.items;
+    final value = widget.value;
+    final hint = widget.hint;
     final disabled = items.isEmpty;
-    return InkWell(
+    return Focus(
+      focusNode: _sink,
+      child: InkWell(
       onTap: disabled ? null : () async {
-        // Drop primary focus BEFORE opening the sheet. Without this the
-        // framework hands focus back to the last-focused TextField when
-        // the sheet closes, and the enclosing scroll view auto-scrolls
-        // up to reveal it — the form "jumped to top" whenever the
-        // Doctor / Block / Village picker was used (user bug 2026-08-14).
-        FocusManager.instance.primaryFocus?.unfocus();
+        // Park BEFORE opening: without it the enclosing scroll view chases
+        // whatever text field held focus when the sheet closes, and the
+        // form jumped to the top (user 2026-08-14).
+        _park();
         final picked = await showModalBottomSheet<String>(
           context: context,
           isScrollControlled: true,
           backgroundColor: Colors.transparent,
-          builder: (_) => _SearchSheet(items: items, current: value, hint: searchLabel ?? 'Search $hint'),
+          builder: (_) => _SearchSheet(
+              items: items, current: value,
+              hint: widget.searchLabel ?? 'Search $hint'),
         );
-        if (picked != null) onChanged(picked);
+        if (!mounted) return;
+        // And again on the way out, after the frame the route pops on, so
+        // the restore has nothing left to restore to.
+        _park();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _park();
+        });
+        if (picked != null) widget.onChanged(picked);
       },
       child: InputDecorator(
         decoration: cInput().copyWith(
@@ -411,6 +589,7 @@ class SearchDropdown extends StatelessWidget {
               value == null ? C2.text3 : C2.text),
         ),
       ),
+    ),
     );
   }
 }
