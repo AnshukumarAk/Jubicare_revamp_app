@@ -1245,7 +1245,10 @@ class CounsellorState extends ChangeNotifier {
           .where((p) => _within7Days(p.regDate)));
 
   String nextId() => 'P${_seq++}';
-  String nextUniqueCode() => 'GN-${(_seq).toString().padLeft(4, '0')}';
+  // Server assigns the real code (NO-DDMMYYYY-NNN, daily per block) on
+  // sync; a local guess would show a wrong number until then, so leave
+  // it blank — every list already hides an empty code (2026-10-13).
+  String nextUniqueCode() => '';
 
   String addPatient(CPatient p) {
     patients.insert(0, p);

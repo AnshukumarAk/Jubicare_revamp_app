@@ -9,6 +9,7 @@ import '../counsellor/cstate.dart';
 import '../counsellor/cw.dart' show confirmLogout;
 import '../screens/unified_login.dart';
 import '../state/app_state.dart';
+import 'analytics_service.dart';
 import 'fcm_service.dart';
 import 'location_service.dart';
 
@@ -52,10 +53,16 @@ Future<void> performLogout(BuildContext context) async {
   // Wipe user-scoped lists so the next person on this handset never sees the
   // previous one's rows (user rule 2026-08-16).
   context.read<CounsellorState>().resetForNewUser();
+  // Analytics logout event + clear user id (user 2026-10-13). Read
+  // the role BEFORE AppState.logout() wipes it.
+  final appState = context.read<AppState>();
+  final roleName = appState.currentRole?.name ?? 'unknown';
+  unawaited(AnalyticsService.instance.logLogout(roleName));
+  unawaited(AnalyticsService.instance.clearUser());
   // Clears AuthPersistence, so the push handlers stop accepting messages
   // immediately. It does NOT clear TokenStore — that is AuthApi.logout()'s
   // job below, which is why the background calls still have a token to use.
-  context.read<AppState>().logout();
+  appState.logout();
 
   navigator.pushAndRemoveUntil(
     MaterialPageRoute(builder: (_) => const UnifiedLoginScreen()),

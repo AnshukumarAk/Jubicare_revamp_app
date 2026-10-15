@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -22,6 +21,7 @@ import 'ddata.dart';
 import '../counsellor/cdata.dart' show ScoredDisease;
 import 'disease_master.dart';
 import 'doctor_db_loader.dart';
+import 'past_history_card.dart';
 import '../services/deepgram_stt.dart';
 
 class DoctorCaseDetails extends StatefulWidget {
@@ -792,10 +792,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ])),
           // registration details (read-only, filled by counsellor)
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Receptionist', bg: C2.cyanLight, fg: C2.cyan)]),
-            _kv('Symptoms', p.symptoms.isNotEmpty
-                ? p.symptoms.join(', ')
-                : (_loadingRegDetail ? 'Loading…' : '—')),
+            Row(children: [const Expanded(child: SecBar('Registration Details')), CBadge('By Patient Coordinator', bg: C2.cyanLight, fg: C2.cyan)]),
+            // Symptoms row removed (user 2026-10-14) — the Patient
+            // Coordinator no longer takes symptoms at registration; the
+            // doctor records them in Symptoms & Diagnosis below.
             // Label matches patient_history.dart (user 2026-08-22 rename).
             // p.remarks is set by _applyRegistrationDetail with the English
             // version preferred (counsellor_remarks_english), falling back
@@ -850,29 +850,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // a tabular history dialog (rule 2026-08-05). Doctor sees a
           // structured view of past consultations and past prescriptions
           // instead of two long stacked lists inline.
-          CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const SecBar('Past Medical History and Prescription'),
-            const SizedBox(height: 4),
-            Row(children: [
-              Expanded(child: _historyChip(
-                label: 'Dx',
-                icon: Icons.history_edu_outlined,
-                count: _pxCount(),
-                onTap: () => _openPxHistory(),
-              )),
-              const SizedBox(width: 8),
-              Expanded(child: _historyChip(
-                label: 'Rx',
-                icon: Icons.medication_outlined,
-                count: p.previousRx.length,
-                onTap: () => _openRxHistory(),
-              )),
-            ]),
-            if (_pxCount() == 0 && p.previousRx.isEmpty)
-              Padding(padding: const EdgeInsets.only(top: 8),
-                child: Text('No prescriptions or reports on record.',
-                    style: ct(12, FontWeight.w400, C2.text2))),
-          ])),
+          // Past Medical History — date-wise cards (Dx + Rx + files of a
+          // day together), newest first, 10 + "Show more" (user
+          // 2026-10-13). Replaces the separate Dx / Rx table dialogs.
+          PastMedicalHistoryCard(patient: p),
           // symptoms & diagnosis
           CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const SecBar('Symptoms & Diagnosis'),
@@ -2156,33 +2137,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       builder: (_) => _PickerSheet(title: title, options: options));
   }
 
-  void _viewUploadedRx(String path) {
-    final file = File(path);
-    showDialog(context: context, builder: (_) => Dialog(
-      backgroundColor: C2.white,
-      child: Padding(padding: const EdgeInsets.all(12), child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('Uploaded Prescription', style: ct(14.5, FontWeight.w700, C2.navy)),
-        const SizedBox(height: 4),
-        Text(path.split('/').last, style: ct(11, FontWeight.w400, C2.text2)),
-        const SizedBox(height: 10),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 420),
-          child: file.existsSync()
-            ? InteractiveViewer(child: Image.file(file, fit: BoxFit.contain))
-            : Container(padding: const EdgeInsets.all(24), alignment: Alignment.center,
-                decoration: BoxDecoration(color: C2.bg, borderRadius: BorderRadius.circular(8)),
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.image_not_supported_outlined, size: 36, color: C2.text3),
-                  const SizedBox(height: 8),
-                  Text('Image preview not available on this device.', textAlign: TextAlign.center, style: ct(12, FontWeight.w400, C2.text2)),
-                ])),
-        ),
-        const SizedBox(height: 8),
-        Align(alignment: Alignment.centerRight, child: TextButton(onPressed: () => Navigator.pop(context), child: Text('Close', style: ct(13, FontWeight.w700, C2.cyan)))),
-      ])),
-    ));
-  }
-
   /// Label above value, each taking the full width.
   ///
   /// It was a 90px label column with the value beside it, which left a
@@ -2204,180 +2158,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ),
         ]),
       );
-
-  // ═════════════ Px + Rx history (rule 2026-08-05) ═════════════
-  // Prescription & Reports section renders two chip buttons; tapping each
-  // opens a modal dialog with a table of historical rows.
-
-  /// Total count for the Dx chip badge: past-history + attached
-  /// reports/prescriptions. The CURRENT visit's provisional diagnosis
-  /// (p.disease) is deliberately NOT counted — it isn't history, and it
-  /// made the dialog show "past" data the counsellor never entered
-  /// (user bug report 2026-08-14). A genuine previous diagnosis reaches
-  /// here via the re-appointment carry-forward tag inside pastHistory.
-  int _pxCount() {
-    var c = 0;
-    if (p.pastHistory.trim().isNotEmpty) c++;
-    c += p.attachments.length;
-    return c;
-  }
-
-  Widget _historyChip({
-    required String label,
-    required IconData icon,
-    required int count,
-    required VoidCallback onTap,
-  }) {
-    // Outline style (user 2026-08-18): white face, navy border, black
-    // label. Icon sits in a soft tinted square and the count is a solid
-    // navy pill so the tap target reads as a proper control, not a bare
-    // box.
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
-        decoration: BoxDecoration(
-          color: C2.white,
-          border: Border.all(color: C2.navy, width: 1.2),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(children: [
-          Container(
-            width: 30,
-            height: 30,
-            decoration: BoxDecoration(
-              color: C2.cyanLight,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Icon(icon, size: 17, color: C2.navy),
-          ),
-          const SizedBox(width: 8),
-          Expanded(child: Row(children: [
-            Text(label, style: ct(15, FontWeight.w800, Colors.black)),
-            const SizedBox(width: 6),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-              decoration: BoxDecoration(
-                color: C2.navy,
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Text('$count', style: ct(10.5, FontWeight.w700, Colors.white)),
-            ),
-          ])),
-          const Icon(Icons.chevron_right, size: 18, color: C2.navy),
-        ]),
-      ),
-    );
-  }
-
-  void _openPxHistory() {
-    // Rows for Dx = past consultations table. Sourced from:
-    //  - Past Medical History text (one row, no date) — includes the
-    //    re-appointment carry-forward "Previous Diagnosis (date): X" tag
-    //  - Each counsellor-uploaded attachment (Report / Other) with its
-    //    kind + description. Attachment rows are tappable → the previously
-    //    captured image opens in an interactive viewer.
-    // The current visit's provisional diagnosis is NOT listed here — the
-    // doctor already sees it in Symptoms & Diagnosis, and presenting it
-    // as a past consultation fabricated history (user bug 2026-08-14).
-    final rows = <_HistoryRow>[];
-    if (p.pastHistory.trim().isNotEmpty) {
-      rows.add(_HistoryRow(cells: ['—', 'Past History', p.pastHistory.trim()]));
-    }
-    for (final a in p.attachments) {
-      rows.add(_HistoryRow(
-        cells: [
-          p.regDate.isEmpty ? '—' : p.regDate,
-          a.kind.label,
-          a.description.isEmpty ? a.path.split(RegExp(r'[\\/]+')).last : a.description,
-        ],
-        onTap: () => _viewUploadedRx(a.path),
-      ));
-    }
-    _openHistoryDialog(
-      title: 'Dx',
-      icon: Icons.history_edu_outlined,
-      headers: const ['Date', 'Type', 'Details'],
-      rows: rows,
-      empty: 'No past consultation records on file.',
-    );
-  }
-
-  void _openRxHistory() {
-    // Rows for Rx = past prescriptions table. One row per PrevRx entry.
-    final rows = p.previousRx.map((r) => _HistoryRow(cells: [
-      r.date,
-      r.medicine,
-      r.dosage.isEmpty ? '—' : displayDosage(r.dosage),
-      r.frequency.isEmpty ? '—' : r.frequency,
-      r.duration.isEmpty ? '—' : r.duration,
-    ])).toList();
-    _openHistoryDialog(
-      title: 'Rx',
-      icon: Icons.medication_outlined,
-      headers: const ['Date', 'Medicine', 'Dosage', 'Frequency', 'Duration'],
-      rows: rows,
-      empty: 'No prescriptions on file yet.',
-    );
-  }
-
-  /// Shared Px/Rx dialog. Header + scrollable structured table + Close.
-  void _openHistoryDialog({
-    required String title,
-    required IconData icon,
-    required List<String> headers,
-    required List<_HistoryRow> rows,
-    required String empty,
-  }) {
-    showDialog(context: context, builder: (_) => Dialog(
-      backgroundColor: C2.white,
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 640, maxHeight: 520),
-        child: Padding(padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Row(children: [
-              Icon(icon, size: 18, color: C2.navy),
-              const SizedBox(width: 8),
-              Expanded(child: Text(title, style: ct(15, FontWeight.w700, C2.navy))),
-              InkWell(onTap: () => Navigator.pop(context),
-                child: const Padding(padding: EdgeInsets.all(4), child: Icon(Icons.close, size: 18, color: C2.text2))),
-            ]),
-            const SizedBox(height: 6),
-            Container(height: 1, color: C2.border),
-            const SizedBox(height: 8),
-            if (rows.isEmpty)
-              Padding(padding: const EdgeInsets.symmetric(vertical: 24),
-                child: Center(child: Text(empty, style: ct(12.5, FontWeight.w400, C2.text2))))
-            else
-              Flexible(child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SingleChildScrollView(
-                  child: DataTable(
-                    headingRowColor: WidgetStatePropertyAll(C2.cyanLight),
-                    headingTextStyle: ct(11.5, FontWeight.w800, C2.navy),
-                    dataTextStyle: ct(12, FontWeight.w500, C2.text),
-                    columnSpacing: 16,
-                    horizontalMargin: 8,
-                    columns: [for (final h in headers) DataColumn(label: Text(h))],
-                    rows: [for (final r in rows) DataRow(
-                      onSelectChanged: r.onTap == null ? null : (_) { Navigator.pop(context); r.onTap!(); },
-                      cells: [for (final c in r.cells) DataCell(Text(c, style: ct(12, FontWeight.w500, C2.text)))],
-                    )],
-                  ),
-                ),
-              )),
-            const SizedBox(height: 6),
-            Align(alignment: Alignment.centerRight,
-              child: TextButton(onPressed: () => Navigator.pop(context),
-                child: Text('Close', style: ct(13, FontWeight.w700, C2.cyan)))),
-          ]),
-        ),
-      ),
-    ));
-  }
 
   // Mirrors the counsellor Register form's _toggle helper so the two
   // Vitals sections look identical.
@@ -2813,12 +2593,3 @@ class _DiseasePickerSheetState extends State<_DiseasePickerSheet> {
   }
 }
 
-/// Row model for the Px + Rx tabular history dialogs (rule 2026-08-05).
-/// `cells` maps 1:1 with the dialog's column headers. `onTap` is optional
-/// — when non-null the row is selectable (currently used for attachment
-/// rows in the Px table, which open the uploaded image).
-class _HistoryRow {
-  final List<String> cells;
-  final VoidCallback? onTap;
-  _HistoryRow({required this.cells, this.onTap});
-}

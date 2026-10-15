@@ -1,5 +1,8 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
+
+import 'package:firebase_core/firebase_core.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -23,7 +26,9 @@ import 'api/token_store.dart';
 import 'api/uploads_api.dart';
 import 'models/models.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 
+import 'services/analytics_service.dart';
 import 'services/fcm_service.dart';
 import 'services/notification_router.dart';
 import 'services/terminology_store.dart';
@@ -72,6 +77,23 @@ void main() async {
   try {
     FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   } catch (_) {/* Firebase not initialised — push simply stays off */}
+
+  // Crashlytics — forward every uncaught Flutter error + platform
+  // error to Firebase so the Crashlytics console actually shows live
+  // crashes (user 2026-10-13). Analytics init is deferred until after
+  // Firebase.initializeApp completes below.
+  FlutterError.onError = (details) {
+    if (Firebase.apps.isNotEmpty) {
+      FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+    }
+    FlutterError.presentError(details);
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    if (Firebase.apps.isNotEmpty) {
+      FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+    }
+    return true;
+  };
 
   // Build the API layer once — the client is stateless w.r.t. the user
   // (tokens live in TokenStore, session in AuthPersistence) so a single
@@ -133,6 +155,19 @@ void main() async {
     mastersStore.hydrate().catchError((_) {}),
   ]);
   final StoredSession? session = initResults[1] as StoredSession?;
+
+  // Analytics init runs after Firebase.initializeApp returns from
+  // firebase.ensureInitialized above; no-op if init failed. Also
+  // arm Crashlytics collection explicitly so release builds send
+  // reports (debug builds still collect but you'll see them in the
+  // console labelled debug). User 2026-10-13.
+  if (Firebase.apps.isNotEmpty) {
+    unawaited(AnalyticsService.instance.init());
+    try {
+      await FirebaseCrashlytics.instance
+          .setCrashlyticsCollectionEnabled(true);
+    } catch (_) {/* non-fatal */}
+  }
 
   // If the app opens online with pending offline actions, drain right
   // away — this is safest even when the user hasn't signed in yet
@@ -348,6 +383,13 @@ class JubiCareApp extends StatelessWidget {
         debugShowCheckedModeBanner: false,
         theme: buildJubiCareTheme(),
         navigatorKey: _rootNavigator,
+        // Auto-log screen_view events to Firebase Analytics on every
+        // route push/pop so the console's "Views by screen" tile fills
+        // in without touching individual screens (user 2026-10-13).
+        navigatorObservers: [
+          if (AnalyticsService.instance.observer != null)
+            AnalyticsService.instance.observer!,
+        ],
         home: Builder(builder: (context) {
           if (session != null) return _homeForSession(context);
           return const SplashScreen();

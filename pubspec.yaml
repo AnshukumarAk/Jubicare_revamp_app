@@ -1,7 +1,7 @@
 name: jubicare_mmu
 description: JubiCare MMU mobile prototype — Counselor, Doctor, Pharmacist workflow with modernized UI, simulated voice capture and AI clinical decision support.
 publish_to: 'none'
-version: 0.24.0+51
+version: 2.0.0+201
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -57,6 +57,11 @@ dependencies:
   flutter_local_notifications: ^22.3.0
   timezone: ^0.11.1
   firebase_messaging: ^15.2.10
+  # Analytics + Crashlytics (user 2026-10-13) — ship crash reports and
+  # usage events to the jubicare-revamp-app Firebase project so the
+  # dashboard shows live DAU, screens, and crash traces.
+  firebase_analytics: ^11.3.3
+  firebase_crashlytics: ^4.1.3
 dev_dependencies:
   # Dev only — nothing here is compiled into the APK. Added 2026-09-26 so the
   # sync-row adapter has tests; the two test files under test/ predate it and

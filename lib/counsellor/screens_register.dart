@@ -528,9 +528,6 @@ class _CounRegisterState extends State<CounRegister> {
     // profile (rule 2026-07-29); only block + village are picked here.
     if (block == null) return err('Select block');
     if (village == null) return err('Select village');
-    // Symptoms are mandatory (user 2026-08-22) — a visit with no recorded
-    // complaint gives the doctor and the advisory nothing to work from.
-    if (symptoms.isEmpty) return err('Select at least one symptom');
     if (doctor == null) return err('Select doctor assignment');
     // Aadhaar and PIN are optional, but a HALF-typed one is not. Both used
     // to be dropped from the payload unless they matched exactly, which
@@ -1167,7 +1164,7 @@ class _CounRegisterState extends State<CounRegister> {
               ),
           ],
         ],
-        CField('Know', _radios(['Age','Date of Birth'], knowAge ? 'Age' : 'Date of Birth', (v) => setState(() => knowAge = v == 'Age')), required: true),
+        CField('Age/Date of Birth', _radios(['Age','Date of Birth'], knowAge ? 'Age' : 'Date of Birth', (v) => setState(() => knowAge = v == 'Age')), required: true),
         if (knowAge)
           CField('Age (Years)', TextField(controller: _age, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 28').copyWith(errorText: _ageErr())), required: true)
         else
@@ -1234,40 +1231,9 @@ class _CounRegisterState extends State<CounRegister> {
         }),
       ])),
 
-      // SYMPTOMS (its own section, not part of Advance Details)
-      CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        // Section header carries the required marker — submit blocks when
-        // symptoms is empty (user 2026-09-02 asterisk audit).
-        const SecBar('Symptoms of the Patient', required: true),
-        SymptomField(
-          selected: symptoms,
-          block: block,
-          // Village panel deliberately HIDDEN on Register (user
-          // 2026-08-27) — trending still fetched below so the Likely
-          // Conditions card keeps its village-share bonus; only the
-          // visible "Common in <village>" chip strip is suppressed.
-          hideVillagePanel: true,
-          // Counsellor Register no longer surfaces Likely Conditions
-          // (user 2026-09-10). Doctor Case Details keeps it — that
-          // instance leaves the flag unset (default false).
-          hideLikelyPanel: true,
-          placeName: village ?? block,
-          trending: _previewTrending,
-          serverRelated: _previewRelated,
-          serverLikely: _previewLikely,
-          loading: _previewLoading,
-          error: _previewError,
-          onRetry: () {
-            setState(() { _previewError = false; _previewLoading = true; });
-            _lastPreviewKey = '';
-            _fetchPreview();
-          },
-          onChanged: (v) => setState(() {
-            symptoms..clear()..addAll(v);
-            _schedulePreview();
-          }),
-        ),
-      ])),
+      // Symptoms section removed from Registration (user 2026-10-13) —
+      // the doctor captures symptoms on Case Details instead. The
+      // `symptoms` list stays (empty) so the payload shape is unchanged.
 
       // ADVANCE (collapsible)
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
