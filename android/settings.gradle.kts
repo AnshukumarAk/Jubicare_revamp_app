@@ -24,6 +24,10 @@ plugins {
     // Reads android/app/google-services.json so Firebase (FCM push +
     // Firestore location bridge) can initialise (ATTEND task D1).
     id("com.google.gms.google-services") version "4.4.2" apply false
+    // Crashlytics Gradle plugin (user 2026-10-13) — uploads NDK symbols
+    // and Dart obfuscation mapping so stack traces are readable in the
+    // Firebase Crashlytics console.
+    id("com.google.firebase.crashlytics") version "3.0.2" apply false
 }
 
 include(":app")

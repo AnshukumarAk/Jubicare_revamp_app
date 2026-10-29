@@ -1150,9 +1150,28 @@ class _Req {
   /// future server-side grouping can pick them up without a mobile
   /// resubmit.
   List<_ReqCombo> combos;
-  _Req({this.name, this.dosage = '', this.unit = 'Strip', this.qty = '10',
+  /// Controllers live on the row, not in build(). A controller created
+  /// inline is replaced on every rebuild, which wipes the composing
+  /// region mid-word: the first keystroke after the keyboard opened
+  /// went nowhere and only a second tap into the box made typing stick
+  /// (user 2026-10-14).
+  final TextEditingController qtyCtl;
+  final TextEditingController dosageCtl;
+  _Req({this.name, String dosage = '', this.unit = 'Strip', String qty = '10',
         this.dosageForm = 'Tab', List<_ReqCombo>? combos})
-      : combos = combos ?? <_ReqCombo>[];
+      : dosage = dosage,
+        qty = qty,
+        qtyCtl = TextEditingController(text: qty),
+        dosageCtl = TextEditingController(text: dosage),
+        combos = combos ?? <_ReqCombo>[];
+
+  void dispose() {
+    qtyCtl.dispose();
+    dosageCtl.dispose();
+    for (final c in combos) {
+      c.dispose();
+    }
+  }
 }
 
 /// One combination partner on a requisition row. Frequency / qty /
@@ -1160,7 +1179,12 @@ class _Req {
 class _ReqCombo {
   String name;
   String dosage;
-  _ReqCombo({required this.name, this.dosage = ''});
+  final TextEditingController dosageCtl;
+  _ReqCombo({required this.name, String dosage = ''})
+      : dosage = dosage,
+        dosageCtl = TextEditingController(text: dosage);
+
+  void dispose() => dosageCtl.dispose();
 }
 
 const List<String> _kMedUnits = ['Tab', 'Strip', 'Bottle', 'Vial', 'Sachet', 'ml', 'Ampoule', 'Tube', 'Piece'];
@@ -1234,6 +1258,7 @@ class _PharmaStockState extends State<PharmaStock> {
   void dispose() {
     _sync?.removeListener(_onSyncTick);
     _fcmStockSub?.cancel();
+    for (final r in reqItems) { r.dispose(); }
     super.dispose();
   }
 
@@ -1327,6 +1352,7 @@ class _PharmaStockState extends State<PharmaStock> {
     }
     if (top.isEmpty) return;
     setState(() {
+      for (final r in reqItems) { r.dispose(); }
       reqItems
         ..clear()
         ..addAll(top.map((n) {
@@ -1555,6 +1581,7 @@ class _PharmaStockState extends State<PharmaStock> {
         final tpl = s.consumeReorderTemplate();
         if (tpl == null) return;
         setState(() {
+          for (final r in reqItems) { r.dispose(); }
           reqItems
             ..clear()
             // Pre-fill ALL past items (user 2026-08-26 — the earlier
@@ -1633,7 +1660,7 @@ class _PharmaStockState extends State<PharmaStock> {
                   color: e.value.name == null ? C2.text3 : C2.navy),
             ),
           ),
-          if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key)), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
+          if (reqItems.length > 1) IconButton(onPressed: () => setState(() => reqItems.removeAt(e.key).dispose()), icon: const Icon(Icons.close, size: 18, color: C2.text2)),
         ]),
         Row(children: [
           // Dosage Form first (user 2026-09-14, restated 2026-09-26) —
@@ -1649,7 +1676,7 @@ class _PharmaStockState extends State<PharmaStock> {
           // gels / syrups the pharmacist orders N tubes or bottles,
           // not a bare volume (user 2026-09-14).
           Expanded(flex: 2, child: CField('Qty', TextField(
-            controller: TextEditingController(text: e.value.qty),
+            controller: e.value.qtyCtl,
             keyboardType: TextInputType.number,
             inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)],
             decoration: cInput(),
@@ -1670,9 +1697,10 @@ class _PharmaStockState extends State<PharmaStock> {
         // add / remove (user 2026-09-18 "dont do option every medicine
         // cross icon").
         for (final d in [
-          (name: e.value.name, get: () => e.value.dosage, set: (String v) => e.value.dosage = v),
+          (name: e.value.name, ctl: e.value.dosageCtl,
+           set: (String v) => e.value.dosage = v),
           for (final c in e.value.combos)
-            (name: c.name, get: () => c.dosage, set: (String v) => c.dosage = v),
+            (name: c.name, ctl: c.dosageCtl, set: (String v) => c.dosage = v),
         ])
           Padding(padding: const EdgeInsets.only(top: 4), child: () {
             // Solid forms are counted in mg; syrups / gels / creams are
@@ -1690,7 +1718,7 @@ class _PharmaStockState extends State<PharmaStock> {
                   ? 'Dosage ($unit)'
                   : '${d.name ?? 'Medicine'} Dosage ($unit)',
               TextField(
-                controller: TextEditingController(text: d.get()),
+                controller: d.ctl,
                 decoration: cInput(needsQty ? 'e.g. 500' : 'e.g. 100 ml'),
                 keyboardType: needsQty
                     ? TextInputType.number
@@ -1788,7 +1816,7 @@ class _PharmaStockState extends State<PharmaStock> {
       // Blank the form, then immediately re-arm the history prefill so
       // coming back from the Past tab shows a filled form again instead
       // of a single empty row (user 2026-08-21).
-      setState(() { reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
+      setState(() { for (final r in reqItems) { r.dispose(); } reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
       _maybePrefillFromHistory();
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         content: Text('Requisition submitted · Awaiting approval'),
@@ -1837,7 +1865,7 @@ class _PharmaStockState extends State<PharmaStock> {
           audit: [AuditEntry(when: now, actor: 'Pharmacist', action: 'Submitted (offline)')],
         ));
         if (!mounted) return;
-        setState(() { reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
+        setState(() { for (final r in reqItems) { r.dispose(); } reqItems..clear()..add(_Req()); _didPrefill = false; tab = 1; });
         _maybePrefillFromHistory();
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Offline — saved locally, will sync when back online'),
@@ -1994,6 +2022,10 @@ class _PharmaStockState extends State<PharmaStock> {
       final existing = <String, _ReqCombo>{
         for (final c in r.combos) c.name: c,
       };
+      final keep = result.toSet();
+      for (final e in existing.entries) {
+        if (!keep.contains(e.key)) e.value.dispose();
+      }
       r.combos
         ..clear()
         ..addAll([
@@ -3063,7 +3095,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Receptionist').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Patient Coordinator').toString());
           return;
         }
       }
@@ -3359,7 +3391,7 @@ class _PharmaAttendanceState extends State<PharmaAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Receptionist $_counsellorMarkedBy has marked you present today.',
+              'Patient Coordinator $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),

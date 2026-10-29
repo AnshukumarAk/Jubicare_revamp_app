@@ -37,12 +37,18 @@ class CounDashboard extends StatelessWidget {
     final today = s.backendRegisteredToday ?? s.registeredToday;
     final done = s.backendVisitsCompleted ?? s.visitsCompleted;
     final past7 = s.backendPast7DaysTotal ?? s.counsellorPast7Days.length;
-    // "Registered Patients (Today)" section — filter the shared patient
-    // list to just today's rows so the counsellor sees the day's work
-    // (older visits are one tap away via the stat tiles).
-    final todaysList = s.patients.where((p) => p.registeredOn == 'Today').toList();
+    // "Registered Patients (Today)" section — PENDING-only, oldest
+    // first (user 2026-10-13 "jo pahle aaya hai usko pahle dekhega").
+    // Completed visits move to the "Completed Today" tile beside it,
+    // so Home stays a working queue, not a history scroll.
+    final todaysList = s.patients
+        .where((p) => p.registeredOn == 'Today' && p.status != 'completed')
+        .toList()
+      ..sort((a, b) =>
+          (a.backendAppointmentId ?? 1 << 30)
+              .compareTo(b.backendAppointmentId ?? 1 << 30));
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      GradGreeting(name: name, sub: 'Receptionist Dashboard', initials: initials),
+      GradGreeting(name: name, sub: 'Patient Coordinator Dashboard', initials: initials),
       // Sync status moved to the app-bar cloud icon (user 2026-08-14) —
       // tap it for the counts + a "Sync now" action.
       // Backend refresh status: thin loading bar while the shell's
@@ -127,7 +133,14 @@ class _PatientRow extends StatelessWidget {
           Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
             const SizedBox(height: 1),
-            Text('${p.age}y · ${p.symptoms.take(2).join(', ')}', style: ct(11.5, FontWeight.w400, C2.text2)),
+            // Age · village (block if no village). Symptoms are no longer
+            // taken at registration, so they left a dangling "24y ·"
+            // (user 2026-10-13).
+            Text([
+              '${p.age}y',
+              if (p.village.trim().isNotEmpty) p.village.trim()
+              else if (p.block.trim().isNotEmpty) p.block.trim(),
+            ].join(' · '), style: ct(11.5, FontWeight.w400, C2.text2)),
           ])),
           CBadge(label, bg: bg, fg: fg),
         ]),

@@ -585,44 +585,38 @@ class _DoctorDashboardState extends State<DoctorDashboard>
       const SizedBox(height: 14),
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         const SecBar('Patient Queue'),
-        if (s.doctorQueue.isEmpty)
-          Padding(padding: const EdgeInsets.all(16), child: Center(child: Text('No patients in queue', style: ct(12, FontWeight.w400, C2.text2))))
-        else
-          ...s.doctorQueue.take(5).map((p) => QueueRow(p: p, sub: '${p.age}y · ${p.symptoms.take(2).join(', ')}',
-            badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
-            badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
-            badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
-            onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))),
-        if (s.doctorQueue.length > 5)
-          Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${s.doctorQueue.length} · tap "In Queue" to view all', style: ct(11, FontWeight.w500, C2.text2))),
+        // Pending patients only, oldest-first (user 2026-10-13 "jo
+        // pahle aaya hai usko pahle dekhega"). Completed cases moved
+        // to the "Completed Today" tile above — Home stays a working
+        // queue, not a history scroll.
+        () {
+          final pending = List.of(s.doctorQueue)
+            ..sort((a, b) => (a.backendAppointmentId ?? 1 << 30)
+                .compareTo(b.backendAppointmentId ?? 1 << 30));
+          if (pending.isEmpty) {
+            return Padding(padding: const EdgeInsets.all(16), child: Center(child: Text('No patients in queue', style: ct(12, FontWeight.w400, C2.text2))));
+          }
+          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            // Age · village (block if no village) — same as the
+            // counsellor Home row (user 2026-10-13).
+            ...pending.take(5).map((p) => QueueRow(p: p, sub: [
+              '${p.age}y',
+              if (p.village.trim().isNotEmpty) p.village.trim()
+              else if (p.block.trim().isNotEmpty) p.block.trim(),
+            ].join(' · '),
+              badge: p.status == 'registered' ? 'Waiting' : 'In Progress',
+              badgeBg: p.status == 'registered' ? const Color(0xFFFEF7E0) : C2.badgeBlue,
+              badgeFg: p.status == 'registered' ? const Color(0xFFB8860B) : C2.white,
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DoctorCaseDetails(patient: p))))),
+            if (pending.length > 5)
+              Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${pending.length} · tap "In Queue" to view all', style: ct(11, FontWeight.w500, C2.text2))),
+          ]);
+        }(),
       ])),
-      // Attended (view-only)
-      CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        const SecBar('Attended Patients'),
-        if (s.doctorAttended.isEmpty)
-          Padding(padding: const EdgeInsets.all(12), child: Center(child: Text('No attended patients yet', style: ct(12, FontWeight.w400, C2.text2))))
-        else ...[
-          ...s.doctorAttended.take(5).map((p) => InkWell(
-            onTap: () => Navigator.push(context,
-                MaterialPageRoute(builder: (_) => PatientHistoryScreen(patient: p))),
-            child: Container(
-              padding: const EdgeInsets.symmetric(vertical: 10),
-              decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: C2.cyanLight))),
-              child: Row(children: [
-                Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(p.name, style: ct(13, FontWeight.w600, C2.text)),
-                  // Queue rows carry no Rx lines, only their count — local
-                  // p.prescription is always empty for server-merged rows,
-                  // which is why every card said "0 meds" (user 2026-08-22).
-                  Text('${p.disease.isEmpty ? "—" : p.disease} · ${p.prescription.isNotEmpty ? p.prescription.length : p.medicineCount} meds', style: ct(11.5, FontWeight.w400, C2.text2)),
-                ])),
-                doctorStatusBadge(p.status),
-              ]),
-            ))),
-          if (s.doctorAttended.length > 5)
-            Padding(padding: const EdgeInsets.only(top: 8), child: Text('Showing 5 of ${s.doctorAttended.length} · tap "Completed" to view all', style: ct(11, FontWeight.w500, C2.text2))),
-        ],
-      ])),
+      // "Attended Patients" section removed from Home (user 2026-10-13
+      // "showing completed data it will be not show, it will show in
+      // Completed Today"). The Completed Today stat tile above opens
+      // the full attended list.
     ]);
   }
 }
@@ -924,7 +918,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
                 caseSensitive: false).hasMatch(notes)) {
           if (!mounted) return;
           setState(() =>
-              _counsellorMarkedBy = (r['full_name'] ?? 'Receptionist').toString());
+              _counsellorMarkedBy = (r['full_name'] ?? 'Patient Coordinator').toString());
           return;
         }
       }
@@ -1398,7 +1392,7 @@ class _DoctorAttendanceState extends State<DoctorAttendance> {
             const Icon(Icons.check_circle, size: 16, color: C2.green),
             const SizedBox(width: 8),
             Expanded(child: Text(
-              'Receptionist $_counsellorMarkedBy has marked you present today.',
+              'Patient Coordinator $_counsellorMarkedBy has marked you present today.',
               style: ct(12.5, FontWeight.w600, C2.green))),
           ]),
         ),

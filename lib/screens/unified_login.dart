@@ -7,6 +7,7 @@ import '../api/api_client.dart';
 import '../api/api_errors.dart';
 import '../api/auth_api.dart';
 import '../api/masters_store.dart';
+import '../services/analytics_service.dart';
 import '../services/fcm_service.dart';
 import '../services/notifications_store.dart';
 import '../models/models.dart';
@@ -16,6 +17,7 @@ import '../theme/app_theme.dart';
 import '../counsellor/shell.dart';
 import '../doctor/dshell.dart';
 import '../pharmacist/pshell.dart';
+import 'terms_dialog.dart';
 
 /// Single login screen. The user enters username + password. The app
 /// hits `/api/auth/login`; on success it persists tokens + user,
@@ -114,6 +116,13 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
     if (mounted) {
       unawaited(FcmService.instance.register(context.read<ApiClient>()));
     }
+    // Analytics identify + login event (user 2026-10-13). Role label
+    // is a user property so the console can slice by role; raw name
+    // never ships.
+    unawaited(AnalyticsService.instance.setUser(
+        userId: '${app.backendUserId ?? _user.text.trim()}',
+        role: role.name));
+    unawaited(AnalyticsService.instance.logLogin(role.name));
     // Per-user notification history (user 2026-08-19). Persist so the
     // background FCM isolate can still resolve the user (2026-08-20).
     unawaited(NotificationsStore.setCurrentUser(
@@ -126,6 +135,31 @@ class _UnifiedLoginScreenState extends State<UnifiedLoginScreen> {
         ((user['full_name'] as String?)?.trim().isNotEmpty ?? false)
             ? (user['full_name'] as String).trim()
             : role.label;
+
+    // Terms & Conditions acceptance (user 2026-10-12). Shown ONCE per
+    // user — the key is the backend user id so a shared handset asks
+    // every new signed-in user, but never a user who has already
+    // agreed. Decline → sign the user back out and drop the tokens.
+    if (mounted) {
+      final userKey = '${app.backendUserId ?? _user.text.trim()}';
+      final already = await TermsDialog.hasAccepted(userKey);
+      if (!already) {
+        if (!mounted) return;
+        final agreed = await TermsDialog.show(context, userKey);
+        if (!mounted) return;
+        if (!agreed) {
+          // User declined — clear the just-persisted session so the
+          // next cold start lands back on the login screen, and
+          // surface a visible message explaining why we did not open
+          // the shell.
+          await AuthPersistence.clear();
+          app.logout();
+          setState(() => _error = 'You must accept the Terms and Conditions to use the app.');
+          return;
+        }
+      }
+    }
+
     _goToShell(role, displayName);
   }
 
