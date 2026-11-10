@@ -489,16 +489,16 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     // already cleared at start.
     QueueList queue;
     try {
-      queue = await api.doctorQueue(limit: 200);
+      queue = await api.doctorQueue(limit: 500);
     } catch (_) {
       return;
     }
     Future<QueueList> safe(Future<QueueList> f) =>
         f.catchError((_) => QueueList(items: const [], total: 0, count: 0));
     final results = await Future.wait([
-      safe(api.doctorAttended(limit: 200)),
-      safe(api.pendingPayment(limit: 200)),
-      safe(api.labQueue(limit: 200)),
+      safe(api.doctorAttended(limit: 500)),
+      safe(api.pendingPayment(limit: 500)),
+      safe(api.labQueue(limit: 500)),
     ]);
     // Today's whole day, merged SEPARATELY and additively. The four pulls
     // above cover disjoint statuses, so concatenating them cannot repeat a
@@ -511,7 +511,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
     // off on the day it happened. Without it the doctor's Past 7 Days was
     // whatever the queues happened to hold, and the patients who stopped
     // coming were in none of them (user 2026-09-30).
-    final weekRows = await safe(api.doctorPast7Days(limit: 200));
+    final weekRows = await safe(api.doctorPast7Days(limit: 500));
     if (!mounted) return;
     final store = context.read<CounsellorState>();
     final combined = [
@@ -566,7 +566,7 @@ class _DoctorDashboardState extends State<DoctorDashboard>
           borderRadius: BorderRadius.circular(10),
           onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) =>
             DoctorPatientList(title: 'In Queue', patients: s.doctorQueue))),
-          child: StatTile('${s.doctorQueue.length}', 'In Queue', C2.cyan))),
+          child: StatTile('${s.backendDoctorQueue ?? s.doctorQueue.length}', 'In Queue', C2.cyan))),
         const SizedBox(width: 8),
         Expanded(child: InkWell(
           borderRadius: BorderRadius.circular(10),

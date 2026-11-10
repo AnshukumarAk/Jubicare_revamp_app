@@ -52,7 +52,7 @@ class RxItem {
   // No default duration (user rule 2026-08-16): the doctor must enter
   // the day count explicitly — pre-filling "5 Days" left rows silently
   // wrong and read as a required-field error.
-  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '', this.interval = 'TDS', this.qty = 0, int? dispensedQty, this.dispensed = false, this.dispenseReason = '', this.dosageForm = '', List<ComboMed>? combos, this.comboKey = ''})
+  RxItem({required this.name, this.itemId, this.dosage = '', this.days = '', this.interval = 'OD', this.qty = 0, int? dispensedQty, this.dispensed = false, this.dispenseReason = '', this.dosageForm = '', List<ComboMed>? combos, this.comboKey = ''})
       : dispensedQty = dispensedQty ?? qty,
         combos = combos ?? <ComboMed>[];
 }
@@ -1448,6 +1448,12 @@ class CounsellorState extends ChangeNotifier {
     }
     if (p.backendAppointmentId != null) {
       _optimisticStatus[p.backendAppointmentId!] = status;
+    }
+    if (backendDoctorQueue != null && backendDoctorQueue! > 0) {
+      backendDoctorQueue = backendDoctorQueue! - 1;
+    }
+    if (backendDoctorCompleted != null) {
+      backendDoctorCompleted = backendDoctorCompleted! + 1;
     }
     notifyListeners();
   }

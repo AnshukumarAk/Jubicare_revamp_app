@@ -15,6 +15,7 @@ import '../api/sync_service.dart';
 import '../api/uploads_api.dart';
 import '../services/deepgram_stt.dart';
 import '../services/staff_cache_store.dart';
+import '../services/symptom_catalog.dart';
 import '../services/translation_service.dart';
 import '../state/app_state.dart';
 import '../widgets/attachments_field.dart';
@@ -1231,10 +1232,6 @@ class _CounRegisterState extends State<CounRegister> {
         }),
       ])),
 
-      // Symptoms section removed from Registration (user 2026-10-13) —
-      // the doctor captures symptoms on Case Details instead. The
-      // `symptoms` list stays (empty) so the payload shape is unchanged.
-
       // ADVANCE (collapsible)
       CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         SecBar('Advance Details', trailing: _toggle(showAdvanced, (v) => setState(() => showAdvanced = v))),
@@ -1293,6 +1290,26 @@ class _CounRegisterState extends State<CounRegister> {
           CField('Hemoglobin (g/dl)', TextField(controller: _hb, keyboardType: const TextInputType.numberWithOptions(decimal: true), inputFormatters: [_DecimalFormatter(3)], onChanged: (_) => setState(() {}), decoration: cInput('e.g. 12.5').copyWith(errorText: _vitalMinErr(_hb)))),
         ] else
           Text('Turn on to record BP, sugar, temperature and more.', style: ct(11.5, FontWeight.w400, C2.text2)),
+      ])),
+
+      // SYMPTOMS (after Vitals, optional - not marked with *)
+      CCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const SecBar('Symptoms of the Patient'),
+        CField(
+          'Symptoms',
+          SearchMultiDropdown(
+            items: _symptomList(context),
+            selected: symptoms,
+            hint: 'Select Symptoms',
+            searchLabel: 'Search Symptoms',
+            onChanged: (v) => setState(() {
+              symptoms
+                ..clear()
+                ..addAll(v);
+              _schedulePreview();
+            }),
+          ),
+        ),
       ])),
 
       // ASSIGNMENT
@@ -1427,6 +1444,10 @@ class _CounRegisterState extends State<CounRegister> {
   /// * Fallback const is appended (deduped) so an old saved value
   ///   still validates and offline sessions render a working picker
   ///   (user 2026-09-10 dynamic masters).
+  List<String> _symptomList(BuildContext ctx) {
+    return _masterOr(ctx, 'symptoms', SymptomCatalog.catalogSymptoms);
+  }
+
   List<String> _masterOr(BuildContext ctx, String key, List<String> fallback) {
     final store = ctx.read<MastersStore>();
     var server = store.masterStrings(key);

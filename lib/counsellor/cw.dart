@@ -682,6 +682,322 @@ class _SearchSheetState extends State<_SearchSheet> {
   }
 }
 
+
+/// A dropdown-style field that opens a bottom sheet with a search box and
+/// scrollable checklist for selecting one or more items (e.g. symptoms).
+/// Displays the selected items as removable chips below the dropdown box.
+class SearchMultiDropdown extends StatefulWidget {
+  final List<String> items;
+  final List<String> selected;
+  final String hint;
+  final String? searchLabel;
+  final ValueChanged<List<String>> onChanged;
+
+  const SearchMultiDropdown({
+    super.key,
+    required this.items,
+    required this.selected,
+    required this.onChanged,
+    this.hint = 'Select',
+    this.searchLabel,
+  });
+
+  @override
+  State<SearchMultiDropdown> createState() => _SearchMultiDropdownState();
+}
+
+class _SearchMultiDropdownState extends State<SearchMultiDropdown> {
+  final FocusNode _sink =
+      FocusNode(skipTraversal: true, debugLabel: 'search-multi-dropdown-sink');
+
+  @override
+  void dispose() {
+    _sink.dispose();
+    super.dispose();
+  }
+
+  void _park() {
+    if (_sink.canRequestFocus) _sink.requestFocus();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final items = widget.items;
+    final selected = widget.selected;
+    final hint = widget.hint;
+
+    return Focus(
+      focusNode: _sink,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: items.isEmpty
+                ? null
+                : () async {
+                    _park();
+                    final picked = await showModalBottomSheet<List<String>>(
+                      context: context,
+                      isScrollControlled: true,
+                      backgroundColor: Colors.transparent,
+                      builder: (_) => _MultiSearchSheet(
+                        items: items,
+                        selected: selected,
+                        title: widget.searchLabel ?? hint,
+                      ),
+                    );
+                    if (!mounted) return;
+                    _park();
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) _park();
+                    });
+                    if (picked != null) widget.onChanged(picked);
+                  },
+            child: InputDecorator(
+              decoration: cInput().copyWith(
+                suffixIcon: const Icon(Icons.arrow_drop_down, color: C2.text2),
+              ),
+              child: Text(
+                selected.isEmpty
+                    ? hint
+                    : '${selected.length} symptom(s) selected',
+                overflow: TextOverflow.ellipsis,
+                style: ct(
+                  13.5,
+                  selected.isEmpty ? FontWeight.w400 : FontWeight.w600,
+                  selected.isEmpty ? C2.text3 : C2.text,
+                ),
+              ),
+            ),
+          ),
+          if (selected.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final s in selected)
+                  Chip(
+                    label: Text(s, style: ct(12, FontWeight.w600, C2.navy)),
+                    backgroundColor: C2.cyanLight,
+                    side: BorderSide.none,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                    deleteIcon: const Icon(Icons.close, size: 14),
+                    deleteIconColor: C2.text2,
+                    onDeleted: () {
+                      final updated = List<String>.from(selected)..remove(s);
+                      widget.onChanged(updated);
+                    },
+                  ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _MultiSearchSheet extends StatefulWidget {
+  final List<String> items;
+  final List<String> selected;
+  final String title;
+
+  const _MultiSearchSheet({
+    required this.items,
+    required this.selected,
+    required this.title,
+  });
+
+  @override
+  State<_MultiSearchSheet> createState() => _MultiSearchSheetState();
+}
+
+class _MultiSearchSheetState extends State<_MultiSearchSheet> {
+  late final TextEditingController _q = TextEditingController();
+  late final Set<String> _current = Set<String>.from(widget.selected);
+  List<String> _filtered = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _filtered = List.of(widget.items);
+    _q.addListener(_apply);
+  }
+
+  void _apply() {
+    final q = _q.text.trim().toLowerCase();
+    setState(() {
+      _filtered = q.isEmpty
+          ? List.of(widget.items)
+          : widget.items.where((e) => e.toLowerCase().contains(q)).toList();
+    });
+  }
+
+  @override
+  void dispose() {
+    _q.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final viewInsets = MediaQuery.of(context).viewInsets.bottom;
+    return Padding(
+      padding: EdgeInsets.only(bottom: viewInsets),
+      child: Container(
+        decoration: const BoxDecoration(
+          color: C2.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.75,
+        ),
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: C2.border,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    style: ct(15, FontWeight.w700, C2.navy),
+                  ),
+                ),
+                if (_current.isNotEmpty)
+                  TextButton(
+                    onPressed: () => setState(() => _current.clear()),
+                    child: Text(
+                      'Clear (${_current.length})',
+                      style: ct(12, FontWeight.w600, C2.text2),
+                    ),
+                  ),
+                IconButton(
+                  icon: const Icon(Icons.close, size: 20, color: C2.text2),
+                  onPressed: () => Navigator.of(context).pop(_current.toList()),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            TextField(
+              controller: _q,
+              autofocus: true,
+              decoration: cInput('Search...').copyWith(
+                prefixIcon: const Icon(Icons.search, size: 18, color: C2.text2),
+                suffixIcon: _q.text.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.cancel, size: 16, color: C2.text3),
+                        onPressed: () => _q.clear(),
+                      )
+                    : null,
+              ),
+              style: ct(13.5, FontWeight.w500, C2.text),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: _filtered.isEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Center(
+                        child: Text(
+                          widget.items.isEmpty
+                              ? 'No items available'
+                              : 'No matches found',
+                          style: ct(13, FontWeight.w400, C2.text2),
+                        ),
+                      ),
+                    )
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: _filtered.length,
+                      itemExtent: 46,
+                      itemBuilder: (_, i) {
+                        final it = _filtered[i];
+                        final checked = _current.contains(it);
+                        return InkWell(
+                          onTap: () => setState(() {
+                            if (checked) {
+                              _current.remove(it);
+                            } else {
+                              _current.add(it);
+                            }
+                          }),
+                          child: Row(
+                            children: [
+                              Checkbox(
+                                value: checked,
+                                activeColor: C2.cyan,
+                                materialTapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                                visualDensity: VisualDensity.compact,
+                                onChanged: (v) => setState(() {
+                                  if (v == true) {
+                                    _current.add(it);
+                                  } else {
+                                    _current.remove(it);
+                                  }
+                                }),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  it,
+                                  style: ct(
+                                    13.5,
+                                    checked ? FontWeight.w700 : FontWeight.w500,
+                                    C2.text,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () => Navigator.of(context).pop(_current.toList()),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: C2.navy,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: Text(
+                  _current.isEmpty
+                      ? 'Done'
+                      : 'Done (${_current.length} selected)',
+                  style: ct(14, FontWeight.w700, Colors.white),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// A tappable field that opens a time picker and shows the chosen time.
 class TimeField extends StatefulWidget {
   final String hint;

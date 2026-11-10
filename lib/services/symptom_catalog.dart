@@ -38,6 +38,9 @@ class SymptomCatalog {
     'with', 'feel', 'feels', 'feeling',
   };
 
+  /// Public list of standard symptoms known by the catalog.
+  static List<String> get catalogSymptoms => _catalog.keys.toList();
+
   /// label → patterns. A pattern is one-or-more words; every word must be
   /// found in the dictation (any order). Keep every word already
   /// normalize-friendly (roman, lowercase) — Devanagari input arrives

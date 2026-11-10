@@ -62,10 +62,44 @@ class ApiClient {
   }
 
   Map<String, String> _headers(String? bearer) => {
-        'Accept':       'application/json',
-        'Content-Type': 'application/json',
-        if (bearer != null) 'Authorization': 'Bearer $bearer',
-      };
+    'Accept':       'application/json',
+    'Content-Type': 'application/json',
+    if (bearer != null) 'Authorization': 'Bearer $bearer',
+  };
+
+  // API diagnostics. Authorization values are deliberately never printed.
+  void _logRequest(String method, Uri uri, Map<String, String> headers,
+      String? payload) {
+    final safeHeaders = Map<String, String>.from(headers);
+    if (safeHeaders.containsKey('Authorization')) {
+      safeHeaders['Authorization'] = 'Bearer <redacted>';
+    }
+
+    print('''
+========== API REQUEST ==========
+API      : $method $uri
+HEADERS  : ${jsonEncode(safeHeaders)}
+PAYLOAD  : ${payload ?? '<empty>'}
+=================================''');
+  }
+
+  void _logResponse(String method, Uri uri, http.Response response) {
+    print('''
+========== API RESPONSE ==========
+API      : $method $uri
+STATUS   : ${response.statusCode}
+HEADERS  : ${jsonEncode(response.headers)}
+RESPONSE : ${response.body.isEmpty ? '<empty>' : response.body}
+==================================''');
+  }
+
+  void _logApiError(String method, Uri uri, Object error) {
+    print('''
+========== API ERROR ==========
+API   : $method $uri
+ERROR : $error
+===============================''');
+  }
 
   Future<dynamic> get(String path, {Map<String, dynamic>? query, bool auth = true}) =>
       _send('GET', path, query: query, auth: auth);
@@ -106,14 +140,24 @@ class ApiClient {
       final lower = filePath.toLowerCase();
       final mime = contentTypeOverride ??
           (lower.endsWith('.png') ? 'image/png'
-           : lower.endsWith('.webp') ? 'image/webp'
-           : 'image/jpeg');
+              : lower.endsWith('.webp') ? 'image/webp'
+              : 'image/jpeg');
       req.files.add(await http.MultipartFile.fromPath(
         field, filePath,
         contentType: MediaType.parse(mime),
       ));
+
+      _logRequest(
+        'POST',
+        _uri(path, null),
+        req.headers,
+        'multipart field=$field, contentType=$mime, file=<attached>',
+      );
+
       final streamed = await req.send();
-      return http.Response.fromStream(streamed);
+      final response = await http.Response.fromStream(streamed);
+      _logResponse('POST', _uri(path, null), response);
+      return response;
     }
 
     try {
@@ -132,8 +176,10 @@ class ApiClient {
       }
       return _decode(res);
     } on SocketException catch (e) {
+      _logApiError('POST', _uri(path, null), e);
       throw ApiException.network(e);
     } on http.ClientException catch (e) {
+      _logApiError('POST', _uri(path, null), e);
       throw ApiException.network(e);
     }
   }
@@ -198,8 +244,10 @@ class ApiClient {
       }
       return _decode(res);
     } on SocketException catch (e) {
+      _logApiError(method, _uri(path, query), e);
       throw ApiException.network(e);
     } on http.ClientException catch (e) {
+      _logApiError(method, _uri(path, query), e);
       throw ApiException.network(e);
     }
   }
@@ -215,6 +263,7 @@ class ApiClient {
     final uri = _uri(path, query);
     final headers = _headers(bearer);
     final encoded = body == null ? null : jsonEncode(body);
+    _logRequest(method, uri, headers, encoded);
     final Future<http.Response> res = switch (method) {
       'GET'    => _http.get(uri, headers: headers),
       'POST'   => _http.post(uri, headers: headers, body: encoded),
@@ -223,7 +272,11 @@ class ApiClient {
       _        => throw ArgumentError('Unsupported HTTP method: $method'),
     };
     return res.timeout(_requestTimeout,
-        onTimeout: () => throw const SocketException('request timed out'));
+        onTimeout: () => throw const SocketException('request timed out'))
+        .then((response) {
+      _logResponse(method, uri, response);
+      return response;
+    });
   }
 
   dynamic _decode(http.Response res) {
@@ -313,8 +366,8 @@ class ApiClient {
       // session the server has already ended (2026-09-26).
       final definitiveAuthFailure = res.statusCode == 401 && (
           code == 'SIGNED_OUT_REMOTELY' ||
-          code == 'INVALID_TOKEN' ||
-          code == 'REFRESH_EXPIRED');
+              code == 'INVALID_TOKEN' ||
+              code == 'REFRESH_EXPIRED');
       if (definitiveAuthFailure) {
         await onSignedOutRemotely?.call();
       }
@@ -345,3 +398,4 @@ StoredTokens _tokensFromLoginPayload(Map<String, dynamic> j, {StoredTokens? fall
     refreshExpiresAt: parse(j['refresh_expires_at'] as String?, const Duration(days: 30)),
   );
 }
+

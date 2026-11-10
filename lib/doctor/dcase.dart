@@ -8,6 +8,7 @@ import '../api/appointments_api.dart';
 import '../api/api_client.dart';
 import '../api/masters_store.dart';
 import '../api/sync_service.dart';
+import '../api/patients_api.dart';
 import '../counsellor/cw.dart';
 import '../counsellor/cstate.dart';
 import '../counsellor/symptom_field.dart';
@@ -111,6 +112,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   late final Map<String, TextEditingController> _vitals;
   bool _showVitals = false;
   bool _advisoryDismissed = false;
+  bool _advisoryExpanded = false;
   // Red "Required" boxes on prescription rows appear only after a Submit
   // attempt, not while the doctor is still filling the card in (user
   // 2026-08-21 "dont show required red box, show on submitting").
@@ -136,7 +138,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   List<Map<String, dynamic>>? _advLikely;
   // Next Follow-Up question (user 2026-08-21): null = not answered yet;
   // Yes requires a date, which submits as follow_up_date.
-  bool? _nextFollowUp;
+  bool? _nextFollowUp=false;
   DateTime? _followUpDate;
   /// How far ahead a follow-up may be booked — one month (user 2026-09-30).
   static const int _followUpMaxDays = 31;
@@ -210,7 +212,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // already (user 2026-09-26).
           dosage: bareStrength(parsed.strength),
           dosageForm: m.dosageForm.isNotEmpty ? m.dosageForm : parsed.form,
-          days: m.days, interval: m.interval, qty: m.qty,
+          days: m.days, interval: m.interval, qty: (!dosageFormNeedsQty(m.dosageForm.isNotEmpty ? m.dosageForm : parsed.form) && m.qty <= 0) ? 1 : m.qty,
           comboKey: key,
           combos: partners,
         ));
@@ -224,6 +226,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     _loadRegistrationDetail();
     _loadAdvisory();
     _loadStock();
+    _loadPast7DaysMedicineFrequencies();
   }
 
   /// Pharmacy on-hand quantities for this unit (GET /medicines/stock) —
@@ -263,6 +266,168 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     } catch (_) {
       // Offline / old backend without the endpoint — the line stays hidden.
     }
+  }
+
+  /// Medicine frequency in the past 7 days (lowercase name -> count).
+  /// Powers descending frequency sort in "Add Medicine" and the frequent chips.
+  Map<String, int> _past7DaysMedicineFreq = {};
+
+  Future<void> _loadPast7DaysMedicineFrequencies() async {
+    try {
+      final app = context.read<AppState>();
+      final userKey = 'doctor_${app.backendUserId ?? app.currentUser}';
+      final prefs = await SharedPreferences.getInstance();
+
+      // 1. Hydrate from cached frequencies immediately
+      try {
+        final raw = prefs.getString('doctor_med_freq_7d_v1:$userKey');
+        if (raw != null && mounted) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map) {
+            setState(() {
+              _past7DaysMedicineFreq = {
+                for (final e in decoded.entries) e.key.toString(): (e.value as num).toInt(),
+              };
+            });
+          }
+        }
+      } catch (_) {}
+
+      // 2. Compute live counts across the past 7 days
+      final now = DateTime.now();
+      final cutoff = now.subtract(const Duration(days: 7));
+      final counts = <String, int>{};
+
+      void bump(String name, {int times = 1}) {
+        final k = name.trim().toLowerCase();
+        if (k.isNotEmpty) {
+          counts[k] = (counts[k] ?? 0) + times;
+        }
+      }
+
+      // A. Local submissions history from SharedPreferences
+      try {
+        final historyRaw = prefs.getStringList('doctor_rx_history_v1:$userKey') ?? const [];
+        final activeHistory = <String>[];
+        for (final itemStr in historyRaw) {
+          try {
+            final item = jsonDecode(itemStr);
+            if (item is Map) {
+              final ts = DateTime.tryParse(item['ts']?.toString() ?? '');
+              if (ts != null && !ts.isBefore(cutoff)) {
+                activeHistory.add(itemStr);
+                final name = item['name']?.toString() ?? '';
+                bump(name);
+              }
+            }
+          } catch (_) {}
+        }
+        if (activeHistory.length != historyRaw.length) {
+          unawaited(prefs.setStringList('doctor_rx_history_v1:$userKey', activeHistory));
+        }
+      } catch (_) {}
+
+      // B. Attended cases in local CounsellorState.doctorPast7Days
+      try {
+        final s = context.read<CounsellorState>();
+        final recentPatients = s.doctorPast7Days;
+        for (final pat in recentPatients) {
+          for (final m in pat.prescription) {
+            bump(m.name);
+          }
+          final pid = pat.backendPatientId;
+          if (pid != null) {
+            final cachedHistRaw = prefs.getString('patient_history_cache_v1:$pid');
+            if (cachedHistRaw != null) {
+              try {
+                final visits = jsonDecode(cachedHistRaw);
+                if (visits is List) {
+                  for (final v in visits) {
+                    if (v is Map) {
+                      final apptDate = DateTime.tryParse(v['appointment_date']?.toString() ?? '');
+                      if (apptDate != null && !apptDate.isBefore(cutoff)) {
+                        final rxList = v['prescription'] as List? ?? const [];
+                        for (final m in rxList) {
+                          if (m is Map) {
+                            bump((m['medicine_name'] ?? '').toString());
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      } catch (_) {}
+
+      if (mounted && counts.isNotEmpty) {
+        setState(() {
+          _past7DaysMedicineFreq = counts;
+        });
+        await prefs.setString('doctor_med_freq_7d_v1:$userKey', jsonEncode(counts));
+      }
+
+      // C. Background fetch for any past-7-days patients whose history is not yet cached
+      try {
+        final s = context.read<CounsellorState>();
+        final patientsToFetch = <int>[];
+        for (final pat in s.doctorPast7Days) {
+          final pid = pat.backendPatientId;
+          if (pid != null && !prefs.containsKey('patient_history_cache_v1:$pid')) {
+            patientsToFetch.add(pid);
+          }
+        }
+        if (patientsToFetch.isNotEmpty) {
+          final patientsApi = context.read<PatientsApi>();
+          var updated = false;
+          for (final pid in patientsToFetch.take(10)) {
+            if (!mounted) return;
+            try {
+              final res = await patientsApi.history(pid);
+              final visits = (res['visits'] as List? ?? const []).whereType<Map>().toList();
+              await prefs.setString('patient_history_cache_v1:$pid', jsonEncode(visits));
+              for (final v in visits) {
+                final apptDate = DateTime.tryParse(v['appointment_date']?.toString() ?? '');
+                if (apptDate != null && !apptDate.isBefore(cutoff)) {
+                  final rxList = v['prescription'] as List? ?? const [];
+                  for (final m in rxList) {
+                    if (m is Map) {
+                      bump((m['medicine_name'] ?? '').toString());
+                      updated = true;
+                    }
+                  }
+                }
+              }
+            } catch (_) {}
+          }
+          if (updated && mounted) {
+            setState(() {
+              _past7DaysMedicineFreq = counts;
+            });
+            await prefs.setString('doctor_med_freq_7d_v1:$userKey', jsonEncode(counts));
+          }
+        }
+      } catch (_) {}
+    } catch (_) {}
+  }
+
+  Future<void> _recordSubmittedRx(List<RxItem> items) async {
+    if (items.isEmpty) return;
+    try {
+      final app = context.read<AppState>();
+      final userKey = 'doctor_${app.backendUserId ?? app.currentUser}';
+      final prefs = await SharedPreferences.getInstance();
+      final historyRaw = (prefs.getStringList('doctor_rx_history_v1:$userKey') ?? const []).toList();
+      final nowStr = DateTime.now().toIso8601String();
+      for (final m in items) {
+        if (m.name.trim().isNotEmpty) {
+          historyRaw.add(jsonEncode({'name': m.name.trim(), 'ts': nowStr}));
+        }
+      }
+      await prefs.setStringList('doctor_rx_history_v1:$userKey', historyRaw);
+    } catch (_) {}
   }
 
   /// Village name + village trending from GET /appointments/{id}/advisory.
@@ -598,7 +763,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // Non-solid forms have no piece count — set qty to 0 so the
     // backend gets a truthful "dispense by volume/tube" value
     // (user 2026-09-14).
-    if (!dosageFormNeedsQty(m.dosageForm)) { m.qty = 0; return; }
+    if (!dosageFormNeedsQty(m.dosageForm)) { m.qty = 1; return; }
     final perDay = _perDay[m.interval] ?? 1;
     final days = int.tryParse(RegExp(r'\d+').firstMatch(m.days)?.group(0) ?? '') ?? 0;
     m.qty = perDay * days;
@@ -1004,7 +1169,9 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                           // the number goes in (user 2026-09-26).
                           rx.add(RxItem(name: f.name, dosage: bareStrength(f.dosage)));
                         }),
-                        child: Container(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width - 64),
+                          child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                           decoration: BoxDecoration(
                             color: Colors.white,
@@ -1014,9 +1181,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                           child: Row(mainAxisSize: MainAxisSize.min, children: [
                             const Icon(Icons.add, size: 13, color: C2.text),
                             const SizedBox(width: 4),
-                            Text(f.dosage.isEmpty ? f.name : '${f.name} · ${f.dosage}',
-                                style: ct(12, FontWeight.w700, C2.text)),
+                            Flexible(child: Text(f.dosage.isEmpty ? f.name : '${f.name} · ${f.dosage}',
+                                style: ct(12, FontWeight.w700, C2.text), maxLines: 1, overflow: TextOverflow.ellipsis)),
                           ]),
+                        ),
                         ),
                       ),
                   ]),
@@ -1195,7 +1363,9 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
                              'icd11_code':     d.icd,
                              'is_primary':     i == 0});
             }
+            for (final m in rx) { _recalcQty(m); }
             s.doctorSubmit(p, disease: diagnoses.join(', '), rx: rx, tests: tests, observations: _obs.text.trim(), remarks: _remarks.text.trim());
+            _recordSubmittedRx(rx);
             // Enqueue appointment.doctor_submit (v2 §4). Server decides
             // the next status based on tests vs medicines.
             print('[JC] submit validations passed — enqueueing doctor_submit');
@@ -1360,10 +1530,19 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]), borderRadius: BorderRadius.circular(12)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
-          Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
-        ]),
+        InkWell(
+          onTap: () => setState(() => _advisoryExpanded = !_advisoryExpanded),
+          child: Row(children: [
+            const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
+            Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
+            const Spacer(),
+            Icon(
+              _advisoryExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+              size: 18,
+              color: Colors.white70,
+            ),
+          ]),
+        ),
         const SizedBox(height: 10),
         // Red flags present in THIS case - the most important line (spec).
         if (flagHits.isNotEmpty)
@@ -1384,27 +1563,29 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           ),
         line(Icons.coronavirus_outlined, 'Likely:',
             '${e.standardTerm} (${c.pct}%)$icd'),
-        if (shortSymptoms.isNotEmpty)
-          line(Icons.sick_outlined, 'Symptoms:', shortSymptoms.join('; ')),
-        if (plan != null) ...[
-          if (plan.tests.isNotEmpty)
-            line(Icons.science_outlined, 'Tests:',
-                plan.tests.map((t) => t.sourceText).where((t) => t.trim().length <= 60).join(', ')),
-          if (plan.firstLine.trim().isNotEmpty)
-            line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
-          if (plan.rx.isNotEmpty)
-            line(Icons.medication_outlined, 'Rx:',
-                plan.rx.map((r) => '${r.name} (${r.interval} x ${r.days})').join(', ')),
-          if (plan.redFlags.isNotEmpty)
+        if (_advisoryExpanded) ...[
+          if (shortSymptoms.isNotEmpty)
+            line(Icons.sick_outlined, 'Symptoms:', shortSymptoms.join('; ')),
+          if (plan != null) ...[
+            if (plan.tests.isNotEmpty)
+              line(Icons.science_outlined, 'Tests:',
+                  plan.tests.map((t) => t.sourceText).where((t) => t.trim().length <= 60).join(', ')),
+            if (plan.firstLine.trim().isNotEmpty)
+              line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
+            if (plan.rx.isNotEmpty)
+              line(Icons.medication_outlined, 'Rx:',
+                  plan.rx.map((r) => '${r.name} (${r.interval} x ${r.days})').join(', ')),
+            if (plan.redFlags.isNotEmpty)
+              line(Icons.warning_amber_rounded, 'Red Flags:',
+                  plan.redFlags.where((f) => f.trim().length <= 60)
+                      .take(3).join('; ')),
+          ],
+          if (plan == null && flagHits.isEmpty && shortFlags.isNotEmpty)
             line(Icons.warning_amber_rounded, 'Red Flags:',
-                plan.redFlags.where((f) => f.trim().length <= 60)
-                    .take(3).join('; ')),
+                shortFlags.join('; ')),
+          if (e.reference.isNotEmpty)
+            line(Icons.menu_book_outlined, 'Ref:', e.reference),
         ],
-        if (plan == null && flagHits.isEmpty && shortFlags.isNotEmpty)
-          line(Icons.warning_amber_rounded, 'Red Flags:',
-              shortFlags.join('; ')),
-        if (e.reference.isNotEmpty)
-          line(Icons.menu_book_outlined, 'Ref:', e.reference),
         const SizedBox(height: 6),
         Row(children: [
           _aiBtn(_appliedAdvSig == null ? 'Apply' : 'Re-apply',
@@ -1453,6 +1634,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             _aiBtn('Dismiss', Colors.white.withValues(alpha: 0.15),
                 () => setState(() => _advisoryDismissed = true)),
           ],
+          const Spacer(),
+          _aiToggleBtn(),
         ]),
       ]),
     ));
@@ -1475,18 +1658,29 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(gradient: const LinearGradient(colors: [C2.navy, Color(0xFF005A8D)]), borderRadius: BorderRadius.circular(12)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
-          Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
-        ]),
+        InkWell(
+          onTap: () => setState(() => _advisoryExpanded = !_advisoryExpanded),
+          child: Row(children: [
+            const Icon(Icons.memory, size: 15, color: Colors.white), const SizedBox(width: 6),
+            Text('AI Clinical Advisory', style: ct(12.5, FontWeight.w700, Colors.white)),
+            const Spacer(),
+            Icon(
+              _advisoryExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+              size: 18,
+              color: Colors.white70,
+            ),
+          ]),
+        ),
         const SizedBox(height: 10),
         // "Typhoid fever - 1A09 (46%)" (user 2026-08-22).
         line(Icons.coronavirus_outlined, 'Likely:',
             '$name${(icd ?? '').isNotEmpty ? ' - $icd' : ''} ($pct%)'),
-        line(Icons.science_outlined, 'Tests:', plan.tests.map((t) => t.sourceText).join(', ')),
-        line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
-        line(Icons.medication_outlined, 'Rx:', rxStr),
-        line(Icons.warning_amber_rounded, 'Red Flags:', plan.redFlags.join(', ')),
+        if (_advisoryExpanded) ...[
+          line(Icons.science_outlined, 'Tests:', plan.tests.map((t) => t.sourceText).join(', ')),
+          line(Icons.healing_outlined, 'Treatment:', plan.firstLine),
+          line(Icons.medication_outlined, 'Rx:', rxStr),
+          line(Icons.warning_amber_rounded, 'Red Flags:', plan.redFlags.join(', ')),
+        ],
         // Disclaimer strip removed (user 2026-08-22).
         const SizedBox(height: 6),
         Row(children: [
@@ -1499,6 +1693,8 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
             _aiBtn('Dismiss', Colors.white.withValues(alpha: 0.15),
                 () => setState(() => _advisoryDismissed = true)),
           ],
+          const Spacer(),
+          _aiToggleBtn(),
         ]),
       ]),
     ));
@@ -1540,6 +1736,32 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         ),
       );
 
+  Widget _aiToggleBtn() => InkWell(
+        onTap: () => setState(() => _advisoryExpanded = !_advisoryExpanded),
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(6)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_advisoryExpanded ? 'Show less' : 'Show more',
+                  style: ct(12, FontWeight.w600, Colors.white)),
+              const SizedBox(width: 4),
+              Icon(
+                _advisoryExpanded
+                    ? Icons.keyboard_arrow_up
+                    : Icons.keyboard_arrow_down,
+                size: 15,
+                color: Colors.white,
+              ),
+            ],
+          ),
+        ),
+      );
+
   Widget _diagnosisField() {
     final loaded = DiseaseMaster.isLoaded;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -1555,13 +1777,19 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         // restoration can't bring focus back to the Symptoms TextField
         // (which would call Scrollable.ensureVisible and jump the page).
         _parkFocus();
-        final picked = await showModalBottomSheet<String>(
+        final picked = await showModalBottomSheet<List<String>>(
           context: context, isScrollControlled: true, backgroundColor: C2.white,
           shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-          builder: (_) => const _DiseasePickerSheet());
+          builder: (_) => _DiseasePickerSheet(alreadySelected: diagnoses.toSet()));
         if (!mounted) return;
         _parkFocus();
-        if (picked != null && picked.trim().isNotEmpty && !diagnoses.contains(picked)) setState(() => diagnoses.add(picked));
+        if (picked != null && picked.isNotEmpty) {
+          setState(() {
+            for (final d in picked) {
+              if (d.trim().isNotEmpty && !diagnoses.contains(d)) diagnoses.add(d);
+            }
+          });
+        }
       }),
     ]);
   }
@@ -1777,7 +2005,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
           // as the offline fallback so a fresh install / cache-miss still
           // renders a working dropdown, and validation always accepts
           // either source (user 2026-09-07: "do dynamic frequencies").
-          Expanded(child: _mini('Frequency', m.interval, _frequencyOptions(context),
+          Expanded(child: _mini('Frequency', m.interval.isNotEmpty ? m.interval : 'OD', _frequencyOptions(context),
               (v) => setState(() { m.interval = v; _recalcQty(m); }))),
           const SizedBox(width: 6),
           // Open-ended duration: 1-2 digit days OR a 3-letter code (SOS, PRN).
@@ -1904,6 +2132,16 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
         bump(pr.medicine, pr.dosage);
       }
     }
+    final serverMeds = context.read<MastersStore>().medicineNames();
+    final nameMap = {for (final sm in serverMeds) sm.trim().toLowerCase(): sm.trim()};
+    for (final e in _past7DaysMedicineFreq.entries) {
+      if (e.value > 0) {
+        final properName = nameMap[e.key] ?? e.key;
+        for (var i = 0; i < e.value; i++) {
+          bump(properName, '');
+        }
+      }
+    }
     final entries = count.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
     final taken = {for (final x in rx) x.name.toLowerCase()};
@@ -1966,7 +2204,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       'b-complex': '1 tab',
       'betadine gargle': '10 ml',
     };
-    final serverMeds = context.read<MastersStore>().medicineNames();
     final pool = serverMeds;
     for (final n in pool) {
       if (out.length >= 5) break;
@@ -1974,7 +2211,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
       out.add((name: n, dosage: defaults[n.toLowerCase()] ?? ''));
       taken.add(n.toLowerCase());
     }
-    return out;
+    return [
+      for (final r in out)
+        (name: r.name, dosage: r.dosage.isNotEmpty ? r.dosage : (defaults[r.name.toLowerCase()] ?? '')),
+    ];
   }
 
   /// Open the medicine picker to attach a COMBINATION medicine to [m].
@@ -2097,14 +2337,38 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // the current Rx.
     final rxNames = {for (final x in rx) x.name.toLowerCase()};
     final seen = <String>{};
-    final _opts = <String>[];
+    final rawOpts = <String>[];
     for (final m in medOptions) {
       final n = m.trim();
       if (n.isEmpty) continue;
       final k = n.toLowerCase();
       if (rxNames.contains(k) || !seen.add(k)) continue;
-      _opts.add(n);
+      rawOpts.add(n);
     }
+
+    // Sort medicines:
+    // 1. Frequently prescribed in the past 7 days (descending order of frequency)
+    // 2. All remaining medicines sorted alphabetically
+    final freqMeds = <String>[];
+    final otherMeds = <String>[];
+    for (final n in rawOpts) {
+      final count = _past7DaysMedicineFreq[n.toLowerCase()] ?? 0;
+      if (count > 0) {
+        freqMeds.add(n);
+      } else {
+        otherMeds.add(n);
+      }
+    }
+    freqMeds.sort((a, b) {
+      final ca = _past7DaysMedicineFreq[a.toLowerCase()] ?? 0;
+      final cb = _past7DaysMedicineFreq[b.toLowerCase()] ?? 0;
+      final cmp = cb.compareTo(ca); // descending frequency
+      if (cmp != 0) return cmp;
+      return a.toLowerCase().compareTo(b.toLowerCase());
+    });
+    otherMeds.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    final _opts = [...freqMeds, ...otherMeds];
+
     print('[JC] Add Medicine prep took '
         '${DateTime.now().microsecondsSinceEpoch - _tMed0} µs '
         '(options=${_opts.length})');
@@ -2112,7 +2376,7 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     // on Add adds them all (parity with the previous app, user
     // 2026-09-14). Combination picker + test picker stay single-pick
     // since each of those adds one row.
-    final picked = await _pickMulti(context, 'Add Medicine', _opts);
+    final picked = await _pickMulti(context, 'Add Medicine', _opts, frequencies: _past7DaysMedicineFreq);
     if (!mounted) return;
     _parkFocus();
     if (picked != null && picked.isNotEmpty) {
@@ -2125,10 +2389,10 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
     }
   }
 
-  Future<List<String>?> _pickMulti(BuildContext context, String title, List<String> options) {
+  Future<List<String>?> _pickMulti(BuildContext context, String title, List<String> options, {Map<String, int>? frequencies}) {
     return showModalBottomSheet<List<String>>(context: context, isScrollControlled: true, backgroundColor: C2.white,
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
-      builder: (_) => _MultiPickerSheet(title: title, options: options));
+      builder: (_) => _MultiPickerSheet(title: title, options: options, frequencies: frequencies));
   }
 
   Future<String?> _pick(BuildContext context, String title, List<String> options) {
@@ -2241,44 +2505,52 @@ class _PickerSheetState extends State<_PickerSheet> {
         : widget.options.where((o) => o.toLowerCase().contains(ql)).toList();
     print('[JC] _PickerSheet build q="$query" matches=${m.length} '
         'took ${DateTime.now().microsecondsSinceEpoch - _tB} µs');
-    return Padding(
-      padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(widget.title, style: ct(15, FontWeight.w700, C2.navy)),
-        const SizedBox(height: 10),
-        TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
-        const SizedBox(height: 8),
-        // Picker-only (user 2026-08-26): free-text add was letting the
-        // doctor save items that don't exist in the master, which the
-        // backend silently drops. If it's not in the list, it can't be
-        // added — the master must be updated first.
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 320),
-          child: m.isEmpty
-              ? Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
-                      style: ct(13, FontWeight.w400, C2.text2)))
-              // Lazy — 787-symptom sheet was building every row up front
-              // and made the picker feel frozen (user 2026-08-25).
-              // 44 was one line's worth, which clipped the master's longer
-              // standard names to "Spirometry / Pulmonary Function Test
-              // (with bronchodi…" (user 2026-09-29). A fixed extent is what
-              // keeps this lazy, so it stays — just tall enough for two.
-              : ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: m.length,
-                  itemExtent: 62,
-                  itemBuilder: (_, i) => ListTile(
-                    dense: true,
-                    title: Text(m[i], maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: ct(13.5, FontWeight.w500, C2.text)),
-                    trailing: const Icon(Icons.add, size: 18, color: C2.cyan),
-                    onTap: () => Navigator.pop(context, m[i]),
-                  ),
-                )),
-      ]),
+    final media = MediaQuery.of(context);
+    return SafeArea(
+      top: true,
+      bottom: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: media.size.height * 0.85),
+        child: Padding(
+          padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: media.viewInsets.bottom + 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(widget.title, style: ct(15, FontWeight.w700, C2.navy)),
+            const SizedBox(height: 10),
+            TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
+            const SizedBox(height: 8),
+            // Picker-only (user 2026-08-26): free-text add was letting the
+            // doctor save items that don't exist in the master, which the
+            // backend silently drops. If it's not in the list, it can't be
+            // added — the master must be updated first.
+            Flexible(
+              child: m.isEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                          style: ct(13, FontWeight.w400, C2.text2)))
+                  // Lazy — 787-symptom sheet was building every row up front
+                  // and made the picker feel frozen (user 2026-08-25).
+                  // 44 was one line's worth, which clipped the master's longer
+                  // standard names to "Spirometry / Pulmonary Function Test
+                  // (with bronchodi…" (user 2026-09-29). A fixed extent is what
+                  // keeps this lazy, so it stays — just tall enough for two.
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: m.length,
+                      itemExtent: 62,
+                      itemBuilder: (_, i) => ListTile(
+                        dense: true,
+                        title: Text(m[i], maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: ct(13.5, FontWeight.w500, C2.text)),
+                        trailing: const Icon(Icons.add, size: 18, color: C2.cyan),
+                        onTap: () => Navigator.pop(context, m[i]),
+                      ),
+                    ),
+            ),
+          ]),
+        ),
+      ),
     );
   }
 }
@@ -2290,7 +2562,8 @@ class _PickerSheetState extends State<_PickerSheet> {
 class _MultiPickerSheet extends StatefulWidget {
   final String title;
   final List<String> options;
-  const _MultiPickerSheet({required this.title, required this.options});
+  final Map<String, int>? frequencies;
+  const _MultiPickerSheet({required this.title, required this.options, this.frequencies});
   @override
   State<_MultiPickerSheet> createState() => _MultiPickerSheetState();
 }
@@ -2305,67 +2578,91 @@ class _MultiPickerSheetState extends State<_MultiPickerSheet> {
     final m = query.isEmpty
         ? widget.options
         : widget.options.where((o) => o.toLowerCase().contains(ql)).toList();
-    return Padding(
-      padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Expanded(child: Text(widget.title, style: ct(15, FontWeight.w700, C2.navy))),
-          if (_sel.isNotEmpty)
-            TextButton(
-              onPressed: () => setState(_sel.clear),
-              child: Text('Clear (${_sel.length})',
-                  style: ct(12, FontWeight.w600, C2.text2)),
-            ),
-        ]),
-        const SizedBox(height: 6),
-        TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
-        const SizedBox(height: 8),
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 320),
-          child: m.isEmpty
-              ? Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
-                      style: ct(13, FontWeight.w400, C2.text2)))
-              : ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: m.length,
-                  itemExtent: 44,
-                  itemBuilder: (_, i) {
-                    final name = m[i];
-                    final checked = _sel.contains(name);
-                    return InkWell(
-                      onTap: () => setState(() {
-                        if (checked) { _sel.remove(name); } else { _sel.add(name); }
-                      }),
-                      child: Row(children: [
-                        Checkbox(
-                          value: checked,
-                          onChanged: (v) => setState(() {
-                            if (v == true) { _sel.add(name); } else { _sel.remove(name); }
+    final media = MediaQuery.of(context);
+    return SafeArea(
+      top: true,
+      bottom: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: media.size.height * 0.85),
+        child: Padding(
+          padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: media.viewInsets.bottom + 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Expanded(child: Text(widget.title, style: ct(15, FontWeight.w700, C2.navy))),
+              if (_sel.isNotEmpty)
+                TextButton(
+                  onPressed: () => setState(_sel.clear),
+                  child: Text('Clear (${_sel.length})',
+                      style: ct(12, FontWeight.w600, C2.text2)),
+                ),
+            ]),
+            const SizedBox(height: 6),
+            TextField(autofocus: true, decoration: cInput('Search…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
+            const SizedBox(height: 8),
+            Flexible(
+              child: m.isEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                          style: ct(13, FontWeight.w400, C2.text2)))
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: m.length,
+                      itemExtent: 44,
+                      itemBuilder: (_, i) {
+                        final name = m[i];
+                        final checked = _sel.contains(name);
+                        final count = widget.frequencies?[name.toLowerCase()] ?? 0;
+                        return InkWell(
+                          onTap: () => setState(() {
+                            if (checked) { _sel.remove(name); } else { _sel.add(name); }
                           }),
-                          visualDensity: VisualDensity.compact,
-                          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        ),
-                        Expanded(child: Text(name, style: ct(13.5, FontWeight.w500, C2.text))),
-                      ]),
-                    );
-                  },
-                )),
-        const SizedBox(height: 10),
-        SizedBox(width: double.infinity, child: ElevatedButton(
-          onPressed: _sel.isEmpty
-              ? null
-              : () => Navigator.pop(context, _sel.toList()),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: C2.navy, foregroundColor: Colors.white,
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-          child: Text(_sel.isEmpty ? 'Select medicines' : 'Add ${_sel.length}',
-              style: ct(13.5, FontWeight.w700, Colors.white)),
-        )),
-      ]),
+                          child: Row(children: [
+                            Checkbox(
+                              value: checked,
+                              onChanged: (v) => setState(() {
+                                if (v == true) { _sel.add(name); } else { _sel.remove(name); }
+                              }),
+                              visualDensity: VisualDensity.compact,
+                              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            ),
+                            Expanded(child: Text(name, style: ct(13.5, FontWeight.w500, C2.text))),
+                            if (count > 0)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 8),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: C2.cyanLight,
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    '$count in 7d',
+                                    style: ct(10.5, FontWeight.w700, C2.cyan),
+                                  ),
+                                ),
+                              ),
+                          ]),
+                        );
+                      },
+                    ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(width: double.infinity, child: ElevatedButton(
+              onPressed: _sel.isEmpty
+                  ? null
+                  : () => Navigator.pop(context, _sel.toList()),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: C2.navy, foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              child: Text(_sel.isEmpty ? 'Select medicines' : 'Add ${_sel.length}',
+                  style: ct(13.5, FontWeight.w700, Colors.white)),
+            )),
+          ]),
+        ),
+      ),
     );
   }
 }
@@ -2528,13 +2825,31 @@ class _MultiComboEditSheetState extends State<_MultiComboEditSheet> {
 }
 
 class _DiseasePickerSheet extends StatefulWidget {
-  const _DiseasePickerSheet();
+  final Set<String>? alreadySelected;
+  const _DiseasePickerSheet({this.alreadySelected});
   @override
   State<_DiseasePickerSheet> createState() => _DiseasePickerSheetState();
 }
 
 class _DiseasePickerSheetState extends State<_DiseasePickerSheet> {
   String q = '';
+  final Set<String> _sel = <String>{};
+
+  bool _isAlreadyAdded(Disease d) {
+    if (widget.alreadySelected == null || widget.alreadySelected!.isEmpty) {
+      return false;
+    }
+    final termLower = d.term.toLowerCase();
+    final icdLower = d.icd.toLowerCase();
+    for (final s in widget.alreadySelected!) {
+      if (s.toLowerCase() == d.display.toLowerCase()) return true;
+      final split = _splitDx(s);
+      if (split.text.toLowerCase() == termLower) return true;
+      if (icdLower.isNotEmpty && split.icd.toLowerCase() == icdLower) return true;
+    }
+    return false;
+  }
+
   @override
   Widget build(BuildContext context) {
     final _tB = DateTime.now().microsecondsSinceEpoch;
@@ -2542,53 +2857,132 @@ class _DiseasePickerSheetState extends State<_DiseasePickerSheet> {
     final query = q.trim();
     print('[JC] _DiseasePickerSheet build q="$query" matches=${matches.length} '
         'took ${DateTime.now().microsecondsSinceEpoch - _tB} µs');
-    return Padding(
-      padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: MediaQuery.of(context).viewInsets.bottom + 16),
-      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Text('Select Diagnosis', style: ct(15, FontWeight.w700, C2.navy)),
-          const Spacer(),
-          Text('${matches.length} of ${DiseaseMaster.all.length}', style: ct(11, FontWeight.w500, C2.text2)),
-        ]),
-        const SizedBox(height: 10),
-        TextField(autofocus: true, decoration: cInput('Search a diagnosis…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)), onChanged: (v) => setState(() => q = v)),
-        const SizedBox(height: 4),
-        // Picker-only (user 2026-08-26): free-text add was letting a
-        // diagnosis that isn't in the ICD-11 master slip through, and
-        // the backend silently drops non-master names on save.
-        ConstrainedBox(
-          constraints: const BoxConstraints(maxHeight: 360),
-          child: matches.isEmpty
-              ? Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
-                      style: ct(13, FontWeight.w400, C2.text2)))
-              // Lazy row builds — used to render all 158 diseases up front
-              // on every keystroke; picker felt frozen (user 2026-08-25).
-              : ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: matches.length,
-                  itemExtent: 48,
-                  itemBuilder: (_, i) {
-                    final d = matches[i];
-                    return InkWell(
-                      onTap: () => Navigator.pop(context, d.display),
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
-                        child: Row(children: [
-                          Expanded(child: Text(d.term, style: ct(13.5, FontWeight.w600, C2.text))),
-                          const SizedBox(width: 8),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-                            decoration: BoxDecoration(color: C2.navyLight, borderRadius: BorderRadius.circular(5)),
-                            child: Text(d.icd.isEmpty ? '—' : d.icd, style: ct(10.5, FontWeight.w700, C2.navy)),
+    final media = MediaQuery.of(context);
+    return SafeArea(
+      top: true,
+      bottom: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: media.size.height * 0.85),
+        child: Padding(
+          padding: EdgeInsets.only(left: 16, right: 16, top: 14, bottom: media.viewInsets.bottom + 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              Text('Select Diagnosis', style: ct(15, FontWeight.w700, C2.navy)),
+              const Spacer(),
+              if (_sel.isNotEmpty)
+                TextButton(
+                  onPressed: () => setState(_sel.clear),
+                  child: Text('Clear (${_sel.length})',
+                      style: ct(12, FontWeight.w600, C2.text2)),
+                ),
+              Text('${matches.length} of ${DiseaseMaster.all.length}', style: ct(11, FontWeight.w500, C2.text2)),
+            ]),
+            const SizedBox(height: 10),
+            TextField(
+              autofocus: true,
+              decoration: cInput('Search a diagnosis…').copyWith(prefixIcon: const Icon(Icons.search, size: 18)),
+              onChanged: (v) => setState(() => q = v),
+            ),
+            const SizedBox(height: 4),
+            // Flexible allows the list to dynamically shrink when the soft keyboard
+            // appears, preventing bottom overflow and status bar collision.
+            Flexible(
+              child: matches.isEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(query.isEmpty ? 'Type to search' : 'No match found in master list',
+                          style: ct(13, FontWeight.w400, C2.text2)))
+                  // Lazy row builds — used to render all 158 diseases up front
+                  // on every keystroke; picker felt frozen (user 2026-08-25).
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: matches.length,
+                      itemExtent: 48,
+                      itemBuilder: (_, i) {
+                        final d = matches[i];
+                        final alreadyAdded = _isAlreadyAdded(d);
+                        final checked = alreadyAdded || _sel.contains(d.display);
+                        return InkWell(
+                          onTap: alreadyAdded
+                              ? null
+                              : () => setState(() {
+                                    if (_sel.contains(d.display)) {
+                                      _sel.remove(d.display);
+                                    } else {
+                                      _sel.add(d.display);
+                                    }
+                                  }),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 2),
+                            child: Row(children: [
+                              Checkbox(
+                                value: checked,
+                                onChanged: alreadyAdded
+                                    ? null
+                                    : (v) => setState(() {
+                                          if (v == true) {
+                                            _sel.add(d.display);
+                                          } else {
+                                            _sel.remove(d.display);
+                                          }
+                                        }),
+                                visualDensity: VisualDensity.compact,
+                                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              ),
+                              const SizedBox(width: 4),
+                              Expanded(
+                                child: Text(
+                                  d.term,
+                                  style: ct(13.5, FontWeight.w600, alreadyAdded ? C2.text2 : C2.text),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              if (alreadyAdded) ...[
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: C2.green.withValues(alpha: 0.15),
+                                    borderRadius: BorderRadius.circular(5),
+                                  ),
+                                  child: Text('Added', style: ct(10, FontWeight.w700, C2.green)),
+                                ),
+                                const SizedBox(width: 6),
+                              ],
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                decoration: BoxDecoration(color: C2.navyLight, borderRadius: BorderRadius.circular(5)),
+                                child: Text(d.icd.isEmpty ? '—' : d.icd, style: ct(10.5, FontWeight.w700, C2.navy)),
+                              ),
+                            ]),
                           ),
-                        ]),
-                      ),
-                    );
-                  },
-                )),
-      ]),
+                        );
+                      },
+                    ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _sel.isEmpty
+                    ? null
+                    : () => Navigator.pop(context, _sel.toList()),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: C2.navy,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                child: Text(
+                  _sel.isEmpty ? 'Select diagnosis' : 'Add ${_sel.length}',
+                  style: ct(13.5, FontWeight.w700, Colors.white),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
     );
   }
 }

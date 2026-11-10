@@ -577,9 +577,9 @@ class _PharmaDispensedListState extends State<PharmaDispensedList> {
                   name: '${r['medicine_name'] ?? ''}',
                   dosage: parsed.strength,
                   dosageForm: serverForm.isNotEmpty ? serverForm : parsed.form,
-                  interval: '${r['frequency'] ?? 'TDS'}',
+                  interval: '${r['frequency'] ?? 'OD'}',
                   days: '${r['duration_days'] ?? 5} Days',
-                  qty: (r['qty'] as num?)?.toInt() ?? 0,
+                  qty: ((r['qty'] as num?)?.toInt() ?? 0) <= 0 && !dosageFormNeedsQty(serverForm.isNotEmpty ? serverForm : parsed.form) ? 1 : ((r['qty'] as num?)?.toInt() ?? 0),
                   dispensedQty: (r['dispensed_qty'] as num?)?.toInt(),
                   dispensed: (r['dispensed'] as bool?) ?? false,
                   dispenseReason: '${r['qty_change_reason'] ?? ''}',
@@ -751,6 +751,7 @@ class _PharmaDispenseState extends State<PharmaDispense> {
 
   void _snapshotDispensedQty() {
     for (final m in p.prescription) {
+      if (!dosageFormNeedsQty(m.dosageForm) && m.qty <= 0) { m.qty = 1; m.dispensedQty = 1; }
       _originalDispensedQty.putIfAbsent(m, () => m.dispensedQty);
     }
   }
@@ -823,9 +824,9 @@ class _PharmaDispenseState extends State<PharmaDispense> {
               dosageForm: '${r['dosage_form'] ?? ''}'.trim().isNotEmpty
                   ? '${r['dosage_form']}'.trim()
                   : parseDosage('${r['dosage'] ?? ''}').form,
-              interval: '${r['frequency'] ?? 'TDS'}',
+              interval: '${r['frequency'] ?? 'OD'}',
               days:     '${r['duration_days'] ?? 5} Days',
-              qty:      (r['qty'] as num?)?.toInt() ?? 0,
+              qty:      ((r['qty'] as num?)?.toInt() ?? 0) <= 0 && !dosageFormNeedsQty('${r['dosage_form'] ?? ''}'.trim().isNotEmpty ? '${r['dosage_form']}'.trim() : parseDosage('${r['dosage'] ?? ''}').form) ? 1 : ((r['qty'] as num?)?.toInt() ?? 0),
               // Falls back to the prescribed qty so the Delivered field opens
               // pre-filled with the expected amount (user 2026-08-22) — the
               // server sends 0, not null, for still-undispensed lines, which

@@ -122,7 +122,7 @@ const List<String> kFrequencies = ['OD','BD','TDS','QID','SOS'];
 /// facility name never clips the picker. Backend has no dedicated
 /// column — the value round-trips as a "<form> · " prefix on the
 /// PrescriptionItem.dosage column (see RxItem.dosageForm).
-const List<String> kDosageForms = ['Tab', 'Cap', 'Syp', 'Gel', 'Cream'];
+const List<String> kDosageForms = ['Tab', 'Cap', 'Syp', 'Gel', 'Cream','Drop','Others'];
 
 /// Solid forms count as pieces (Tab / Cap) — a per-dose quantity makes
 /// sense, so the auto-QTY box is shown. Syrup / Gel / Cream are
