@@ -760,9 +760,6 @@ class _DoctorCaseDetailsState extends State<DoctorCaseDetails> {
   // itself is removed per user rule 2026-08-16, see kFrequencies).
   static const _perDay = {'OD': 1, 'BD': 2, 'TDS': 3, 'QID': 4, 'SOS': 1, 'HS': 1};
   void _recalcQty(RxItem m) {
-    // Non-solid forms have no piece count — set qty to 0 so the
-    // backend gets a truthful "dispense by volume/tube" value
-    // (user 2026-09-14).
     if (!dosageFormNeedsQty(m.dosageForm)) { m.qty = 1; return; }
     final perDay = _perDay[m.interval] ?? 1;
     final days = int.tryParse(RegExp(r'\d+').firstMatch(m.days)?.group(0) ?? '') ?? 0;

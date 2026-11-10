@@ -816,32 +816,27 @@ class _PharmaDispenseState extends State<PharmaDispense> {
       final lines = <RxItem>[
         for (final r in (d['prescription'] as List? ?? const []))
           if (r is Map)
-            RxItem(
-              itemId:   (r['prescription_item_id'] as num?)?.toInt(),
-              name:     '${r['medicine_name'] ?? ''}',
-              // Split "<form> · <strength>" back apart (user 2026-09-08).
-              dosage:   parseDosage('${r['dosage'] ?? ''}').strength,
-              dosageForm: '${r['dosage_form'] ?? ''}'.trim().isNotEmpty
+            () {
+              final form = '${r['dosage_form'] ?? ''}'.trim().isNotEmpty
                   ? '${r['dosage_form']}'.trim()
-                  : parseDosage('${r['dosage'] ?? ''}').form,
-              interval: '${r['frequency'] ?? 'OD'}',
-              days:     '${r['duration_days'] ?? 5} Days',
-              qty:      ((r['qty'] as num?)?.toInt() ?? 0) <= 0 && !dosageFormNeedsQty('${r['dosage_form'] ?? ''}'.trim().isNotEmpty ? '${r['dosage_form']}'.trim() : parseDosage('${r['dosage'] ?? ''}').form) ? 1 : ((r['qty'] as num?)?.toInt() ?? 0),
-              // Falls back to the prescribed qty so the Delivered field opens
-              // pre-filled with the expected amount (user 2026-08-22) — the
-              // server sends 0, not null, for still-undispensed lines, which
-              // used to override that fallback and force a "reason" on every
-              // line. The reason dropdown now only appears when the
-              // pharmacist actually changes the quantity.
-              dispensedQty: ((r['dispensed_qty'] as num?)?.toInt() ?? 0) > 0
-                  ? (r['dispensed_qty'] as num).toInt()
-                  : null,
-              dispensed: (r['dispensed'] as bool?) ?? false,
-              // Combination-strip group id so _medRows can merge two
-              // lines the doctor wrote as one deliverable (user
-              // 2026-09-12). Blank on standalone lines.
-              comboKey: '${r['combo_key'] ?? ''}',
-            ),
+                  : parseDosage('${r['dosage'] ?? ''}').form;
+              final rawQty = (r['qty'] as num?)?.toInt() ?? 0;
+              final qty = rawQty == 0 && !dosageFormNeedsQty(form) ? 1 : rawQty;
+              return RxItem(
+                itemId:   (r['prescription_item_id'] as num?)?.toInt(),
+                name:     '${r['medicine_name'] ?? ''}',
+                dosage:   parseDosage('${r['dosage'] ?? ''}').strength,
+                dosageForm: form,
+                interval: '${r['frequency'] ?? 'OD'}',
+                days:     '${r['duration_days'] ?? 5} Days',
+                qty:      qty,
+                dispensedQty: ((r['dispensed_qty'] as num?)?.toInt() ?? 0) > 0
+                    ? (r['dispensed_qty'] as num).toInt()
+                    : null,
+                dispensed: (r['dispensed'] as bool?) ?? false,
+                comboKey: '${r['combo_key'] ?? ''}',
+              );
+            }(),
       ]..removeWhere((m) => m.name.trim().isEmpty);
       setState(() {
         if (lines.isNotEmpty) p.prescription = lines;
